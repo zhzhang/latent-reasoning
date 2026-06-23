@@ -1,0 +1,12 @@
+[project]
+name = "latent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.14.0",
+    "lm-eval>=0.4.12",
+    "torch>=2.12.1",
+    "transformers>=5.12.1",
+]
