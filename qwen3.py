@@ -11,6 +11,7 @@ from pathlib import Path
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # 0.6 billion parameters
@@ -147,19 +148,109 @@ class Qwen3Model(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.cfg = cfg
 
-    def forward(self, in_idx):
+    def forward(self, in_idx, cache=None, start_pos=0, return_cache=False):
         # Forward pass
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
 
         num_tokens = x.shape[1]
-        mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
+        total_len = start_pos + num_tokens
 
-        for block in self.trf_blocks:
-            x = block(x, mask, self.cos, self.sin)
+        # Causal mask: query positions [start_pos, total_len) attend to key positions [0, total_len).
+        # When start_pos == 0 and no cache, this reduces to the standard upper-triangular causal mask.
+        q_pos = torch.arange(start_pos, total_len, device=x.device).unsqueeze(1)
+        k_pos = torch.arange(total_len, device=x.device).unsqueeze(0)
+        mask = k_pos > q_pos
+
+        new_caches = []
+        for i, block in enumerate(self.trf_blocks):
+            layer_cache = cache[i] if cache is not None else None
+            x, layer_new_cache = block(x, mask, self.cos, self.sin, start_pos, layer_cache)
+            new_caches.append(layer_new_cache)
+
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
+
+        if return_cache:
+            return logits, new_caches
         return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids,
+        max_new_tokens=512,
+        eos_token_id=None,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=None,
+    ):
+        """Autoregressively generate tokens using KV-caching.
+
+        input_ids: LongTensor of shape (batch, seq_len).
+        Returns the full sequence (prompt + generated) of shape (batch, seq_len + new).
+        Generation stops early only when every sequence in the batch has emitted eos.
+        """
+        self.eval()
+        max_ctx = self.cfg["context_length"]
+
+        # Prefill: run the whole prompt once and cache its keys/values.
+        prompt_len = input_ids.shape[1]
+        if prompt_len > max_ctx:
+            input_ids = input_ids[:, -max_ctx:]
+            prompt_len = max_ctx
+
+        logits, cache = self.forward(input_ids, cache=None, start_pos=0, return_cache=True)
+        start_pos = prompt_len
+        generated = input_ids
+        next_logits = logits[:, -1, :]
+
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+
+        for _ in range(max_new_tokens):
+            next_token = self._sample_next(next_logits, temperature, top_p, top_k)
+            generated = torch.cat([generated, next_token], dim=1)
+
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+                if bool(finished.all()):
+                    break
+
+            if start_pos >= max_ctx:
+                break
+
+            logits, cache = self.forward(
+                next_token, cache=cache, start_pos=start_pos, return_cache=True
+            )
+            start_pos += 1
+            next_logits = logits[:, -1, :]
+
+        return generated
+
+    @staticmethod
+    def _sample_next(logits, temperature=0.0, top_p=1.0, top_k=None):
+        # logits: (batch, vocab). Returns next tokens of shape (batch, 1).
+        logits = logits.float()
+
+        if temperature is None or temperature <= 0.0:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        logits = logits / temperature
+
+        if top_k is not None and top_k > 0:
+            top_k = min(top_k, logits.shape[-1])
+            kth_vals = torch.topk(logits, top_k, dim=-1).values[:, -1, None]
+            logits = logits.masked_fill(logits < kth_vals, -torch.inf)
+
+        if top_p is not None and 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+            remove = cum_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
+            sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
+            logits = torch.full_like(logits, -torch.inf).scatter(-1, sorted_idx, sorted_logits)
+
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
 
 
 class TransformerBlock(nn.Module):
@@ -180,11 +271,11 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x, mask, cos, sin,)  # Shape [batch_size, num_tokens, emb_size]
+        x, new_cache = self.att(x, mask, cos, sin, start_pos, cache)  # Shape [batch_size, num_tokens, emb_size]
         x = x + shortcut  # Add the original input back
 
         # Shortcut connection for feed-forward block
@@ -193,7 +284,7 @@ class TransformerBlock(nn.Module):
         x = self.ff(x)
         x = x + shortcut  # Add the original input back
 
-        return x
+        return x, new_cache
 
 
 class FeedForward(nn.Module):
@@ -293,7 +384,7 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.q_norm = self.k_norm = None
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
         b, num_tokens, _ = x.shape
 
         # Apply projections
@@ -312,21 +403,42 @@ class GroupedQueryAttention(nn.Module):
         if self.k_norm:
             keys = self.k_norm(keys)
 
-        # Apply RoPE
-        queries = apply_rope(queries, cos, sin)
-        keys = apply_rope(keys, cos, sin)
+        # Apply RoPE at the correct absolute positions (offset by start_pos for cached decoding)
+        cos_slice = cos[start_pos:start_pos + num_tokens]
+        sin_slice = sin[start_pos:start_pos + num_tokens]
+        queries = apply_rope(queries, cos_slice, sin_slice)
+        keys = apply_rope(keys, cos_slice, sin_slice)
+
+        # Append the new keys/values to the running cache (incremental decoding)
+        if cache is not None:
+            prev_k, prev_v = cache
+            keys = torch.cat([prev_k, keys], dim=2)
+            values = torch.cat([prev_v, values], dim=2)
+        new_cache = (keys, values)
 
         # Expand K and V to match number of heads
         keys = keys.repeat_interleave(self.group_size, dim=1)
         values = values.repeat_interleave(self.group_size, dim=1)
 
-        # Attention
-        attn_scores = queries @ keys.transpose(2, 3)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+        # Fused (flash / mem-efficient) scaled-dot-product attention.
+        # Fast paths avoid materializing an explicit mask so the flash kernel can fire:
+        #   - prefill (q_len == k_len): standard causal attention
+        #   - single-token decode: the new token may attend to all cached keys
+        # Any other shape falls back to an explicit boolean mask.
+        kv_len = keys.shape[2]
+        if num_tokens == kv_len:
+            context = F.scaled_dot_product_attention(
+                queries, keys, values, is_causal=True
+            )
+        elif num_tokens == 1:
+            context = F.scaled_dot_product_attention(queries, keys, values)
+        else:
+            context = F.scaled_dot_product_attention(
+                queries, keys, values, attn_mask=~mask
+            )
 
-        context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
-        return self.out_proj(context)
+        context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)
+        return self.out_proj(context), new_cache
 
 
 # ==============================================================================
