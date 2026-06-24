@@ -153,8 +153,7 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        in_idx=None,
-        input_embeds=None,
+        in_idx,
         cache=None,
         start_pos=0,
         return_cache=False,
@@ -162,14 +161,8 @@ class Qwen3Model(nn.Module):
         thinking_max_layer=None,
     ):
         # Forward pass
-        if (in_idx is None) == (input_embeds is None):
-            raise ValueError("Provide exactly one of in_idx or input_embeds.")
-
-        if input_embeds is not None:
-            x = input_embeds
-        else:
-            tok_embeds = self.tok_emb(in_idx)
-            x = tok_embeds
+        tok_embeds = self.tok_emb(in_idx)
+        x = tok_embeds
 
         num_tokens = x.shape[1]
         total_len = start_pos + num_tokens
@@ -196,21 +189,18 @@ class Qwen3Model(nn.Module):
             mask = (~disallow).unsqueeze(1)  # (b, 1, q, k)
 
         new_caches = []
-        output_embed = None
         for i, block in enumerate(self.trf_blocks):
             layer_cache = cache[i] if cache is not None else None
             x, layer_new_cache = block(
                 x, mask, self.cos, self.sin, start_pos, layer_cache
             )
-            if thinking_max_layer is not None and i + 1 == thinking_max_layer:
-                output_embed = x
             new_caches.append(layer_new_cache)
 
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
 
         if return_cache:
-            return logits, new_caches, output_embed
+            return logits, new_caches
         return logits
 
     @torch.no_grad()
@@ -224,8 +214,6 @@ class Qwen3Model(nn.Module):
         top_p=1.0,
         top_k=None,
         thinking_max_layer=None,
-        latent_thinking=False,
-        thinking_end_token_id=None,
     ):
         """Autoregressively generate tokens using KV-caching.
 
@@ -252,82 +240,17 @@ class Qwen3Model(nn.Module):
         if attention_mask is not None and bool((attention_mask == 0).any()):
             key_pad = attention_mask == 0
 
-        effective_thinking_layer = thinking_max_layer
-        if latent_thinking and effective_thinking_layer is None:
-            effective_thinking_layer = len(self.trf_blocks)
-        if latent_thinking and (
-            effective_thinking_layer < 1
-            or effective_thinking_layer > len(self.trf_blocks)
-        ):
-            raise ValueError(
-                f"thinking_max_layer must be in [1, {len(self.trf_blocks)}], "
-                f"got {effective_thinking_layer}."
-            )
-
-        logits, cache, output_embed = self.forward(
-            input_ids,
-            cache=None,
-            start_pos=0,
-            return_cache=True,
-            key_pad=key_pad,
-            thinking_max_layer=effective_thinking_layer if latent_thinking else None,
+        logits, cache = self.forward(
+            input_ids, cache=None, start_pos=0, return_cache=True, key_pad=key_pad
         )
         start_pos = prompt_len
         generated = input_ids
         next_logits = logits[:, -1, :]
-        next_latent_embed = output_embed[:, -1:, :] if output_embed is not None else None
 
         batch_size = input_ids.shape[0]
         finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-        in_latent_thinking = latent_thinking
 
         for _ in range(max_new_tokens):
-            if in_latent_thinking:
-                if thinking_end_token_id is None:
-                    raise ValueError(
-                        "thinking_end_token_id is required when latent_thinking is enabled."
-                    )
-                if next_latent_embed is None:
-                    raise ValueError(
-                        "thinking_max_layer did not produce embeddings for latent thinking."
-                    )
-
-                # Stop latent updates once </think> is the most likely next token.
-                if bool((next_logits.argmax(dim=-1) == thinking_end_token_id).all()):
-                    in_latent_thinking = False
-                else:
-                    if start_pos >= max_ctx:
-                        break
-
-                    if key_pad is not None:
-                        key_pad = torch.cat(
-                            [
-                                key_pad,
-                                torch.zeros(
-                                    batch_size,
-                                    1,
-                                    dtype=torch.bool,
-                                    device=key_pad.device,
-                                ),
-                            ],
-                            dim=1,
-                        )
-
-                    logits, cache, output_embed = self.forward(
-                        input_embeds=next_latent_embed,
-                        cache=cache,
-                        start_pos=start_pos,
-                        return_cache=True,
-                        key_pad=key_pad,
-                        thinking_max_layer=effective_thinking_layer,
-                    )
-                    start_pos += 1
-                    next_logits = logits[:, -1, :]
-                    next_latent_embed = (
-                        output_embed[:, -1:, :] if output_embed is not None else None
-                    )
-                    continue
-
             next_token = self._sample_next(next_logits, temperature, top_p, top_k)
 
             # Once a sequence has finished, keep emitting eos so the batch stays aligned.
@@ -360,7 +283,7 @@ class Qwen3Model(nn.Module):
                     dim=1,
                 )
 
-            logits, cache, _ = self.forward(
+            logits, cache = self.forward(
                 next_token,
                 cache=cache,
                 start_pos=start_pos,
