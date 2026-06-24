@@ -12,9 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-THINK_START_TOKEN_ID = 151667
-THINK_END_TOKEN_ID = 151668
-
 
 # 0.6 billion parameters
 QWEN_CONFIG_06_B = {
@@ -158,44 +155,21 @@ class Qwen3Model(nn.Module):
         self,
         in_idx=None,
         input_embeds=None,
-        input_embeds_mask=None,
         cache=None,
         start_pos=0,
         return_cache=False,
         key_pad=None,
         thinking_max_layer=None,
-        thinking_start_token_id=THINK_START_TOKEN_ID,
-        thinking_end_token_id=THINK_END_TOKEN_ID,
     ):
         # Forward pass
-        if in_idx is None and input_embeds is None:
-            raise ValueError("Provide in_idx and optionally input_embeds.")
+        if (in_idx is None) == (input_embeds is None):
+            raise ValueError("Provide exactly one of in_idx or input_embeds.")
 
-        if in_idx is not None:
-            tok_embeds = self.tok_emb(in_idx)
-        else:
-            tok_embeds = None
-
-        if input_embeds is None:
-            x = tok_embeds if tok_embeds is not None else input_embeds
-        elif tok_embeds is None:
+        if input_embeds is not None:
             x = input_embeds
         else:
-            if input_embeds.shape != tok_embeds.shape:
-                raise ValueError(
-                    "input_embeds must match token embedding shape "
-                    f"{tok_embeds.shape}, got {input_embeds.shape}."
-                )
-            if input_embeds_mask is None:
-                input_embeds_mask = self._build_thinking_mask(
-                    in_idx, thinking_start_token_id, thinking_end_token_id
-                )
-            elif input_embeds_mask.shape != in_idx.shape:
-                raise ValueError(
-                    "input_embeds_mask must have shape "
-                    f"{in_idx.shape}, got {input_embeds_mask.shape}."
-                )
-            x = torch.where(input_embeds_mask.unsqueeze(-1), input_embeds, tok_embeds)
+            tok_embeds = self.tok_emb(in_idx)
+            x = tok_embeds
 
         num_tokens = x.shape[1]
         total_len = start_pos + num_tokens
@@ -239,16 +213,6 @@ class Qwen3Model(nn.Module):
             return logits, new_caches, output_embed
         return logits
 
-    @staticmethod
-    def _build_thinking_mask(token_ids, thinking_start_token_id, thinking_end_token_id):
-        start_hits = token_ids == thinking_start_token_id
-        end_hits = token_ids == thinking_end_token_id
-        depth_delta = start_hits.to(torch.int32) - end_hits.to(torch.int32)
-        depth = torch.cumsum(depth_delta, dim=1)
-        in_span = depth > 0
-        # Strictly between delimiters, so the markers themselves use token embeddings.
-        return in_span & ~start_hits & ~end_hits
-
     @torch.no_grad()
     def generate(
         self,
@@ -261,7 +225,6 @@ class Qwen3Model(nn.Module):
         top_k=None,
         thinking_max_layer=None,
         latent_thinking=False,
-        thinking_start_token_id=THINK_START_TOKEN_ID,
         thinking_end_token_id=None,
     ):
         """Autoregressively generate tokens using KV-caching.
@@ -292,10 +255,6 @@ class Qwen3Model(nn.Module):
         effective_thinking_layer = thinking_max_layer
         if latent_thinking and effective_thinking_layer is None:
             effective_thinking_layer = len(self.trf_blocks)
-        if latent_thinking and thinking_end_token_id is None:
-            raise ValueError(
-                "thinking_end_token_id is required when latent_thinking is enabled."
-            )
         if latent_thinking and (
             effective_thinking_layer < 1
             or effective_thinking_layer > len(self.trf_blocks)
@@ -320,36 +279,23 @@ class Qwen3Model(nn.Module):
 
         batch_size = input_ids.shape[0]
         finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-        in_latent_thinking = torch.full(
-            (batch_size,),
-            latent_thinking,
-            dtype=torch.bool,
-            device=input_ids.device,
-        )
+        in_latent_thinking = latent_thinking
 
         for _ in range(max_new_tokens):
-            if bool(in_latent_thinking.any()):
+            if in_latent_thinking:
+                if thinking_end_token_id is None:
+                    raise ValueError(
+                        "thinking_end_token_id is required when latent_thinking is enabled."
+                    )
                 if next_latent_embed is None:
                     raise ValueError(
                         "thinking_max_layer did not produce embeddings for latent thinking."
                     )
 
-                # Stop latent updates per sample once </think> is most likely.
-                latent_next_token = next_logits.argmax(dim=-1, keepdim=True)
-                hit_thinking_end = (
-                    latent_next_token.squeeze(-1) == thinking_end_token_id
-                )
-                in_latent_thinking = in_latent_thinking & ~hit_thinking_end
-
-                if bool(in_latent_thinking.any()):
-                    # Keep rows that already exited latent mode on a stable token while
-                    # the rest of the batch continues latent updates.
-                    latent_next_token = torch.where(
-                        in_latent_thinking.unsqueeze(1),
-                        latent_next_token,
-                        torch.full_like(latent_next_token, thinking_end_token_id),
-                    )
-
+                # Stop latent updates once </think> is the most likely next token.
+                if bool((next_logits.argmax(dim=-1) == thinking_end_token_id).all()):
+                    in_latent_thinking = False
+                else:
                     if start_pos >= max_ctx:
                         break
 
@@ -368,16 +314,12 @@ class Qwen3Model(nn.Module):
                         )
 
                     logits, cache, output_embed = self.forward(
-                        in_idx=latent_next_token,
                         input_embeds=next_latent_embed,
-                        input_embeds_mask=in_latent_thinking.unsqueeze(1),
                         cache=cache,
                         start_pos=start_pos,
                         return_cache=True,
                         key_pad=key_pad,
                         thinking_max_layer=effective_thinking_layer,
-                        thinking_start_token_id=thinking_start_token_id,
-                        thinking_end_token_id=thinking_end_token_id,
                     )
                     start_pos += 1
                     next_logits = logits[:, -1, :]
