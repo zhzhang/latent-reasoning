@@ -148,7 +148,7 @@ class Qwen3Model(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.cfg = cfg
 
-    def forward(self, in_idx, cache=None, start_pos=0, return_cache=False):
+    def forward(self, in_idx, cache=None, start_pos=0, return_cache=False, key_pad=None):
         # Forward pass
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
@@ -156,11 +156,24 @@ class Qwen3Model(nn.Module):
         num_tokens = x.shape[1]
         total_len = start_pos + num_tokens
 
-        # Causal mask: query positions [start_pos, total_len) attend to key positions [0, total_len).
-        # When start_pos == 0 and no cache, this reduces to the standard upper-triangular causal mask.
-        q_pos = torch.arange(start_pos, total_len, device=x.device).unsqueeze(1)
-        k_pos = torch.arange(total_len, device=x.device).unsqueeze(0)
-        mask = k_pos > q_pos
+        # When there is no padding we pass mask=None so attention can use the fast
+        # causal SDPA path. For padded batches we build an explicit boolean keep-mask
+        # combining the causal constraint with the per-sequence key padding.
+        #
+        # key_pad: (batch, total_len) bool, True where a key position is PADDING.
+        if key_pad is None:
+            mask = None
+        else:
+            q_pos = torch.arange(start_pos, total_len, device=x.device).unsqueeze(1)  # (q, 1)
+            k_pos = torch.arange(total_len, device=x.device).unsqueeze(0)             # (1, k)
+            causal_disallow = k_pos > q_pos                                           # (q, k)
+            disallow = causal_disallow.unsqueeze(0) | key_pad.unsqueeze(1)            # (b, q, k)
+            # Always let a position attend itself so fully-padded query rows don't
+            # produce NaNs (softmax over an all-masked row). These rows belong to pad
+            # tokens whose outputs are never read.
+            eye = q_pos == k_pos                                                      # (q, k)
+            disallow = disallow & ~eye.unsqueeze(0)
+            mask = (~disallow).unsqueeze(1)                                           # (b, 1, q, k)
 
         new_caches = []
         for i, block in enumerate(self.trf_blocks):
@@ -179,6 +192,7 @@ class Qwen3Model(nn.Module):
     def generate(
         self,
         input_ids,
+        attention_mask=None,
         max_new_tokens=512,
         eos_token_id=None,
         temperature=0.0,
@@ -187,7 +201,9 @@ class Qwen3Model(nn.Module):
     ):
         """Autoregressively generate tokens using KV-caching.
 
-        input_ids: LongTensor of shape (batch, seq_len).
+        input_ids: LongTensor of shape (batch, seq_len). For batched generation the
+            inputs must be LEFT-padded and ``attention_mask`` (1 = real, 0 = pad)
+            must be provided so padding tokens are excluded from attention.
         Returns the full sequence (prompt + generated) of shape (batch, seq_len + new).
         Generation stops early only when every sequence in the batch has emitted eos.
         """
@@ -198,17 +214,37 @@ class Qwen3Model(nn.Module):
         prompt_len = input_ids.shape[1]
         if prompt_len > max_ctx:
             input_ids = input_ids[:, -max_ctx:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -max_ctx:]
             prompt_len = max_ctx
 
-        logits, cache = self.forward(input_ids, cache=None, start_pos=0, return_cache=True)
+        # Only build padding masks when padding is actually present (keeps the
+        # single-sequence / full-batch case on the fast causal path).
+        key_pad = None
+        if attention_mask is not None and bool((attention_mask == 0).any()):
+            key_pad = attention_mask == 0
+
+        logits, cache = self.forward(
+            input_ids, cache=None, start_pos=0, return_cache=True, key_pad=key_pad
+        )
         start_pos = prompt_len
         generated = input_ids
         next_logits = logits[:, -1, :]
 
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        batch_size = input_ids.shape[0]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
 
         for _ in range(max_new_tokens):
             next_token = self._sample_next(next_logits, temperature, top_p, top_k)
+
+            # Once a sequence has finished, keep emitting eos so the batch stays aligned.
+            if eos_token_id is not None:
+                next_token = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(next_token, eos_token_id),
+                    next_token,
+                )
+
             generated = torch.cat([generated, next_token], dim=1)
 
             if eos_token_id is not None:
@@ -219,8 +255,15 @@ class Qwen3Model(nn.Module):
             if start_pos >= max_ctx:
                 break
 
+            # Newly generated tokens are always real (not padding).
+            if key_pad is not None:
+                key_pad = torch.cat(
+                    [key_pad, torch.zeros(batch_size, 1, dtype=torch.bool, device=key_pad.device)],
+                    dim=1,
+                )
+
             logits, cache = self.forward(
-                next_token, cache=cache, start_pos=start_pos, return_cache=True
+                next_token, cache=cache, start_pos=start_pos, return_cache=True, key_pad=key_pad
             )
             start_pos += 1
             next_logits = logits[:, -1, :]
@@ -421,21 +464,24 @@ class GroupedQueryAttention(nn.Module):
         values = values.repeat_interleave(self.group_size, dim=1)
 
         # Fused (flash / mem-efficient) scaled-dot-product attention.
-        # Fast paths avoid materializing an explicit mask so the flash kernel can fire:
+        # `mask` is None for unpadded inputs, which lets the flash kernel fire via
+        # the causal fast paths:
         #   - prefill (q_len == k_len): standard causal attention
         #   - single-token decode: the new token may attend to all cached keys
-        # Any other shape falls back to an explicit boolean mask.
-        kv_len = keys.shape[2]
-        if num_tokens == kv_len:
+        # For padded batches, `mask` is an explicit boolean keep-mask
+        # (shape (b, 1, q_len, kv_len), True = attend) combining causal + padding.
+        if mask is not None:
             context = F.scaled_dot_product_attention(
-                queries, keys, values, is_causal=True
+                queries, keys, values, attn_mask=mask
             )
-        elif num_tokens == 1:
-            context = F.scaled_dot_product_attention(queries, keys, values)
         else:
-            context = F.scaled_dot_product_attention(
-                queries, keys, values, attn_mask=~mask
-            )
+            kv_len = keys.shape[2]
+            if num_tokens == kv_len:
+                context = F.scaled_dot_product_attention(
+                    queries, keys, values, is_causal=True
+                )
+            else:
+                context = F.scaled_dot_product_attention(queries, keys, values)
 
         context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context), new_cache
