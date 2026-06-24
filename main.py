@@ -170,6 +170,29 @@ def parse_args():
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument(
+        "--latent_thinking",
+        action="store_true",
+        help=(
+            "Run hidden reasoning by feeding layer embeddings back into forward "
+            "until </think> is the most likely token."
+        ),
+    )
+    parser.add_argument(
+        "--thinking_max_layer",
+        type=int,
+        default=None,
+        help=(
+            "Layer index (1-based) whose output embedding is looped during latent "
+            "thinking; defaults to the last transformer block."
+        ),
+    )
+    parser.add_argument(
+        "--thinking_end_token_id",
+        type=int,
+        default=THINK_END_TOKEN_ID,
+        help="Token id used to detect end of latent thinking.",
+    )
+    parser.add_argument(
         "--no_compile",
         action="store_true",
         help="Disable torch.compile (compilation has a one-time warmup cost).",
@@ -207,6 +230,9 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
+        latent_thinking=args.latent_thinking,
+        thinking_max_layer=args.thinking_max_layer,
+        thinking_end_token_id=args.thinking_end_token_id,
     )
 
     answers = []
