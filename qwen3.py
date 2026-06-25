@@ -12,6 +12,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+THINK_START_TOKEN_ID = 151667
+THINK_END_TOKEN_ID = 151668
+
 
 # 0.6 billion parameters
 QWEN_CONFIG_06_B = {
@@ -154,6 +157,8 @@ class Qwen3Model(nn.Module):
     def forward(
         self,
         in_idx,
+        in_embeds=None,
+        in_embeds_mask=None,
         cache=None,
         start_pos=0,
         return_cache=False,
@@ -163,6 +168,8 @@ class Qwen3Model(nn.Module):
         # Forward pass
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
+        if in_embeds is not None:
+            x = torch.where(in_embeds_mask.unsqueeze(-1), in_embeds, x)
 
         num_tokens = x.shape[1]
         total_len = start_pos + num_tokens
@@ -195,12 +202,13 @@ class Qwen3Model(nn.Module):
                 x, mask, self.cos, self.sin, start_pos, layer_cache
             )
             new_caches.append(layer_new_cache)
+        last_layer_x = x
 
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
 
         if return_cache:
-            return logits, new_caches
+            return logits, new_caches, last_layer_x
         return logits
 
     @torch.no_grad()
@@ -226,7 +234,7 @@ class Qwen3Model(nn.Module):
         self.eval()
         max_ctx = self.cfg["context_length"]
 
-        # Prefill: run the whole prompt once and cache its keys/values.
+        # Generation loop: step 0 prefills the prompt; later steps decode one token.
         prompt_len = input_ids.shape[1]
         if prompt_len > max_ctx:
             input_ids = input_ids[:, -max_ctx:]
@@ -240,17 +248,48 @@ class Qwen3Model(nn.Module):
         if attention_mask is not None and bool((attention_mask == 0).any()):
             key_pad = attention_mask == 0
 
-        logits, cache = self.forward(
-            input_ids, cache=None, start_pos=0, return_cache=True, key_pad=key_pad
-        )
-        start_pos = prompt_len
-        generated = input_ids
-        next_logits = logits[:, -1, :]
-
         batch_size = input_ids.shape[0]
+        generated = input_ids
         finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        thinking_finished = torch.zeros(batch_size, dtype=torch.long, device=input_ids.device)
 
-        for _ in range(max_new_tokens):
+        in_embeds = None
+        forward_input = input_ids
+        forward_start_pos = 0
+        forward_cache = None
+        start_pos = 0
+
+        for step in range(max_new_tokens + 1):
+            is_prefill = step == 0
+
+            logits, cache, last_layer_x = self.forward(
+                forward_input,
+                in_embeds=in_embeds,
+                in_embeds_mask=(thinking_finished.unsqueeze(1) == 0),
+                cache=forward_cache,
+                start_pos=forward_start_pos,
+                return_cache=True,
+                key_pad=key_pad,
+            )
+            next_logits = logits[:, -1, :]
+            if is_prefill:
+                start_pos = prompt_len
+                in_embeds = last_layer_x
+            else:
+                start_pos += 1
+            thinking_finished = thinking_finished + (
+                torch.argmax(next_logits, dim=-1) == THINK_END_TOKEN_ID
+            ).long()
+            eot_logits = torch.full_like(next_logits, -torch.inf)
+            eot_logits[:, THINK_END_TOKEN_ID] = 0
+            next_logits = torch.where(thinking_finished.unsqueeze(-1) == 1, eot_logits, next_logits)
+            print(thinking_finished)
+            in_embeds = last_layer_x[:, -1:, :]
+
+
+            if step >= max_new_tokens:
+                break
+
             next_token = self._sample_next(next_logits, temperature, top_p, top_k)
 
             # Once a sequence has finished, keep emitting eos so the batch stays aligned.
@@ -283,15 +322,10 @@ class Qwen3Model(nn.Module):
                     dim=1,
                 )
 
-            logits, cache = self.forward(
-                next_token,
-                cache=cache,
-                start_pos=start_pos,
-                return_cache=True,
-                key_pad=key_pad,
-            )
-            start_pos += 1
-            next_logits = logits[:, -1, :]
+            forward_input = next_token
+            forward_cache = cache
+            forward_start_pos = start_pos
+
 
         return generated
 

@@ -198,6 +198,7 @@ def main():
     if args.num_samples and args.num_samples > 0:
         list_data_dict = list_data_dict[: args.num_samples]
 
+    print("Loading model and tokenizer...")
     model, tokenizer = load_model_and_tokenizer(
         args.model_name_or_path, args.local_dir, device, compile_model=not args.no_compile
     )
