@@ -73,8 +73,8 @@ def load_model_and_tokenizer(repo_id, local_dir, device, compile_model=True):
 
     # Weights are stored in bfloat16; the config dtype keeps the whole model in
     # half precision (RMSNorm internally upcasts to fp32 for numerical stability).
-    model = Qwen3Model(QWEN3_4B_THINKING_CONFIG)
-    load_weights_into_qwen(model, QWEN3_4B_THINKING_CONFIG, weights)
+    model = Qwen3Model(QWEN3_CONFIG_4B)
+    load_weights_into_qwen(model, QWEN3_CONFIG_4B, weights)
     del weights
     model.to(device)
     model.eval()
@@ -132,6 +132,7 @@ def generate_batch(model, tokenizer, prompts, device, gen_kwargs):
     results = []
     for i in range(output_ids.shape[0]):
         new_tokens = output_ids[i][prompt_len:].tolist()
+        print(tokenizer.decode(new_tokens))
         reasoning_tokens, answer_tokens = split_completion_tokens(new_tokens)
         reasoning = tokenizer.decode(reasoning_tokens, skip_special_tokens=True).strip("\n")
         answer_text = tokenizer.decode(answer_tokens, skip_special_tokens=True).strip("\n")
@@ -163,7 +164,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
+        default=1,
         help="Number of questions to generate for in parallel.",
     )
     parser.add_argument("--temperature", type=float, default=0.6)
