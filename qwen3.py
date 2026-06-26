@@ -209,7 +209,6 @@ class Qwen3Model(nn.Module):
             #     break
 
         x = self.final_norm(x)
-        print("final", torch.norm(x, dim=-1))
         logits = self.out_head(x.to(self.cfg["dtype"]))
 
         if return_cache:
