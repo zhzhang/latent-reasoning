@@ -166,10 +166,10 @@ class Qwen3Model(nn.Module):
         thinking_max_layer=None,
     ):
         # Forward pass
-        tok_embeds = self.tok_emb(in_idx)
-        x = tok_embeds
+        x = self.tok_emb(in_idx)
         if in_embeds is not None:
             x = torch.where(in_embeds_mask.unsqueeze(-1), in_embeds, x)
+            # x = in_embeds.unsqueeze(1)
 
         num_tokens = x.shape[1]
         total_len = start_pos + num_tokens
@@ -196,19 +196,24 @@ class Qwen3Model(nn.Module):
             mask = (~disallow).unsqueeze(1)  # (b, 1, q, k)
 
         new_caches = []
+        hidden_states = []
         for i, block in enumerate(self.trf_blocks):
             layer_cache = cache[i] if cache is not None else None
             x, layer_new_cache = block(
                 x, mask, self.cos, self.sin, start_pos, layer_cache
             )
+            print(torch.norm(x, dim=-1))
+            hidden_states.append(x)
             new_caches.append(layer_new_cache)
-        last_layer_x = x
+            # if i == len(self.trf_blocks) - 4:
+            #     break
 
         x = self.final_norm(x)
+        print("final", torch.norm(x, dim=-1))
         logits = self.out_head(x.to(self.cfg["dtype"]))
 
         if return_cache:
-            return logits, new_caches, last_layer_x
+            return logits, new_caches, hidden_states
         return logits
 
     @torch.no_grad()
@@ -232,6 +237,7 @@ class Qwen3Model(nn.Module):
         Generation stops early only when every sequence in the batch has emitted eos.
         """
         self.eval()
+        print("hit test 3")
         max_ctx = self.cfg["context_length"]
 
         # Generation loop: step 0 prefills the prompt; later steps decode one token.
@@ -262,28 +268,29 @@ class Qwen3Model(nn.Module):
         for step in range(max_new_tokens + 1):
             is_prefill = step == 0
 
-            logits, cache, last_layer_x = self.forward(
+            logits, cache, hidden_states = self.forward(
                 forward_input,
-                in_embeds=in_embeds,
+                # in_embeds=None if is_prefill else next_logits.softmax(dim=-1) @ self.tok_emb.weight,
+                # in_embeds=in_embeds,
                 in_embeds_mask=(thinking_finished.unsqueeze(1) == 0),
                 cache=forward_cache,
                 start_pos=forward_start_pos,
                 return_cache=True,
                 key_pad=key_pad,
             )
+            last_layer_x = hidden_states[-1]
             next_logits = logits[:, -1, :]
             if is_prefill:
                 start_pos = prompt_len
                 in_embeds = last_layer_x
             else:
                 start_pos += 1
-            thinking_finished = thinking_finished + (
-                torch.argmax(next_logits, dim=-1) == THINK_END_TOKEN_ID
-            ).long()
-            eot_logits = torch.full_like(next_logits, -torch.inf)
-            eot_logits[:, THINK_END_TOKEN_ID] = 0
-            next_logits = torch.where(thinking_finished.unsqueeze(-1) == 1, eot_logits, next_logits)
-            print(thinking_finished)
+            # thinking_finished = thinking_finished + (
+            #     torch.argmax(next_logits, dim=-1) == THINK_END_TOKEN_ID
+            # ).long()
+            # eot_logits = torch.full_like(next_logits, -torch.inf)
+            # eot_logits[:, THINK_END_TOKEN_ID] = 0
+            # next_logits = torch.where(thinking_finished.unsqueeze(-1) == 1, eot_logits, next_logits)
             in_embeds = last_layer_x[:, -1:, :]
 
 
@@ -291,6 +298,11 @@ class Qwen3Model(nn.Module):
                 break
 
             next_token = self._sample_next(next_logits, temperature, top_p, top_k)
+            if step == 80:
+                next_token = torch.full_like(next_token, THINK_END_TOKEN_ID)
+            thinking_finished = thinking_finished + (
+                next_token.squeeze(-1) == THINK_END_TOKEN_ID
+            ).long()
 
             # Once a sequence has finished, keep emitting eos so the batch stays aligned.
             if eos_token_id is not None:
