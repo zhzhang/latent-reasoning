@@ -1,9 +1,81 @@
+import glob
 import gzip
 import json
 import os
 
 import requests
 from tqdm import tqdm
+
+
+def _prepend_ld_library_path(directory):
+    if not directory or not os.path.isdir(directory):
+        return False
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    if directory in current.split(":"):
+        return False
+    os.environ["LD_LIBRARY_PATH"] = (directory + ":" + current).rstrip(":")
+    return True
+
+
+def ensure_libcuda_on_path():
+    """Make libcuda.so discoverable so torch.compile's Triton backend can build.
+
+    On some setups libcuda.so.1 exists but is not in the linker cache, which makes
+    Triton fail with "libcuda.so cannot found!". Triton re-reads LD_LIBRARY_PATH
+    from the environment at compile time, so prepending the right directory here is
+    enough (no need to relaunch the process).
+    """
+    for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"):
+        if glob.glob(os.path.join(d, "libcuda.so*")):
+            _prepend_ld_library_path(d)
+            return d
+    return None
+
+
+def ensure_cuda_runtime_on_path():
+    """Expose the CUDA runtime libraries used by PyTorch and flash-attn."""
+    candidates = (
+        os.environ.get("CUDA_HOME"),
+        "/usr/local/cuda",
+        "/usr/local/cuda-13",
+        "/usr/local/cuda-12",
+    )
+    for base in candidates:
+        if not base:
+            continue
+        lib_dir = os.path.join(base, "lib64")
+        if os.path.isdir(lib_dir) and glob.glob(os.path.join(lib_dir, "libcudart.so*")):
+            _prepend_ld_library_path(lib_dir)
+            bin_dir = os.path.join(base, "bin")
+            if os.path.isdir(bin_dir):
+                path = os.environ.get("PATH", "")
+                if bin_dir not in path.split(":"):
+                    os.environ["PATH"] = bin_dir + (":" + path if path else "")
+            return lib_dir
+    return None
+
+
+def flash_attention_2_available():
+    ensure_cuda_runtime_on_path()
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def resolve_attn_implementation(requested):
+    if not requested or requested != "flash_attention_2":
+        return requested
+
+    if flash_attention_2_available():
+        return requested
+
+    print(
+        "flash-attn is unavailable (missing package or incompatible CUDA runtime). "
+        "Falling back to attn_implementation=sdpa."
+    )
+    return "sdpa"
 
 
 def download_url(url: str, folder: str = "folder") -> str:

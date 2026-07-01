@@ -1,3 +1,8 @@
+from utils import ensure_cuda_runtime_on_path, ensure_libcuda_on_path, resolve_attn_implementation
+
+ensure_libcuda_on_path()
+ensure_cuda_runtime_on_path()
+
 import argparse
 import json
 import os
@@ -21,22 +26,35 @@ DEFAULT_MODEL_ID = "nvidia/audio-flamingo-3-hf"
 YES_VALUES = {"yes", "y", "true", "是"}
 NO_VALUES = {"no", "n", "false", "否"}
 BINARY_RE = re.compile(r"\b(yes|no|true|false|y|n)\b|[是否]", re.IGNORECASE)
+THINKING_END_TAGS = (
+    "</" + "redacted_thinking" + ">",
+    "</thinking>",
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run NVIDIA Audio Flamingo 3 on AHa-Bench and write per-example "
+            "Run an audio-language model on AHa-Bench and write per-example "
             "predictions plus aggregate scores."
         )
     )
     parser.add_argument("--model_id", default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--model_family",
+        default="auto",
+        choices=("auto", "audio_flamingo3", "qwen3_omni"),
+        help=(
+            "Model backend to use. auto infers from --model_id "
+            "(audio-flamingo* -> audio_flamingo3, qwen3-omni* -> qwen3_omni)."
+        ),
+    )
     parser.add_argument("--dataset", default=DATASET_ID)
     parser.add_argument("--config", default=DATASET_CONFIG)
     parser.add_argument("--split", default=DATASET_SPLIT)
     parser.add_argument(
         "--output_dir",
-        default="output/audio_flamingo3_aha",
+        default="output/aha_bench",
         help="Directory for predictions.jsonl and scores.json.",
     )
     parser.add_argument(
@@ -57,7 +75,7 @@ def parse_args():
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument(
         "--attn_implementation",
-        default=None,
+        default="sdpa",
         choices=("sdpa", "flash_attention_2"),
         help="Optional attention implementation passed to from_pretrained.",
     )
@@ -99,6 +117,40 @@ def parse_args():
         help="Instruction prepended before each benchmark question.",
     )
     return parser.parse_args()
+
+
+def detect_model_family(model_id):
+    lowered = model_id.lower()
+    if "audio-flamingo" in lowered or "audio_flamingo" in lowered:
+        return "audio_flamingo3"
+    if "qwen3-omni" in lowered or "qwen3_omni" in lowered:
+        return "qwen3_omni"
+    raise SystemExit(
+        "Could not infer --model_family from "
+        f"{model_id!r}. Pass --model_family explicitly."
+    )
+
+
+def resolve_model_family(args):
+    if args.model_family == "auto":
+        return detect_model_family(args.model_id)
+    return args.model_family
+
+
+def is_thinking_model(model_id):
+    return "thinking" in model_id.lower()
+
+
+def apply_model_defaults(args, model_family):
+    if model_family != "qwen3_omni" or not is_thinking_model(args.model_id):
+        return
+
+    # Qwen thinking checkpoints expect sampling from generation_config, not greedy.
+    if args.temperature == 0.0 and args.top_p == 1.0:
+        args.temperature = 0.6
+        args.top_p = 0.95
+    if args.max_new_tokens == 64:
+        args.max_new_tokens = 2048
 
 
 def request_json(url, params, timeout=120):
@@ -185,6 +237,23 @@ def normalize_text(text):
     return " ".join(text.split())
 
 
+def strip_thinking_content(text):
+    if not text:
+        return ""
+    text = str(text)
+    for end_tag in THINKING_END_TAGS:
+        if end_tag in text:
+            text = text.split(end_tag, 1)[-1]
+    text = re.sub(
+        r"<" + "redacted_thinking" + ">.*",
+        "",
+        text,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return text.strip()
+
+
 def binary_label(text):
     normalized = normalize_text(text)
     if normalized in YES_VALUES:
@@ -216,16 +285,11 @@ def score_prediction(prediction, gold):
     return normalized_gold in normalized_prediction, normalized_prediction
 
 
-def load_model(model_id, torch_dtype, device_map, attn_implementation):
+def load_model(model_id, model_family, torch_dtype, device_map, attn_implementation):
     try:
         import torch
-        from transformers import AudioFlamingo3ForConditionalGeneration, AutoProcessor
     except ImportError as exc:
-        raise SystemExit(
-            "Audio Flamingo 3 requires a recent Transformers install. Try:\n"
-            "  pip install --upgrade git+https://github.com/huggingface/transformers accelerate\n"
-            f"Original import error: {exc}"
-        ) from exc
+        raise SystemExit(f"PyTorch is required: {exc}") from exc
 
     dtype_lookup = {
         "auto": "auto",
@@ -233,17 +297,49 @@ def load_model(model_id, torch_dtype, device_map, attn_implementation):
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    kwargs = {
-        "device_map": device_map,
-        "torch_dtype": dtype_lookup[torch_dtype],
-    }
+    resolved_dtype = dtype_lookup[torch_dtype]
+    kwargs = {"device_map": device_map}
+    attn_implementation = resolve_attn_implementation(attn_implementation)
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
 
-    processor = AutoProcessor.from_pretrained(model_id)
-    model = AudioFlamingo3ForConditionalGeneration.from_pretrained(model_id, **kwargs)
-    model.eval()
-    return model, processor
+    if model_family == "audio_flamingo3":
+        try:
+            from transformers import AudioFlamingo3ForConditionalGeneration, AutoProcessor
+        except ImportError as exc:
+            raise SystemExit(
+                "Audio Flamingo 3 requires a recent Transformers install. Try:\n"
+                "  pip install --upgrade git+https://github.com/huggingface/transformers accelerate\n"
+                f"Original import error: {exc}"
+            ) from exc
+
+        kwargs["torch_dtype"] = resolved_dtype
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = AudioFlamingo3ForConditionalGeneration.from_pretrained(model_id, **kwargs)
+        model.eval()
+        return model, processor
+
+    if model_family == "qwen3_omni":
+        try:
+            from qwen_omni_utils import process_mm_info
+            from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+        except ImportError as exc:
+            raise SystemExit(
+                "Qwen3-Omni requires qwen-omni-utils and a recent Transformers install. Try:\n"
+                "  pip install qwen-omni-utils -U\n"
+                "  pip install --upgrade git+https://github.com/huggingface/transformers accelerate\n"
+                f"Original import error: {exc}"
+            ) from exc
+
+        kwargs["dtype"] = resolved_dtype
+        processor = Qwen3OmniMoeProcessor.from_pretrained(model_id)
+        model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(model_id, **kwargs)
+        if hasattr(model, "disable_talker"):
+            model.disable_talker()
+        model.eval()
+        return model, processor, process_mm_info
+
+    raise SystemExit(f"Unsupported model family: {model_family}")
 
 
 def model_input_device(model):
@@ -253,8 +349,23 @@ def model_input_device(model):
     return next(model.parameters()).device
 
 
-def build_conversation(sample, instruction):
-    question = f"{instruction}\n\nQuestion: {sample['question']}"
+def build_question_text(sample, instruction):
+    return f"{instruction}\n\nQuestion: {sample['question']}"
+
+
+def build_conversation(sample, instruction, model_family):
+    question = build_question_text(sample, instruction)
+    if model_family == "qwen3_omni":
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": sample["audio_url"]},
+                    {"type": "text", "text": question},
+                ],
+            }
+        ]
+
     return [
         {
             "role": "user",
@@ -266,16 +377,23 @@ def build_conversation(sample, instruction):
     ]
 
 
-def generate_batch(model, processor, samples, args):
-    import torch
-
-    conversations = [build_conversation(sample, args.prompt) for sample in samples]
-    inputs = processor.apply_chat_template(
-        conversations,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-    ).to(model_input_device(model))
+def build_generation_kwargs(args, model=None, model_family=None):
+    if model_family == "qwen3_omni":
+        generation_kwargs = {
+            "thinker_max_new_tokens": args.max_new_tokens,
+            "thinker_do_sample": args.temperature > 0,
+            "thinker_return_dict_in_generate": True,
+            "return_audio": False,
+            "use_audio_in_video": False,
+        }
+        if args.temperature > 0:
+            generation_kwargs["thinker_temperature"] = args.temperature
+            generation_kwargs["thinker_top_p"] = args.top_p
+            if model is not None and hasattr(model, "generation_config"):
+                config = model.generation_config
+                if getattr(config, "top_k", None) not in (None, 0):
+                    generation_kwargs["thinker_top_k"] = config.top_k
+        return generation_kwargs
 
     generation_kwargs = {
         "max_new_tokens": args.max_new_tokens,
@@ -283,7 +401,45 @@ def generate_batch(model, processor, samples, args):
         "temperature": args.temperature if args.temperature > 0 else None,
         "top_p": args.top_p,
     }
-    generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
+    if model is not None and hasattr(model, "generation_config"):
+        config = model.generation_config
+        if args.temperature > 0 and getattr(config, "top_k", None) not in (None, 0):
+            generation_kwargs["top_k"] = config.top_k
+    return {key: value for key, value in generation_kwargs.items() if value is not None}
+
+
+def decode_qwen3_omni_generate_output(generated, processor, prompt_len):
+    import torch
+
+    if isinstance(generated, tuple):
+        generated = generated[0]
+
+    if hasattr(generated, "sequences"):
+        sequences = generated.sequences
+    elif isinstance(generated, torch.Tensor):
+        sequences = generated
+    else:
+        raise TypeError(f"Unexpected Qwen3-Omni generate output type: {type(generated)!r}")
+
+    return processor.batch_decode(
+        sequences[:, prompt_len:],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+
+def generate_batch_audio_flamingo3(model, processor, samples, args):
+    import torch
+
+    conversations = [build_conversation(sample, args.prompt, "audio_flamingo3") for sample in samples]
+    inputs = processor.apply_chat_template(
+        conversations,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    ).to(model_input_device(model))
+
+    generation_kwargs = build_generation_kwargs(args)
 
     with torch.inference_mode():
         outputs = model.generate(**inputs, **generation_kwargs)
@@ -295,6 +451,46 @@ def generate_batch(model, processor, samples, args):
     )
 
 
+def generate_batch_qwen3_omni(model, processor, process_mm_info, samples, args):
+    import torch
+
+    conversations = [build_conversation(sample, args.prompt, "qwen3_omni") for sample in samples]
+    text = processor.apply_chat_template(
+        conversations,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    audios, images, videos = process_mm_info(conversations, use_audio_in_video=False)
+    inputs = processor(
+        text=text,
+        audio=audios,
+        images=images,
+        videos=videos,
+        return_tensors="pt",
+        padding=True,
+        use_audio_in_video=False,
+    )
+    inputs = inputs.to(model_input_device(model)).to(getattr(model, "dtype", torch.bfloat16))
+
+    generation_kwargs = build_generation_kwargs(args, model=model, model_family="qwen3_omni")
+
+    with torch.inference_mode():
+        generated = model.generate(**inputs, **generation_kwargs)
+
+    prompt_len = inputs["input_ids"].shape[1]
+    return decode_qwen3_omni_generate_output(generated, processor, prompt_len)
+
+
+def generate_batch(model, processor, samples, args, model_family, process_mm_info=None):
+    if model_family == "audio_flamingo3":
+        return generate_batch_audio_flamingo3(model, processor, samples, args)
+    if model_family == "qwen3_omni":
+        if process_mm_info is None:
+            raise ValueError("process_mm_info is required for qwen3_omni generation.")
+        return generate_batch_qwen3_omni(model, processor, process_mm_info, samples, args)
+    raise ValueError(f"Unsupported model family: {model_family}")
+
+
 def write_jsonl(path, records):
     with path.open("a", encoding="utf-8") as handle:
         for record in records:
@@ -304,6 +500,8 @@ def write_jsonl(path, records):
 def main():
     args = parse_args()
     random.seed(args.seed)
+    model_family = resolve_model_family(args)
+    apply_model_defaults(args, model_family)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -318,13 +516,19 @@ def main():
         raise SystemExit("No AHa-Bench samples matched the requested arguments.")
 
     print(f"Loaded {len(samples)} AHa-Bench samples.")
-    print(f"Loading {args.model_id} ...")
-    model, processor = load_model(
+    print(f"Loading {args.model_id} ({model_family}) ...")
+    loaded = load_model(
         args.model_id,
+        model_family,
         args.torch_dtype,
         args.device_map,
         args.attn_implementation,
     )
+    process_mm_info = None
+    if model_family == "qwen3_omni":
+        model, processor, process_mm_info = loaded
+    else:
+        model, processor = loaded
 
     correct = 0
     results_by_type = {}
@@ -333,14 +537,22 @@ def main():
     for start in range(0, len(samples), args.batch_size):
         batch = samples[start : start + args.batch_size]
         try:
-            predictions = generate_batch(model, processor, batch, args)
+            predictions = generate_batch(
+                model,
+                processor,
+                batch,
+                args,
+                model_family,
+                process_mm_info=process_mm_info,
+            )
         except (urllib.error.URLError, TimeoutError) as exc:
             print(f"Skipping batch at offset {start}: failed to fetch/process audio: {exc}")
             continue
 
         records = []
         for sample, prediction in zip(batch, predictions):
-            is_correct, normalized_prediction = score_prediction(prediction, sample["answer"])
+            answer_text = strip_thinking_content(prediction)
+            is_correct, normalized_prediction = score_prediction(answer_text, sample["answer"])
             correct += int(is_correct)
             bucket = results_by_type.setdefault(sample["type"] or "unknown", {"correct": 0, "total": 0})
             bucket["correct"] += int(is_correct)
@@ -349,6 +561,7 @@ def main():
             record = {
                 **sample,
                 "prediction": prediction,
+                "answer_text": answer_text,
                 "normalized_prediction": normalized_prediction,
                 "correct": is_correct,
             }
@@ -364,6 +577,7 @@ def main():
     total = sum(bucket["total"] for bucket in results_by_type.values())
     summary = {
         "model_id": args.model_id,
+        "model_family": model_family,
         "dataset": args.dataset,
         "config": args.config,
         "split": args.split,

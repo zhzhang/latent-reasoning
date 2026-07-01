@@ -1,6 +1,9 @@
 import argparse
-import glob
 import os
+
+from utils import download_url, ensure_libcuda_on_path, load_jsonl
+
+ensure_libcuda_on_path()
 
 import torch
 from transformers import AutoTokenizer
@@ -17,7 +20,6 @@ from qwen3 import (
     download_from_huggingface_from_snapshots,
     load_weights_into_qwen,
 )
-from utils import download_url, load_jsonl
 
 GSM8K_TEST_URL = (
     "https://raw.githubusercontent.com/openai/grade-school-math/"
@@ -39,23 +41,6 @@ MATH_INSTRUCTION = (
 
 # Token id for `` in Qwen3 thinking models.
 THINK_END_TOKEN_ID = 151668
-
-
-def ensure_libcuda_on_path():
-    """Make libcuda.so discoverable so torch.compile's Triton backend can build.
-
-    On some setups libcuda.so.1 exists but is not in the linker cache, which makes
-    Triton fail with "libcuda.so cannot found!". Triton re-reads LD_LIBRARY_PATH
-    from the environment at compile time, so prepending the right directory here is
-    enough (no need to relaunch the process).
-    """
-    for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"):
-        if glob.glob(os.path.join(d, "libcuda.so*")):
-            current = os.environ.get("LD_LIBRARY_PATH", "")
-            if d not in current.split(":"):
-                os.environ["LD_LIBRARY_PATH"] = (d + ":" + current).rstrip(":")
-            return d
-    return None
 
 
 def load_model_and_tokenizer(repo_id, local_dir, device, compile_model=True):
@@ -80,7 +65,6 @@ def load_model_and_tokenizer(repo_id, local_dir, device, compile_model=True):
     model.eval()
 
     if compile_model and device == "cuda":
-        ensure_libcuda_on_path()
         print("Compiling model with torch.compile (first step will be slow) ...")
         # Compile forward (not the whole module): generate() is a Python loop that
         # calls self.forward each step, so the compiled graph must live on forward.

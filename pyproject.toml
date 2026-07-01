@@ -6,8 +6,22 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.14.0",
+    "braceexpand>=0.1.7",
+    "einops-exts>=0.0.4",
+    "ftfy>=6.3.1",
+    "h5py>=3.16.0",
+    "huggingface-hub>=1.20.1",
     "librosa>=0.11.0",
     "lm-eval>=0.4.12",
+    "nnaudio>=0.3.4",
+    "pyyaml>=6.0.3",
+    "qwen-omni-utils>=0.0.8",
+    "safetensors>=0.8.0",
     "torch>=2.12.1",
+    "torchaudio>=2.11.0",
+    "torchlibrosa>=0.1.0",
+    "torchvision>=0.27.1",
     "transformers>=5.12.1",
+    "webdataset>=1.0.2",
+    "wget>=3.2",
 ]
