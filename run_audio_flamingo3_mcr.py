@@ -550,12 +550,12 @@ def audio_flamingo2_autocast(torch_module, precision):
     from contextlib import suppress
 
     if precision == "amp":
-        return torch_module.cuda.amp.autocast()
+        return lambda: torch_module.cuda.amp.autocast()
     if precision in ("amp_bfloat16", "amp_bf16"):
-        return torch_module.amp.autocast("cuda", dtype=torch_module.bfloat16)
+        return lambda: torch_module.amp.autocast("cuda", dtype=torch_module.bfloat16)
     if precision == "fp16":
-        return torch_module.amp.autocast("cuda", dtype=torch_module.float16)
-    return suppress()
+        return lambda: torch_module.amp.autocast("cuda", dtype=torch_module.float16)
+    return lambda: suppress()
 
 
 def is_audio_flamingo2_code_dir(path):
