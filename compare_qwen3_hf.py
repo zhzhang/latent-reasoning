@@ -21,10 +21,6 @@ import json
 import os
 from dataclasses import dataclass
 
-from utils import ensure_libcuda_on_path
-
-ensure_libcuda_on_path()
-
 import torch
 from transformers import Qwen3ForCausalLM
 

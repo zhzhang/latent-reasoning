@@ -1,8 +1,3 @@
-from utils import ensure_cuda_runtime_on_path, ensure_libcuda_on_path, resolve_attn_implementation
-
-ensure_libcuda_on_path()
-ensure_cuda_runtime_on_path()
-
 import argparse
 import json
 import os
@@ -299,7 +294,6 @@ def load_model(model_id, model_family, torch_dtype, device_map, attn_implementat
     }
     resolved_dtype = dtype_lookup[torch_dtype]
     kwargs = {"device_map": device_map}
-    attn_implementation = resolve_attn_implementation(attn_implementation)
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
 

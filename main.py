@@ -1,9 +1,7 @@
 import argparse
 import os
 
-from utils import download_url, ensure_libcuda_on_path, load_jsonl
-
-ensure_libcuda_on_path()
+from utils import download_url, load_jsonl
 
 import torch
 from transformers import AutoTokenizer

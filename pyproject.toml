@@ -13,6 +13,7 @@ dependencies = [
     "huggingface-hub>=1.20.1",
     "librosa>=0.11.0",
     "lm-eval>=0.4.12",
+    "modal>=1.5.1",
     "nnaudio>=0.3.4",
     "openai>=1.82.0",
     "peft>=0.15.2",

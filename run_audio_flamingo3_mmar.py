@@ -1,12 +1,4 @@
-from utils import (
-    ensure_cuda_runtime_on_path,
-    ensure_libcuda_on_path,
-    ensure_mmar_audio,
-    resolve_attn_implementation,
-)
-
-ensure_libcuda_on_path()
-ensure_cuda_runtime_on_path()
+from utils import ensure_mmar_audio
 
 import argparse
 import json
@@ -287,9 +279,8 @@ def load_audio_flamingo3(args):
         "device_map": args.device_map,
         "torch_dtype": torch_dtype_value(torch, args.torch_dtype),
     }
-    attn_implementation = resolve_attn_implementation(args.attn_implementation)
-    if attn_implementation:
-        kwargs["attn_implementation"] = attn_implementation
+    if args.attn_implementation:
+        kwargs["attn_implementation"] = args.attn_implementation
 
     local_id = args.local_model_dir
     if not local_id:

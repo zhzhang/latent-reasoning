@@ -1,8 +1,3 @@
-from utils import ensure_cuda_runtime_on_path, ensure_libcuda_on_path, resolve_attn_implementation
-
-ensure_libcuda_on_path()
-ensure_cuda_runtime_on_path()
-
 import argparse
 import json
 import random
@@ -367,9 +362,8 @@ class AudioFlamingo3Adapter:
             "device_map": args.device_map,
             "torch_dtype": torch_dtype_value(torch, args.torch_dtype),
         }
-        attn_implementation = resolve_attn_implementation(args.attn_implementation)
-        if attn_implementation:
-            kwargs["attn_implementation"] = attn_implementation
+        if args.attn_implementation:
+            kwargs["attn_implementation"] = args.attn_implementation
 
         self.processor = AutoProcessor.from_pretrained(args.model_id)
         self.model = AudioFlamingo3ForConditionalGeneration.from_pretrained(args.model_id, **kwargs)
@@ -413,9 +407,8 @@ class Qwen3OmniAdapter:
             "device_map": args.device_map,
             "dtype": torch_dtype_value(torch, args.torch_dtype),
         }
-        attn_implementation = resolve_attn_implementation(args.attn_implementation)
-        if attn_implementation:
-            kwargs["attn_implementation"] = attn_implementation
+        if args.attn_implementation:
+            kwargs["attn_implementation"] = args.attn_implementation
 
         self.model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(args.model_id, **kwargs)
         if hasattr(self.model, "disable_talker"):
