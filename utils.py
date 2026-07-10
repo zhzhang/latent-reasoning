@@ -2,9 +2,14 @@ import glob
 import gzip
 import json
 import os
+import tarfile
+from pathlib import Path
 
 import requests
 from tqdm import tqdm
+
+MMAR_DATASET_REPO = "BoJack/MMAR"
+MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
 
 
 def _prepend_ld_library_path(directory):
@@ -135,3 +140,68 @@ def load_jsonl(
                 new_item["category"] = item[category]
             list_data_dict.append(new_item)
     return list_data_dict
+
+
+def count_wav_files(audio_dir):
+    """Return the number of ``.wav`` files directly under ``audio_dir``."""
+    audio_path = Path(audio_dir)
+    if not audio_path.is_dir():
+        return 0
+    return sum(1 for path in audio_path.iterdir() if path.is_file() and path.suffix.lower() == ".wav")
+
+
+def ensure_mmar_audio(
+    data_root,
+    audio_dir=None,
+    min_wav_files=1000,
+    force_download=False,
+):
+    """Download and extract the MMAR audio archive if local clips are missing.
+
+    The archive is cached under ``<data_root>/data/mmar-audio.tar.gz`` and
+    extracted so metadata paths like ``./audio/<id>.wav`` resolve under
+    ``<data_root>/audio``.
+    """
+    data_root = Path(data_root).expanduser().resolve()
+    audio_path = Path(audio_dir).expanduser().resolve() if audio_dir else data_root / "audio"
+    cache_dir = data_root / "data"
+    archive_path = cache_dir / MMAR_AUDIO_ARCHIVE
+
+    wav_count = count_wav_files(audio_path)
+    if wav_count >= min_wav_files and not force_download:
+        print(f"MMAR audio already present: {wav_count} wav files in {audio_path}")
+        return str(audio_path)
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise SystemExit(
+            "huggingface_hub is required to download MMAR audio. Try:\n"
+            "  pip install huggingface_hub\n"
+            f"Original import error: {exc}"
+        ) from exc
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not archive_path.exists() or force_download:
+        print(f"Downloading {MMAR_AUDIO_ARCHIVE} from {MMAR_DATASET_REPO} ...")
+        downloaded = hf_hub_download(
+            repo_id=MMAR_DATASET_REPO,
+            filename=MMAR_AUDIO_ARCHIVE,
+            repo_type="dataset",
+            local_dir=str(cache_dir),
+        )
+        archive_path = Path(downloaded)
+    else:
+        print(f"Using cached archive: {archive_path}")
+
+    print(f"Extracting {archive_path} into {data_root} ...")
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=data_root)
+
+    wav_count = count_wav_files(audio_path)
+    print(f"Extracted {wav_count} wav files to {audio_path}")
+    if wav_count < min_wav_files:
+        raise RuntimeError(
+            f"Expected at least {min_wav_files} wav files in {audio_path}, found {wav_count}."
+        )
+    return str(audio_path)
