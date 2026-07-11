@@ -21,7 +21,7 @@ Usage:
     uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
     uv run modal run run_audio_flamingo3_mmar.py --no-think --num-samples 4
     # (--no-think disables the AF-Think adapter)
-    OPENAI_API_KEY=... uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
+    uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
     # Rubric scoring is on by default; pass --no-score to skip OpenAI grading.
 
 Download results locally:
@@ -35,9 +35,9 @@ Each published run includes:
   - scores.json                  aggregate accuracy / rubric score
   - manifest.json
 
-Requires Modal Secret ``huggingface-secret`` with ``HF_TOKEN``.
-For rubric scoring (default), set ``OPENAI_API_KEY`` locally so it is injected
-into the container.
+Requires Modal Secrets:
+  - ``huggingface-secret`` with ``HF_TOKEN``
+  - ``openai-secret`` with ``OPENAI_API_KEY`` (for rubric scoring; default on)
 """
 
 from __future__ import annotations
@@ -85,10 +85,7 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
 
 hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
-# Injected when present locally; empty string is fine when not scoring.
-openai_secret = modal.Secret.from_dict(
-    {"OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "")}
-)
+openai_secret = modal.Secret.from_name("openai-secret", required_keys=["OPENAI_API_KEY"])
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -147,21 +144,77 @@ def model_param_dtype(model):
     return next(model.parameters()).dtype
 
 
-def prepare_model_inputs(inputs, model):
-    """Move processor outputs to the model device/dtype.
+def unwrap_model(model):
+    if hasattr(model, "get_base_model"):
+        try:
+            return model.get_base_model()
+        except Exception:
+            pass
+    return model
 
-    Audio features come back as float32; AF3 weights are often bfloat16/float16,
-    so a plain ``.to(device)`` leaves a dtype mismatch in the audio encoder.
+
+def audio_tower_dtype(model):
+    """Dtype of the Whisper-style audio encoder (may differ from the LLM)."""
+    root = unwrap_model(model)
+    inner = getattr(root, "model", root)
+    tower = getattr(inner, "audio_tower", None) or getattr(root, "audio_tower", None)
+    if tower is None:
+        return model_param_dtype(model)
+    return next(tower.parameters()).dtype
+
+
+def cast_floating_state_dict(state_dict, dtype):
+    import torch
+
+    out = {}
+    for key, value in state_dict.items():
+        if torch.is_tensor(value) and value.is_floating_point():
+            out[key] = value.to(dtype=dtype)
+        else:
+            out[key] = value
+    return out
+
+
+def cast_model_floating_tensors(model, dtype):
+    """Cast parameters/buffers to ``dtype`` in-place without disturbing device_map."""
+    import torch
+
+    if dtype is None or dtype == "auto":
+        return model
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None or not param.is_floating_point() or param.dtype == dtype:
+                continue
+            module._parameters[name] = torch.nn.Parameter(
+                param.data.to(dtype=dtype),
+                requires_grad=param.requires_grad,
+            )
+        for name, buf in list(module._buffers.items()):
+            if buf is None or not torch.is_tensor(buf):
+                continue
+            if not buf.is_floating_point() or buf.dtype == dtype:
+                continue
+            module._buffers[name] = buf.to(dtype=dtype)
+    return model
+
+
+def prepare_model_inputs(inputs, model):
+    """Move processor outputs onto the model device with per-tower dtypes.
+
+    AF3's audio encoder conv stack must see ``input_features`` in the encoder's
+    dtype. Casting *all* floats to the LLM dtype (or leaving features as float32
+    against a bf16 encoder) triggers the Float/BFloat16 mismatches we hit.
+    Masks stay on-device without a dtype cast.
     """
     device = model_input_device(model)
-    dtype = model_param_dtype(model)
+    feature_dtype = audio_tower_dtype(model)
     prepared = {}
     for key, value in inputs.items():
         if not hasattr(value, "to"):
             prepared[key] = value
             continue
-        if getattr(value, "is_floating_point", lambda: False)():
-            prepared[key] = value.to(device=device, dtype=dtype)
+        if key == "input_features":
+            prepared[key] = value.to(device=device, dtype=feature_dtype)
         else:
             prepared[key] = value.to(device=device)
     return prepared
@@ -334,9 +387,10 @@ def load_audio_flamingo3(args):
     from peft import PeftModel
     from transformers import AudioFlamingo3ForConditionalGeneration, AutoProcessor
 
+    target_dtype = torch_dtype_value(torch, args.torch_dtype)
     kwargs = {
         "device_map": args.device_map,
-        "torch_dtype": torch_dtype_value(torch, args.torch_dtype),
+        "torch_dtype": target_dtype,
     }
     if args.attn_implementation:
         kwargs["attn_implementation"] = args.attn_implementation
@@ -355,15 +409,32 @@ def load_audio_flamingo3(args):
             )
 
         print("Loading AF-Think PEFT adapter ...")
-        non_lora_trainables = torch.load(
-            non_lora_path,
-            map_location="cpu",
-            weights_only=False,
+        # non_lora weights are typically saved as float32; cast before load so we
+        # do not silently mix Float and BFloat16 parameters inside the encoder.
+        resolve_dtype = (
+            model_param_dtype(model) if target_dtype == "auto" else target_dtype
+        )
+        non_lora_trainables = cast_floating_state_dict(
+            torch.load(
+                non_lora_path,
+                map_location="cpu",
+                weights_only=False,
+            ),
+            resolve_dtype,
         )
         model.load_state_dict(non_lora_trainables, strict=False)
         model = PeftModel.from_pretrained(model, local_id, subfolder="think")
 
+    # Unify floating dtypes after adapter load. Think non_lora weights and some
+    # embeddings/LayerNorms otherwise remain float32 while convs are bf16.
+    unify_dtype = model_param_dtype(model) if target_dtype == "auto" else target_dtype
+    cast_model_floating_tensors(model, unify_dtype)
     model.eval()
+    print(
+        f"Model ready: param_dtype={model_param_dtype(model)}, "
+        f"audio_tower_dtype={audio_tower_dtype(model)}, "
+        f"device={model_input_device(model)}"
+    )
     return model, processor
 
 
@@ -431,8 +502,9 @@ def run_rubrics_scoring(predictions_path, meta_path, evaluated_path, *, required
     if not api_key.strip():
         message = (
             "OPENAI_API_KEY is not set; cannot run MMAR-Rubrics grading.\n"
-            "Export OPENAI_API_KEY locally before `modal run`, e.g.:\n"
-            "  OPENAI_API_KEY=... uv run modal run run_audio_flamingo3_mmar.py --num-samples 8"
+            "Ensure Modal Secret ``openai-secret`` exists with key OPENAI_API_KEY:\n"
+            "  uv run modal secret create openai-secret OPENAI_API_KEY=...\n"
+            "Or pass --no-score to skip grading."
         )
         if required:
             raise SystemExit(message)
