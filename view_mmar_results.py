@@ -2,15 +2,14 @@
 
 Reads:
   - MMAR-meta.jsonl (questions, GT reasoning, instance rubrics)
-  - output/results/audio_flamingo3_mmar/<run>/predictions.jsonl
-  - output/results/audio_flamingo3_mmar/<run>/predictions.evaluated.jsonl
-  - output/results/audio_flamingo3_mmar/<run>/scores.json / manifest.json
+  - Run folders under ``outputs/`` (direct or nested ``mmar/af3/<run>/``):
+      predictions.jsonl, predictions.evaluated.jsonl, scores.json, manifest.json
 
 Usage:
 
     uv run python view_mmar_results.py
     uv run python view_mmar_results.py --port 7860
-    uv run python view_mmar_results.py --results-dir ./output/results/audio_flamingo3_mmar
+    uv run python view_mmar_results.py --results-dir ./outputs
     uv run python view_mmar_results.py --meta ./output/data/mmar/MMAR-meta.jsonl
 """
 
@@ -28,7 +27,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_RESULTS_DIR = ROOT / "output" / "results" / "audio_flamingo3_mmar"
+DEFAULT_RESULTS_DIR = ROOT / "outputs"
 DEFAULT_META = ROOT / "output" / "data" / "mmar" / "MMAR-meta.jsonl"
 DEFAULT_AUDIO_DIR = ROOT / "output" / "data" / "mmar" / "audio"
 MMAR_META_URL = (
@@ -80,13 +79,43 @@ def meta_by_id() -> dict[str, dict]:
     return {item["id"]: item for item in load_jsonl(path) if "id" in item}
 
 
-def list_runs(results_dir: Path) -> list[dict]:
+def is_run_dir(path: Path) -> bool:
+    """True if ``path`` looks like an AF3 MMAR run folder."""
+    return path.is_dir() and (
+        (path / "manifest.json").is_file() or (path / "predictions.jsonl").is_file()
+    )
+
+
+def iter_run_dirs(results_dir: Path) -> list[Path]:
+    """Find run folders under ``results_dir``.
+
+    Supports both layouts produced by ``download_results.py``:
+      - outputs/<run_id>/                  (download of mmar/af3)
+      - outputs/mmar/af3/<run_id>/         (full volume sync)
+    Also works when ``--results-dir`` points directly at ``mmar/af3``.
+    """
     if not results_dir.is_dir():
         return []
+
+    found: dict[str, Path] = {}
+
+    def _add_from(parent: Path) -> None:
+        if not parent.is_dir():
+            return
+        for child in parent.iterdir():
+            if is_run_dir(child):
+                found[child.name] = child
+
+    _add_from(results_dir)
+    _add_from(results_dir / "mmar" / "af3")
+    _add_from(results_dir / "af3")
+
+    return sorted(found.values(), key=lambda p: p.name, reverse=True)
+
+
+def list_runs(results_dir: Path) -> list[dict]:
     runs = []
-    for child in sorted(results_dir.iterdir(), reverse=True):
-        if not child.is_dir():
-            continue
+    for child in iter_run_dirs(results_dir):
         manifest = load_json(child / "manifest.json") or {}
         scores = load_json(child / "scores.json")
         preds = child / "predictions.jsonl"
@@ -111,16 +140,15 @@ def list_runs(results_dir: Path) -> list[dict]:
 
 
 def resolve_run_dir(results_dir: Path, run_id: str | None) -> Path | None:
+    run_dirs = iter_run_dirs(results_dir)
     if run_id:
+        for path in run_dirs:
+            if path.name == run_id:
+                return path
+        # Back-compat: allow an explicit relative path under results_dir.
         path = results_dir / run_id
-        return path if path.is_dir() else None
-    latest = results_dir / "latest"
-    if latest.is_dir():
-        return latest
-    runs = [p for p in results_dir.iterdir() if p.is_dir()] if results_dir.is_dir() else []
-    if not runs:
-        return None
-    return sorted(runs, key=lambda p: p.name, reverse=True)[0]
+        return path if is_run_dir(path) else None
+    return run_dirs[0] if run_dirs else None
 
 
 def index_by_id(path: Path) -> dict[str, dict]:
@@ -332,10 +360,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   input[type="search"] { min-width: 14rem; }
   main {
     max-width: 1280px; margin: 0 auto; padding: 1.25rem;
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  .content {
     display: grid; grid-template-columns: 340px 1fr; gap: 1rem;
+    min-width: 0;
   }
   @media (max-width: 960px) {
-    main { grid-template-columns: 1fr; }
+    .content { grid-template-columns: 1fr; }
   }
   .panel {
     background: var(--card); border: 1px solid var(--line);
@@ -343,7 +375,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .stats {
     display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.6rem;
-    margin-bottom: 1rem;
   }
   @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } }
   .stat {
@@ -352,7 +383,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .stat .k { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .stat .v { font-family: "Space Grotesk", sans-serif; font-size: 1.4rem; margin-top: 0.15rem; }
-  .list-panel { overflow: hidden; display: flex; flex-direction: column; max-height: calc(100vh - 8rem); }
+  .list-panel { overflow: hidden; display: flex; flex-direction: column; max-height: calc(100vh - 12rem); }
   .list-head {
     padding: 0.85rem 1rem; border-bottom: 1px solid var(--line);
     display: flex; justify-content: space-between; align-items: baseline;
@@ -408,7 +439,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border: 1px solid var(--line); border-radius: 10px; padding: 0.85rem 1rem;
     background: var(--bg); white-space: pre-wrap; line-height: 1.5; font-size: 0.95rem;
   }
-  .box.mono { font-family: "IBM Plex Mono", monospace; font-size: 0.85rem; }
+  .box.mono {
+    font-family: "IBM Plex Mono", monospace; font-size: 0.85rem;
+    overflow-x: auto; max-height: 28rem; overflow-y: auto;
+  }
+  .box.muted { color: var(--muted); }
+  .section-hint {
+    font-size: 0.75rem; color: var(--muted); font-weight: 400;
+    margin-left: 0.35rem;
+  }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
   @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
   .rubric { display: grid; gap: 0.55rem; }
@@ -460,8 +499,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </header>
   <main>
-    <div>
-      <div class="stats" id="stats"></div>
+    <div class="stats" id="stats"></div>
+    <div class="content">
       <div class="panel list-panel">
         <div class="list-head">
           <span id="list-count">0 examples</span>
@@ -469,8 +508,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="list" id="list"></div>
       </div>
+      <div class="panel detail empty" id="detail">Select an example</div>
     </div>
-    <div class="panel detail empty" id="detail">Select an example</div>
   </main>
 <script>
 const LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -654,11 +693,20 @@ async function selectExample(id) {
     ${cues.length ? `<div class="section"><h3>Reasoning cues</h3><div class="tags">${cues.map(c => tag(c)).join("")}</div></div>` : ""}
 
     <div class="section">
+      <h3>Raw generation<span class="section-hint">decoded tokens, special tokens included · no answer extraction</span></h3>
+      ${
+        example.model_output
+          ? `<div class="box mono">${escapeHtml(example.model_output)}</div>`
+          : example.has_generation
+            ? `<div class="box mono muted">No model_output field on this record (older run may have omitted it).</div>`
+            : `<div class="box mono muted">No generation in this run.</div>`
+      }
+    </div>
+
+    <div class="section">
       <h3>Instance rubric${example.has_grade ? " + grades" : ""}</h3>
       ${renderRubric(example)}
     </div>
-
-    ${example.model_output ? `<div class="section"><h3>Raw model output</h3><div class="box mono">${escapeHtml(example.model_output)}</div></div>` : ""}
   `;
 }
 
@@ -750,11 +798,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/runs":
             runs = list_runs(results_dir)
-            default = None
-            if (results_dir / "latest").is_dir():
-                default = "latest"
-            elif runs:
-                default = runs[0]["id"]
+            default = runs[0]["id"] if runs else None
             self._json(
                 {
                     "runs": runs,
@@ -819,7 +863,7 @@ def parse_args() -> argparse.Namespace:
         "--results-dir",
         type=Path,
         default=DEFAULT_RESULTS_DIR,
-        help="Directory containing AF3 MMAR run folders",
+        help="Directory containing AF3 MMAR run folders (default: outputs)",
     )
     parser.add_argument(
         "--meta",

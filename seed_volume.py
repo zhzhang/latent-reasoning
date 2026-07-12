@@ -50,7 +50,10 @@ MODELS_ROOT = VOLUME_MOUNT / "models"
 
 MMAR_REPO = "BoJack/MMAR"
 MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
-MMAR_META_JSON = "MMAR-meta.json"
+# HF MMAR-meta.json omits thinking/rubric/cue required by MMAR-Rubrics scoring.
+# Use the GitHub release that includes instance rubrics + GT CoT.
+MMAR_META_URL = "https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl"
+MMAR_RUBRIC_KEYS = ("thinking", "rubric", "cue")
 AHA_REPO = "ahabench/AHa-Bench"
 MIN_MMAR_WAVS = 1000
 MIN_DISK_SIZE = 524288
@@ -102,21 +105,34 @@ def _count_wavs(audio_dir: Path) -> int:
     return sum(1 for path in audio_dir.iterdir() if path.is_file() and path.suffix.lower() == ".wav")
 
 
-def _write_jsonl_from_json(src: Path, dest: Path) -> int:
-    with open(src, encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if isinstance(payload, dict):
-        records = [payload]
-    elif isinstance(payload, list):
-        records = payload
-    else:
-        raise TypeError(f"Unexpected JSON root type in {src}: {type(payload)}")
+def _meta_has_rubrics(meta_path: Path) -> bool:
+    if not meta_path.exists() or meta_path.stat().st_size == 0:
+        return False
+    with open(meta_path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            return all(key in record for key in MMAR_RUBRIC_KEYS)
+    return False
+
+
+def _download_mmar_rubric_meta(dest: Path) -> int:
+    """Download MMAR-meta.jsonl with thinking/rubric/cue from GitHub."""
+    import urllib.request
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    return len(records)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    print(f"Downloading rubric meta from {MMAR_META_URL} ...")
+    urllib.request.urlretrieve(MMAR_META_URL, tmp)
+    if not _meta_has_rubrics(tmp):
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Downloaded MMAR meta is missing required keys {MMAR_RUBRIC_KEYS}: {tmp}"
+        )
+    tmp.replace(dest)
+    with open(dest, encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
 def _dir_nonempty(path: Path) -> bool:
@@ -157,12 +173,29 @@ def seed_mmar(force: bool = False) -> dict:
     archive_cache = dest_root / "data" / MMAR_AUDIO_ARCHIVE
 
     wav_count = _count_wavs(audio_dir)
-    if wav_count >= MIN_MMAR_WAVS and meta_path.exists() and not force:
+    meta_ok = _meta_has_rubrics(meta_path)
+    if wav_count >= MIN_MMAR_WAVS and meta_ok and not force:
         summary = {
             "dataset": "mmar",
             "status": "skipped",
             "wav_files": wav_count,
             "meta": str(meta_path),
+            "meta_has_rubrics": True,
+        }
+        print(summary)
+        return summary
+
+    # Audio is present but meta lacks rubrics: refresh meta only (no full re-download).
+    if wav_count >= MIN_MMAR_WAVS and not meta_ok and not force:
+        n_meta = _download_mmar_rubric_meta(meta_path)
+        volume.commit()
+        summary = {
+            "dataset": "mmar",
+            "status": "meta_refreshed",
+            "wav_files": wav_count,
+            "meta_records": n_meta,
+            "meta_has_rubrics": True,
+            "path": str(dest_root),
         }
         print(summary)
         return summary
@@ -197,17 +230,6 @@ def seed_mmar(force: bool = False) -> dict:
             raise RuntimeError(f"No audio/ directory found after extracting {archive_tmp}")
         candidate_audio = matches[0]
 
-    print(f"Downloading {MMAR_META_JSON} from {MMAR_REPO} ...")
-    meta_json = Path(
-        hf_hub_download(
-            repo_id=MMAR_REPO,
-            filename=MMAR_META_JSON,
-            repo_type="dataset",
-            local_dir=str(tmp_root / "download"),
-            token=os.environ.get("HF_TOKEN"),
-        )
-    )
-
     if dest_root.exists() and force:
         shutil.rmtree(dest_root)
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -217,7 +239,7 @@ def seed_mmar(force: bool = False) -> dict:
         shutil.rmtree(audio_dir)
     shutil.copytree(candidate_audio, audio_dir)
     shutil.copy2(archive_tmp, archive_cache)
-    n_meta = _write_jsonl_from_json(meta_json, meta_path)
+    n_meta = _download_mmar_rubric_meta(meta_path)
 
     wav_count = _count_wavs(audio_dir)
     if wav_count < MIN_MMAR_WAVS:
@@ -231,6 +253,7 @@ def seed_mmar(force: bool = False) -> dict:
         "status": "ok",
         "wav_files": wav_count,
         "meta_records": n_meta,
+        "meta_has_rubrics": True,
         "path": str(dest_root),
     }
     print(summary)

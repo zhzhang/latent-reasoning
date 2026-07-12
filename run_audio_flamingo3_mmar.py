@@ -5,11 +5,13 @@ and weights, and writes eval outputs to ``latent-reasoning-results``:
 
     /cache/data/mmar/          # MMAR audio + MMAR-meta.jsonl
     /cache/models/<repo_id>/   # AF3 weights
-    /results/mmar/audio_flamingo3_mmar/<run_id>/
+    /results/mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
-      predictions.evaluated.jsonl    # OpenAI rubric grades
+      predictions.evaluated.jsonl    # OpenAI rubric grades (pipelined)
       scores.json
       manifest.json
+
+Local mirror (via ``download_results.py``): ``<repo>/outputs/mmar/af3/<run_id>/``.
 
 Prereqs (one-time):
 
@@ -22,7 +24,7 @@ Usage:
     uv run modal run run_audio_flamingo3_mmar.py --no-think --num-samples 4
     # (--no-think disables the AF-Think adapter)
     uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
-    # Rubric scoring is on by default; pass --no-score to skip OpenAI grading.
+    # Rubric scoring is pipelined with generation by default; pass --no-score to skip.
 
 Download results locally:
 
@@ -35,6 +37,10 @@ Each published run includes:
   - scores.json                  aggregate accuracy / rubric score
   - manifest.json
 
+OpenAI grading runs concurrently with AF3 generation: each written prediction
+batch is submitted to a background rubric grader so API traffic is spread over
+the run (fewer burst rate-limit hits) and wall time overlaps GPU + API work.
+
 Requires Modal Secrets:
   - ``huggingface-secret`` with ``HF_TOKEN``
   - ``openai-secret`` with ``OPENAI_API_KEY`` (for rubric scoring; default on)
@@ -42,6 +48,7 @@ Requires Modal Secrets:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -49,7 +56,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,8 +79,12 @@ MODELS_ROOT = VOLUME_MOUNT / "models"
 DEFAULT_MODEL_ID = "nvidia/audio-flamingo-3-hf"
 DEFAULT_DATA_ROOT = DATA_ROOT / "mmar"
 DEFAULT_META = DEFAULT_DATA_ROOT / "MMAR-meta.jsonl"
-DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "mmar" / "audio_flamingo3_mmar"
+DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "mmar" / "af3"
 DEFAULT_LOCAL_MODEL_DIR = MODELS_ROOT / DEFAULT_MODEL_ID
+
+# HF BoJack/MMAR MMAR-meta.json omits these; GitHub jsonl includes them.
+MMAR_META_URL = "https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl"
+MMAR_RUBRIC_KEYS = ("thinking", "rubric", "cue")
 
 CHOICE_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 THINK_SUFFIX = "Please think and reason about the input audio before you respond."
@@ -461,20 +474,27 @@ def generate_batch(model, processor, samples, args):
         outputs = model.generate(**inputs, **generation_kwargs(args))
 
     prompt_len = inputs["input_ids"].shape[1]
-    decoded = processor.batch_decode(
-        outputs[:, prompt_len:],
+    generated_ids = outputs[:, prompt_len:]
+    # Clean text for CoT / answer parsing.
+    decoded_clean = processor.batch_decode(
+        generated_ids,
         skip_special_tokens=True,
+    )
+    # True raw decode kept for inspection (special tokens retained).
+    decoded_raw = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=False,
     )
 
     results = []
-    for sample, raw_output in zip(samples, decoded):
+    for sample, clean_output, raw_output in zip(samples, decoded_clean, decoded_raw):
         thinking_prediction, answer_prediction = parse_af3_output(
-            raw_output,
+            clean_output,
             sample["choices"],
         )
         results.append(
             {
-                # Full model generation (includes CoT + final answer text).
+                # Full decoded generation with special tokens retained.
                 "model_output": raw_output,
                 # Parsed chain-of-thought / reasoning trace.
                 "thinking_prediction": thinking_prediction,
@@ -494,6 +514,58 @@ def load_completed_ids(predictions_path):
         if record_id:
             completed.add(record_id)
     return completed
+
+
+def meta_has_rubrics(meta_path: Path) -> bool:
+    if not meta_path.exists() or meta_path.stat().st_size == 0:
+        return False
+    for item in load_jsonl(meta_path):
+        return all(key in item for key in MMAR_RUBRIC_KEYS)
+    return False
+
+
+def ensure_rubric_meta(meta_path: Path, dest: Path | None = None) -> Path:
+    """Return a meta path that includes thinking/rubric/cue for MMAR-Rubrics.
+
+    Downloads the GitHub MMAR-meta.jsonl when the volume copy is the HF
+    variant that omits those fields.
+    """
+    if meta_has_rubrics(meta_path):
+        return meta_path
+
+    import urllib.request
+
+    dest = dest or meta_path
+    print(
+        f"MMAR meta at {meta_path} is missing {MMAR_RUBRIC_KEYS}; "
+        f"downloading rubric-complete meta from {MMAR_META_URL} -> {dest}"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    urllib.request.urlretrieve(MMAR_META_URL, tmp)
+    if not meta_has_rubrics(tmp):
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(
+            f"Downloaded MMAR meta still missing {MMAR_RUBRIC_KEYS}. "
+            "Cannot run rubric scoring."
+        )
+    tmp.replace(dest)
+    return dest
+
+
+def unscored_prediction_ids(predictions_path: Path, evaluated_path: Path) -> set[str]:
+    """Return prediction ids that do not yet appear in the evaluated file."""
+    if not predictions_path.exists() or predictions_path.stat().st_size == 0:
+        return set()
+    pred_ids = {item["id"] for item in load_jsonl(predictions_path) if item.get("id")}
+    eval_ids: set[str] = set()
+    if evaluated_path.exists() and evaluated_path.stat().st_size > 0:
+        eval_ids = {
+            item["id"]
+            for item in load_jsonl(evaluated_path)
+            if item.get("id") and "score" in item
+        }
+    return pred_ids - eval_ids
 
 
 def run_rubrics_scoring(predictions_path, meta_path, evaluated_path, *, required: bool = True):
@@ -518,6 +590,19 @@ def run_rubrics_scoring(predictions_path, meta_path, evaluated_path, *, required
         print(message)
         return False
 
+    remaining = unscored_prediction_ids(Path(predictions_path), Path(evaluated_path))
+    if not remaining:
+        print(
+            f"All predictions already graded at {evaluated_path}; "
+            "skipping rubric subprocess."
+        )
+        return True
+
+    meta_path = ensure_rubric_meta(
+        Path(meta_path),
+        dest=Path(predictions_path).parent / "MMAR-meta.rubrics.jsonl",
+    )
+
     rubrics_script = Path("/root/evaluation_rubrics.py")
     if not rubrics_script.exists():
         # add_local_python_source places modules on sys.path; resolve via import.
@@ -535,9 +620,178 @@ def run_rubrics_scoring(predictions_path, meta_path, evaluated_path, *, required
         "--output",
         str(evaluated_path),
     ]
-    print("Running MMAR-Rubrics OpenAI evaluation ...")
+    print(
+        f"Running MMAR-Rubrics OpenAI evaluation "
+        f"({len(remaining)} remaining of "
+        f"{len(load_jsonl(predictions_path))} predictions) ..."
+    )
     subprocess.run(cmd, check=True)
     return True
+
+
+class StreamingRubricGrader:
+    """Grade predictions on a background asyncio loop while generation continues.
+
+    Spreads OpenAI calls across the generation window (fewer burst rate-limit
+    hits) and overlaps GPU work with API latency.
+    """
+
+    def __init__(
+        self,
+        evaluated_path: Path,
+        *,
+        qps: float | None = None,
+        max_workers: int | None = None,
+    ):
+        # Import only when scoring: evaluation_rubrics requires OPENAI_API_KEY.
+        import evaluation_rubrics as rubrics
+
+        self._rubrics = rubrics
+        self.evaluated_path = Path(evaluated_path)
+        self.evaluated_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._completed_ids: set[str] = set()
+        if self.evaluated_path.exists() and self.evaluated_path.stat().st_size > 0:
+            for item in load_jsonl(self.evaluated_path):
+                if item.get("id") and "score" in item:
+                    self._completed_ids.add(item["id"])
+
+        self._inflight: set[str] = set()
+        self._futures: list[Future] = []
+        self._submit_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._errors: list[dict] = []
+        self._graded = 0
+
+        self._scorer = rubrics.Scorer(
+            api_max_retries=rubrics.DEFAULT_API_MAX_RETRIES,
+            api_retry_interval=rubrics.DEFAULT_API_RETRY_INTERVAL,
+            max_workers=max_workers if max_workers is not None else rubrics.DEFAULT_MAX_WORKERS,
+            qps=qps if qps is not None else rubrics.DEFAULT_QPS,
+            timeout=rubrics.DEFAULT_TIMEOUT,
+        )
+        self._semaphore: asyncio.Semaphore | None = None
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="streaming-rubric-grader",
+            daemon=True,
+        )
+
+    def _thread_main(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._semaphore = asyncio.Semaphore(self._scorer.max_workers)
+        self._ready.set()
+        self._loop.run_forever()
+
+    def start(self) -> None:
+        print(
+            f"Starting pipelined MMAR-Rubrics grader "
+            f"(qps={self._scorer.qps}, max_workers={self._scorer.max_workers}) ..."
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=30):
+            raise RuntimeError("Streaming rubric grader failed to start")
+
+    def submit(self, records: list[dict]) -> int:
+        """Enqueue records for grading. Returns how many were newly submitted."""
+        required = self._rubrics.InputItem.__required_keys__
+        submitted = 0
+        for record in records:
+            record_id = record.get("id")
+            if not record_id:
+                continue
+            with self._submit_lock:
+                if record_id in self._completed_ids or record_id in self._inflight:
+                    continue
+                if not required <= set(record.keys()):
+                    missing = sorted(required - set(record.keys()))
+                    print(
+                        f"Skipping grade for {record_id}: "
+                        f"missing required keys {missing}"
+                    )
+                    continue
+                self._inflight.add(record_id)
+
+            future = asyncio.run_coroutine_threadsafe(
+                self._evaluate_and_write(record),
+                self._loop,
+            )
+            with self._submit_lock:
+                self._futures.append(future)
+            submitted += 1
+        return submitted
+
+    async def _evaluate_and_write(self, record: dict) -> None:
+        record_id = record["id"]
+        assert self._semaphore is not None
+        try:
+            result = await self._rubrics.evaluate_one_record(
+                self._scorer,
+                self._semaphore,
+                record_id,
+                record["question"],
+                record["answer"],
+                record["thinking"],
+                record["cue"],
+                record["choices"],
+                record["rubric"],
+                record["thinking_prediction"],
+                record["answer_prediction"],
+            )
+            if result.exception is not None:
+                with self._submit_lock:
+                    self._inflight.discard(record_id)
+                    self._errors.append(
+                        {"id": record_id, "error": result.exception}
+                    )
+                print(f"Rubric grade failed for {record_id}: {result.exception}")
+                return
+
+            evaluated = {
+                **record,
+                "new": True,
+                "score": result.score,
+                "correct": result.correct,
+                "raw_responses": result.raw_responses,
+                "rubric_results": result.rubric_results,
+            }
+            with self._write_lock:
+                write_jsonl(self.evaluated_path, [evaluated], mode="a")
+            with self._submit_lock:
+                self._inflight.discard(record_id)
+                self._completed_ids.add(record_id)
+                self._graded += 1
+        except Exception as exc:
+            with self._submit_lock:
+                self._inflight.discard(record_id)
+                self._errors.append({"id": record_id, "error": str(exc)})
+            print(f"Rubric grade failed for {record_id}: {exc}")
+
+    def drain(self) -> dict:
+        """Wait for all submitted grades to finish. Returns summary stats."""
+        with self._submit_lock:
+            futures = list(self._futures)
+            self._futures.clear()
+
+        for future in futures:
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"Rubric grade future error: {exc}")
+
+        with self._submit_lock:
+            return {
+                "graded": self._graded,
+                "errors": len(self._errors),
+                "completed_ids": len(self._completed_ids),
+            }
+
+    def close(self) -> None:
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=60)
 
 
 def summarize_evaluated(evaluated_path: Path) -> dict:
@@ -598,10 +852,21 @@ def make_run_id() -> str:
 
 
 def resolve_run_output_dir(output_dir: str | Path, run_id: str | None = None) -> Path:
-    """Place this run under ``output_dir/<run_id>/`` on the results Volume."""
+    """Place this run under ``<dataset>/<model>/<run_id>/`` on the results Volume."""
     base = Path(output_dir).expanduser()
     rid = run_id or make_run_id()
     return (base / rid).resolve()
+
+
+def find_newest_run_dir(output_dir: str | Path) -> Path | None:
+    """Return the newest timestamped run folder under ``output_dir``, if any."""
+    base = Path(output_dir).expanduser().resolve()
+    if not base.is_dir():
+        return None
+    runs = [p for p in base.iterdir() if p.is_dir()]
+    if not runs:
+        return None
+    return sorted(runs, key=lambda p: p.name, reverse=True)[0]
 
 
 def write_manifest(run_dir: Path, payload: dict) -> Path:
@@ -653,22 +918,12 @@ def publish_run_artifacts(run_dir: Path, manifest: dict | None = None) -> dict:
             artifacts[name] = str(path)
 
     results_volume.commit()
-    # Also keep a stable "latest" copy for easy download defaults.
-    latest_dir = run_dir.parent / "latest"
-    if latest_dir.exists():
-        shutil.rmtree(latest_dir)
-    shutil.copytree(run_dir, latest_dir)
-    results_volume.commit()
 
     volume_rel = volume_relative_path(run_dir, RESULTS_MOUNT)
-    latest_rel = volume_relative_path(latest_dir, RESULTS_MOUNT)
     print(f"Published results to volume:{RESULTS_VOLUME_NAME}/{volume_rel}")
-    print(f"Also updated volume:{RESULTS_VOLUME_NAME}/{latest_rel}")
     return {
         "run_dir": str(run_dir),
-        "latest_dir": str(latest_dir),
         "volume_path": volume_rel,
-        "latest_volume_path": latest_rel,
         "artifacts": artifacts,
     }
 
@@ -707,7 +962,7 @@ def finalize_scored_run(
         "evaluated": str(evaluated_path) if evaluated_path.exists() else None,
         "scores": str(run_dir / "scores.json") if (run_dir / "scores.json").exists() else None,
         "fields": {
-            "model_output": "full generation text",
+            "model_output": "full decoded generation (special tokens retained)",
             "thinking_prediction": "parsed CoT / reasoning trace",
             "answer_prediction": "parsed final answer",
             "score": "MMAR-Rubrics aggregate score (evaluated file)",
@@ -757,7 +1012,7 @@ def run_mmar(
     print_every: int = 10,
     run_id: str | None = None,
 ) -> dict:
-    """Run AF3 inference + MMAR-Rubrics OpenAI grading on Modal."""
+    """Run AF3 inference with pipelined MMAR-Rubrics OpenAI grading on Modal."""
     volume.reload()
     results_volume.reload()
 
@@ -808,16 +1063,17 @@ def run_mmar(
     }
 
     if args.score_only:
-        # Score the latest predictions under the parent output dir if this run is empty.
+        # Score the newest run under the parent output dir if this run is empty.
         if not predictions_path.exists():
-            latest_preds = Path(args.output_dir).expanduser().resolve() / "latest" / "predictions.jsonl"
-            if latest_preds.exists():
+            newest = find_newest_run_dir(args.output_dir)
+            newest_preds = newest / "predictions.jsonl" if newest else None
+            if newest_preds is not None and newest_preds.exists():
                 run_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(latest_preds, predictions_path)
+                shutil.copy2(newest_preds, predictions_path)
             else:
                 raise SystemExit(
-                    f"No predictions found at {predictions_path} "
-                    f"(and no latest at {latest_preds})"
+                    f"No predictions found at {predictions_path}"
+                    + (f" (and no run under {args.output_dir})" if newest is None else "")
                 )
         published = finalize_scored_run(
             run_dir,
@@ -834,6 +1090,12 @@ def run_mmar(
             f"MMAR metadata not found: {meta_path}\n"
             "Seed first: uv run modal run seed_volume.py --datasets mmar --models none"
         )
+
+    # HF-seeded meta lacks thinking/rubric/cue; refresh in place when needed.
+    refreshed_meta = not meta_has_rubrics(meta_path)
+    meta_path = ensure_rubric_meta(meta_path)
+    if refreshed_meta:
+        volume.commit()
 
     meta_items = load_jsonl(meta_path)
     expected_wavs = len(meta_items)
@@ -880,46 +1142,87 @@ def run_mmar(
     print(f"Writing run artifacts to {run_dir}")
     model, processor = load_audio_flamingo3(args)
 
+    # Pipeline OpenAI grading behind GPU generation so API calls are spread
+    # across the run instead of bursting after all predictions are written.
+    grader: StreamingRubricGrader | None = None
+    grade_submitted = 0
+    if args.score:
+        api_key = os.environ.get("OPENAI_API_KEY") or ""
+        if not api_key.strip():
+            raise SystemExit(
+                "OPENAI_API_KEY is not set; cannot run MMAR-Rubrics grading.\n"
+                "Ensure Modal Secret ``openai-secret`` exists with key OPENAI_API_KEY:\n"
+                "  uv run modal secret create openai-secret OPENAI_API_KEY=...\n"
+                "Or pass --no-score to skip grading."
+            )
+        grader = StreamingRubricGrader(evaluated_path)
+        grader.start()
+        # Resume: grade any predictions already on disk from a prior attempt.
+        if predictions_path.exists() and predictions_path.stat().st_size > 0:
+            n = grader.submit(load_jsonl(predictions_path))
+            grade_submitted += n
+            if n:
+                print(f"Queued {n} existing predictions for pipelined grading")
+
     start_time = time.time()
     completed = 0
     failures = []
-    for batch_start in range(0, len(pending_items), args.batch_size):
-        batch = pending_items[batch_start : batch_start + args.batch_size]
-        try:
-            outputs = generate_batch(model, processor, batch, args)
-        except (OSError, ValueError, RuntimeError) as exc:
-            ids = ", ".join(item["id"] for item in batch)
-            print(f"Skipping batch ({ids}): {exc}")
-            failures.append({"ids": [item["id"] for item in batch], "error": str(exc)})
-            continue
+    try:
+        for batch_start in range(0, len(pending_items), args.batch_size):
+            batch = pending_items[batch_start : batch_start + args.batch_size]
+            try:
+                outputs = generate_batch(model, processor, batch, args)
+            except (OSError, ValueError, RuntimeError) as exc:
+                ids = ", ".join(item["id"] for item in batch)
+                print(f"Skipping batch ({ids}): {exc}")
+                failures.append({"ids": [item["id"] for item in batch], "error": str(exc)})
+                continue
 
-        records = []
-        for item, output in zip(batch, outputs):
-            # Keep the full MMAR meta row plus generation / CoT / answer fields.
-            record = {
-                **item,
-                **output,
-            }
-            records.append(record)
-            completed += 1
-            if args.print_every > 0 and completed % args.print_every == 0:
-                elapsed = time.time() - start_time
+            records = []
+            for item, output in zip(batch, outputs):
+                # Keep the full MMAR meta row plus generation / CoT / answer fields.
+                record = {
+                    **item,
+                    **output,
+                }
+                records.append(record)
+                completed += 1
+                if args.print_every > 0 and completed % args.print_every == 0:
+                    elapsed = time.time() - start_time
+                    print(
+                        f"[{completed}/{len(pending_items)}] "
+                        f"id={item['id']} answer={output['answer_prediction']!r} "
+                        f"({elapsed:.1f}s elapsed)"
+                    )
+
+            write_jsonl(predictions_path, records, mode="a")
+            if grader is not None:
+                grade_submitted += grader.submit(records)
+            # Persist incrementally so preemption / timeout does not lose progress.
+            results_volume.commit()
+
+        print(f"Wrote predictions to {predictions_path}")
+        if completed == 0:
+            raise SystemExit(
+                f"All {len(pending_items)} generations failed; not publishing empty results.\n"
+                f"First errors: {failures[:3]}"
+            )
+    finally:
+        if grader is not None:
+            print(
+                f"Waiting for pipelined rubric grades "
+                f"({grade_submitted} submitted this run) ..."
+            )
+            try:
+                grade_stats = grader.drain()
                 print(
-                    f"[{completed}/{len(pending_items)}] "
-                    f"id={item['id']} answer={output['answer_prediction']!r} "
-                    f"({elapsed:.1f}s elapsed)"
+                    f"Pipelined grading done: graded={grade_stats['graded']} "
+                    f"errors={grade_stats['errors']} "
+                    f"on_disk={grade_stats['completed_ids']}"
                 )
-
-        write_jsonl(predictions_path, records, mode="a")
-        # Persist incrementally so preemption / timeout does not lose progress.
-        results_volume.commit()
-
-    print(f"Wrote predictions to {predictions_path}")
-    if completed == 0:
-        raise SystemExit(
-            f"All {len(pending_items)} generations failed; not publishing empty results.\n"
-            f"First errors: {failures[:3]}"
-        )
+                results_volume.commit()
+            finally:
+                grader.close()
 
     elapsed_s = round(time.time() - start_time, 1)
     published = finalize_scored_run(
@@ -933,6 +1236,7 @@ def run_mmar(
             "completed": completed,
             "failed_batches": len(failures),
             "elapsed_s": elapsed_s,
+            "pipelined_grading": bool(args.score),
         },
         score=args.score,
     )
@@ -979,7 +1283,7 @@ def main(
         data_root: MMAR root used to resolve ./audio paths.
         audio_dir: Optional override for wav directory.
         output_dir: Results Volume directory for run folders
-            (default /results/mmar/audio_flamingo3_mmar).
+            (default /results/mmar/af3).
         num_samples: Number of items (-1 = all).
         start: Offset into the meta file.
         batch_size: Generation batch size.
@@ -991,7 +1295,8 @@ def main(
         device_map: Transformers device_map.
         seed: RNG seed.
         think: Load AF-Think adapter and append the think suffix (default True).
-        score: Run OpenAI MMAR-Rubrics grading after inference (default True).
+        score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
+            (default True). Grades each batch while the next generates.
         score_only: Skip inference; only score existing predictions.
         print_every: Progress print interval.
         run_id: Optional run folder name; default is a UTC timestamp.
@@ -1020,9 +1325,9 @@ def main(
         run_id=run_id,
     )
     print("Done:", result)
-    if isinstance(result, dict) and result.get("latest_volume_path"):
+    if isinstance(result, dict) and result.get("volume_path"):
         print(
             "Download with:\n"
             f"  uv run modal run download_results.py "
-            f"--remote-path {result['latest_volume_path']}"
+            f"--remote-path {result['volume_path']}"
         )

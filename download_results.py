@@ -1,21 +1,22 @@
 """Download eval artifacts from the ``latent-reasoning-results`` Modal Volume.
 
-Layout produced by eval runners (e.g. ``run_audio_flamingo3_mmar.py``):
+Volume layout (mirrors locally under ``<repo>/outputs/``):
 
-    mmar/audio_flamingo3_mmar/<run_id>/
+    mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
       predictions.evaluated.jsonl    # OpenAI rubric grades
       scores.json
       manifest.json
-    mmar/audio_flamingo3_mmar/latest/   # copy of the most recent run
+
+The Volume root maps flatly to ``./outputs``, so a full sync yields
+``outputs/mmar/af3/<run_id>/...``.
 
 Usage:
 
     uv run modal run download_results.py
     uv run modal run download_results.py --list-only
-    uv run modal run download_results.py --remote-path mmar/audio_flamingo3_mmar/latest
-    uv run modal run download_results.py --remote-path mmar --local-dir ./output/results
-    uv run modal run download_results.py --remote-path / --local-dir ./output/results --force
+    uv run modal run download_results.py --remote-path mmar/af3
+    uv run modal run download_results.py --remote-path mmar/af3/20260712T185300Z
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ from pathlib import Path
 import modal
 
 RESULTS_VOLUME_NAME = "latent-reasoning-results"
-DEFAULT_REMOTE_PATH = "mmar/audio_flamingo3_mmar/latest"
-DEFAULT_LOCAL_DIR = Path("output/results")
+DEFAULT_REMOTE_PATH = "/"
+DEFAULT_LOCAL_DIR = Path(__file__).resolve().parent / "outputs"
 
 app = modal.App("download-results")
 results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
@@ -60,7 +61,10 @@ def download_results(
     local_dir: str | Path = DEFAULT_LOCAL_DIR,
     force: bool = True,
 ) -> Path:
-    """Download ``remote_path`` from the results Volume into ``local_dir``."""
+    """Download ``remote_path`` from the results Volume into ``local_dir``.
+
+    Volume root (``/``) maps flatly onto ``local_dir`` (default ``./outputs``).
+    """
     remote = _normalize_remote(remote_path)
     dest = Path(local_dir).expanduser().resolve()
     dest.mkdir(parents=True, exist_ok=True)
@@ -94,8 +98,8 @@ def main(
     """List or download files from ``latent-reasoning-results``.
 
     Args:
-        remote_path: Path inside the Volume (default: latest MMAR AF3 run).
-        local_dir: Local destination directory.
+        remote_path: Path inside the Volume (default: ``/``, the full tree).
+        local_dir: Local destination directory (default: ``<repo>/outputs``).
         list_only: Only print remote paths; do not download.
         force: Overwrite existing local files (passed to ``modal volume get``).
     """

@@ -575,13 +575,36 @@ async def main():
     if existing_output_data:
         logger.warning(f"Found {len(existing_output_data)} samples that have already been evaluated in the output file; evaluation of these samples will be skipped.")
 
+    # Keys that must come from MMAR-meta (GT CoT + instance rubrics). HF's
+    # MMAR-meta.json omits these; GitHub MMAR-meta.jsonl includes them.
+    RUBRIC_META_KEYS = ("thinking", "cue", "rubric")
+
     if meta_file:
         meta_data = load_jsonl_or_json(meta_file)
         id_to_meta_file = {item["id"]: item for item in meta_data}
         for item in input_data:
             meta = id_to_meta_file.get(item["id"])
-            if meta: item.update(meta)
+            if not meta:
+                continue
+            for key, value in meta.items():
+                # Always prefer meta for rubric fields; fill anything else that's missing.
+                if key in RUBRIC_META_KEYS or key not in item:
+                    item[key] = value
 
+    invalid = [
+        item for item in input_data
+        if not InputItem.__required_keys__ <= set(item.keys())
+    ]
+    if invalid:
+        sample_keys = set(invalid[0].keys())
+        missing = InputItem.__required_keys__ - sample_keys
+        raise SystemExit(
+            f"{len(invalid)}/{len(input_data)} input items missing required keys "
+            f"{sorted(missing)} (sample keys={sorted(sample_keys)}).\n"
+            "Pass --meta to MMAR-meta.jsonl that includes thinking/rubric/cue, e.g.\n"
+            "  https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl\n"
+            "Or refresh the Modal volume: uv run modal run seed_volume.py --datasets mmar --models none"
+        )
 
     all_metrics = Metrics()
     modality_metrics = defaultdict(lambda: Metrics())
