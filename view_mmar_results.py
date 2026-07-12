@@ -1,7 +1,11 @@
 """Local web UI for MMAR-Rubrics examples + AF3 generations / grades.
 
+On startup, ensures MMAR-meta.jsonl and the MMAR wav archive are persisted
+under ``data/mmar/`` so examples can be played in-browser.
+
 Reads:
   - MMAR-meta.jsonl (questions, GT reasoning, instance rubrics)
+  - Local wavs under ``data/mmar/audio/``
   - Run folders under ``outputs/`` (direct or nested ``mmar/af3/<run>/``):
       predictions.jsonl, predictions.evaluated.jsonl, scores.json, manifest.json
 
@@ -10,7 +14,7 @@ Usage:
     uv run python view_mmar_results.py
     uv run python view_mmar_results.py --port 7860
     uv run python view_mmar_results.py --results-dir ./outputs
-    uv run python view_mmar_results.py --meta ./output/data/mmar/MMAR-meta.jsonl
+    uv run python view_mmar_results.py --meta ./data/mmar/MMAR-meta.jsonl
 """
 
 from __future__ import annotations
@@ -18,6 +22,9 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import shutil
+import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 from functools import lru_cache
@@ -28,11 +35,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS_DIR = ROOT / "outputs"
-DEFAULT_META = ROOT / "output" / "data" / "mmar" / "MMAR-meta.jsonl"
-DEFAULT_AUDIO_DIR = ROOT / "output" / "data" / "mmar" / "audio"
+DEFAULT_DATA_DIR = ROOT / "data" / "mmar"
+DEFAULT_META = DEFAULT_DATA_DIR / "MMAR-meta.jsonl"
+DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
 MMAR_META_URL = (
     "https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl"
 )
+MMAR_REPO = "BoJack/MMAR"
+MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
+MIN_MMAR_WAVS = 1000
 
 # Populated in main() before the server starts.
 CONFIG: dict[str, Any] = {}
@@ -57,6 +68,16 @@ def load_json(path: Path) -> dict | None:
         return json.load(handle)
 
 
+def count_wavs(audio_dir: Path) -> int:
+    if not audio_dir.is_dir():
+        return 0
+    return sum(
+        1
+        for path in audio_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".wav"
+    )
+
+
 def ensure_meta(meta_path: Path) -> Path:
     """Download MMAR-meta.jsonl (with rubrics) if missing."""
     if meta_path.exists() and meta_path.stat().st_size > 0:
@@ -71,6 +92,66 @@ def ensure_meta(meta_path: Path) -> Path:
             f"Pass --meta PATH to an existing MMAR-meta.jsonl."
         ) from exc
     return meta_path
+
+
+def ensure_mmar_audio(audio_dir: Path, *, force: bool = False) -> Path:
+    """Download and extract the MMAR wav archive into ``audio_dir`` if needed."""
+    audio_dir = audio_dir.expanduser().resolve()
+    wav_count = count_wavs(audio_dir)
+    if wav_count >= MIN_MMAR_WAVS and not force:
+        print(f"MMAR audio ready: {wav_count} wav files in {audio_dir}", flush=True)
+        return audio_dir
+
+    from huggingface_hub import hf_hub_download
+
+    cache_root = audio_dir.parent
+    archive_cache = cache_root / MMAR_AUDIO_ARCHIVE
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"MMAR audio missing or incomplete ({wav_count} wavs); "
+        f"downloading {MMAR_AUDIO_ARCHIVE} from {MMAR_REPO} ...",
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="mmar-audio-") as tmp:
+        tmp_root = Path(tmp)
+        archive_tmp = Path(
+            hf_hub_download(
+                repo_id=MMAR_REPO,
+                filename=MMAR_AUDIO_ARCHIVE,
+                repo_type="dataset",
+                local_dir=str(tmp_root / "download"),
+            )
+        )
+        print(f"Extracting {archive_tmp.name} ...", flush=True)
+        extract_dir = tmp_root / "extract"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_tmp, "r:gz") as tar:
+            tar.extractall(path=extract_dir)
+
+        candidate_audio = extract_dir / "audio"
+        if not candidate_audio.is_dir():
+            matches = [path for path in extract_dir.rglob("audio") if path.is_dir()]
+            if not matches:
+                raise SystemExit(
+                    f"No audio/ directory found after extracting {archive_tmp}"
+                )
+            candidate_audio = matches[0]
+
+        if audio_dir.exists():
+            shutil.rmtree(audio_dir)
+        shutil.copytree(candidate_audio, audio_dir)
+        shutil.copy2(archive_tmp, archive_cache)
+
+    wav_count = count_wavs(audio_dir)
+    if wav_count < MIN_MMAR_WAVS:
+        raise SystemExit(
+            f"Expected at least {MIN_MMAR_WAVS} wav files in {audio_dir}, "
+            f"found {wav_count}."
+        )
+    print(f"MMAR audio ready: {wav_count} wav files in {audio_dir}", flush=True)
+    return audio_dir
 
 
 @lru_cache(maxsize=1)
@@ -169,7 +250,8 @@ def merge_example(
     out["has_generation"] = bool(
         (prediction or evaluated)
         and (
-            (prediction or evaluated or {}).get("model_output")
+            (prediction or evaluated or {}).get("raw_tokens")
+            or (prediction or evaluated or {}).get("model_output")
             or (prediction or evaluated or {}).get("answer_prediction")
             or (prediction or evaluated or {}).get("thinking_prediction")
         )
@@ -289,7 +371,7 @@ def find_audio_file(name: str) -> Path | None:
     audio_dir = Path(CONFIG["audio_dir"])
     candidates = [
         audio_dir / name,
-        ROOT / "output" / "data" / "mmar" / "audio" / name,
+        DEFAULT_AUDIO_DIR / name,
     ]
     for path in candidates:
         if path.is_file():
@@ -448,6 +530,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 0.75rem; color: var(--muted); font-weight: 400;
     margin-left: 0.35rem;
   }
+  .token-legend {
+    display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center;
+    margin-bottom: 0.55rem; font-size: 0.75rem; color: var(--muted);
+  }
+  .token-legend .swatch {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+  }
+  .token-legend .tok {
+    margin: 0; padding: 0.05rem 0.35rem; font-size: 0.72rem;
+  }
+  .token-viewer {
+    border: 1px solid var(--line); border-radius: 10px; padding: 0.75rem 0.85rem;
+    background: var(--bg); max-height: 28rem; overflow: auto;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.8rem; line-height: 1.85; word-break: break-word;
+  }
+  .tok {
+    display: inline; border-radius: 3px; padding: 0.08em 0.18em;
+    margin: 0 1px; border: 1px solid transparent; white-space: pre-wrap;
+  }
+  .tok.input {
+    background: #e4edf4; border-color: #c2d3e0; color: #2a4050;
+  }
+  .tok.generated {
+    background: #e7f3ea; border-color: #b5d6be; color: #1f4d32;
+  }
+  .tok.special {
+    background: #f3ebe0; border-color: #d8c4a4; color: #6a4a1a;
+    font-weight: 500;
+  }
+  .tok.special.input { background: #efe6d8; }
+  .tok.special.generated { background: #e9efd9; }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
   @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
   .rubric { display: grid; gap: 0.55rem; }
@@ -463,9 +577,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: inline-flex; align-items: center; gap: 0.35rem;
     font-family: "IBM Plex Mono", monospace; font-size: 0.8rem;
   }
-  audio { width: 100%; margin-top: 0.5rem; }
+  audio {
+    width: 100%;
+    margin-top: 0.35rem;
+    height: 2.5rem;
+  }
+  .audio-player {
+    border: 1px solid var(--line); border-radius: 10px; padding: 0.75rem 1rem;
+    background: var(--bg);
+  }
+  .audio-player .missing { color: var(--muted); font-size: 0.9rem; }
   a { color: var(--accent); }
-  .links { display: flex; flex-wrap: wrap; gap: 0.75rem; font-size: 0.9rem; }
 </style>
 </head>
 <body>
@@ -604,6 +726,39 @@ function choiceClass(choice, answer, pred) {
   return classes.join(" ");
 }
 
+function renderRawText(example) {
+  const tokens = example.raw_tokens;
+  if (Array.isArray(tokens) && tokens.length) {
+    const nIn = tokens.filter(t => t.role === "input").length;
+    const nGen = tokens.filter(t => t.role === "generated").length;
+    const nSp = tokens.filter(t => t.special).length;
+    const chips = tokens.map(t => {
+      const role = t.role === "generated" ? "generated" : "input";
+      const cls = ["tok", role].concat(t.special ? ["special"] : []).join(" ");
+      const title = `id=${t.id} · ${role}${t.special ? " · special" : ""}`;
+      return `<span class="${cls}" title="${escapeHtml(title)}">${escapeHtml(String(t.token ?? ""))}</span>`;
+    }).join("");
+    return `
+      <div class="token-legend">
+        <span class="swatch"><span class="tok input">in</span> input (${nIn})</span>
+        <span class="swatch"><span class="tok generated">gen</span> generated (${nGen})</span>
+        <span class="swatch"><span class="tok special">sp</span> special (${nSp})</span>
+        <span>${tokens.length} tokens</span>
+      </div>
+      <div class="token-viewer">${chips}</div>`;
+  }
+  if (example.model_output) {
+    return `<div class="box mono">${escapeHtml(example.model_output)}</div>
+      <div class="section-hint" style="margin:0.4rem 0 0;display:block">
+        Continuous decode only (no per-token list on this record).
+      </div>`;
+  }
+  if (example.has_generation) {
+    return `<div class="box mono muted">No raw_tokens / model_output on this record (older run may have omitted them).</div>`;
+  }
+  return `<div class="box mono muted">No generation in this run.</div>`;
+}
+
 function renderRubric(example) {
   const rubric = example.rubric || [];
   const results = example.rubric_results || [];
@@ -650,11 +805,17 @@ async function selectExample(id) {
       ${example.has_grade ? tag("score " + fmtScore(example.score), "neutral") : ""}
       ${tag(example.id, "")}
     </div>
-    <div class="links">
-      ${example.url ? `<a href="${escapeHtml(example.url)}" target="_blank" rel="noreferrer">Source video</a>` : ""}
-      ${example.local_audio ? `<a href="${escapeHtml(example.local_audio)}">Download audio</a>` : ""}
+
+    <div class="section">
+      <h3>Audio</h3>
+      <div class="audio-player">
+        ${
+          example.local_audio
+            ? `<audio controls preload="metadata" src="${escapeHtml(example.local_audio)}"></audio>`
+            : `<div class="missing">Local wav not found for this example. Restart the viewer to download MMAR audio, or pass --audio-dir.</div>`
+        }
+      </div>
     </div>
-    ${example.local_audio ? `<audio controls src="${escapeHtml(example.local_audio)}"></audio>` : ""}
 
     <div class="section">
       <h3>Choices</h3>
@@ -693,14 +854,8 @@ async function selectExample(id) {
     ${cues.length ? `<div class="section"><h3>Reasoning cues</h3><div class="tags">${cues.map(c => tag(c)).join("")}</div></div>` : ""}
 
     <div class="section">
-      <h3>Raw generation<span class="section-hint">decoded tokens, special tokens included · no answer extraction</span></h3>
-      ${
-        example.model_output
-          ? `<div class="box mono">${escapeHtml(example.model_output)}</div>`
-          : example.has_generation
-            ? `<div class="box mono muted">No model_output field on this record (older run may have omitted it).</div>`
-            : `<div class="box mono muted">No generation in this run.</div>`
-      }
+      <h3>Raw text<span class="section-hint">all tokens · input + specials + model-generated</span></h3>
+      ${renderRawText(example)}
     </div>
 
     <div class="section">
@@ -708,6 +863,8 @@ async function selectExample(id) {
       ${renderRubric(example)}
     </div>
   `;
+  const audio = detail.querySelector("audio");
+  if (audio) audio.volume = 0.5;
 }
 
 function fillModalities() {
@@ -875,12 +1032,22 @@ def parse_args() -> argparse.Namespace:
         "--audio-dir",
         type=Path,
         default=DEFAULT_AUDIO_DIR,
-        help="Optional local wav directory for playback",
+        help="Local wav directory for in-browser playback (default: data/mmar/audio)",
     )
     parser.add_argument(
         "--skip-meta-download",
         action="store_true",
         help="Do not auto-download meta if missing",
+    )
+    parser.add_argument(
+        "--skip-audio-download",
+        action="store_true",
+        help="Do not auto-download MMAR wavs if missing/incomplete",
+    )
+    parser.add_argument(
+        "--force-audio-download",
+        action="store_true",
+        help="Re-download and replace local MMAR audio even if present",
     )
     return parser.parse_args()
 
@@ -888,19 +1055,31 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     meta_path = args.meta.expanduser().resolve()
+    audio_dir = args.audio_dir.expanduser().resolve()
+
     if not args.skip_meta_download:
         ensure_meta(meta_path)
     elif not meta_path.exists():
         raise SystemExit(f"Meta not found: {meta_path}")
 
+    if not args.skip_audio_download:
+        ensure_mmar_audio(audio_dir, force=args.force_audio_download)
+    elif count_wavs(audio_dir) == 0:
+        print(
+            f"Warning: no wav files in {audio_dir}; "
+            "audio playback will be unavailable.",
+            flush=True,
+        )
+
     CONFIG["results_dir"] = str(args.results_dir.expanduser().resolve())
     CONFIG["meta"] = str(meta_path)
-    CONFIG["audio_dir"] = str(args.audio_dir.expanduser().resolve())
+    CONFIG["audio_dir"] = str(audio_dir)
 
     # Warm caches / validate.
     n_meta = len(meta_by_id())
     runs = list_runs(Path(CONFIG["results_dir"]))
     print(f"Loaded {n_meta} MMAR examples from {meta_path}", flush=True)
+    print(f"Audio dir: {audio_dir} ({count_wavs(audio_dir)} wavs)", flush=True)
     print(f"Found {len(runs)} run(s) under {CONFIG['results_dir']}", flush=True)
     for run in runs[:5]:
         print(

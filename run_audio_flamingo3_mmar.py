@@ -98,7 +98,9 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
 
 hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
-openai_secret = modal.Secret.from_name("openai-secret", required_keys=["OPENAI_API_KEY"])
+openai_secret = modal.Secret.from_name(
+    "openai-secret", required_keys=["OPENAI_API_KEY"]
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -451,6 +453,44 @@ def load_audio_flamingo3(args):
     return model, processor
 
 
+def _processor_tokenizer(processor):
+    return getattr(processor, "tokenizer", processor)
+
+
+def format_raw_token(tokenizer, token_id: int) -> str:
+    """Surface the vocabulary piece for one id (specials kept as named tokens)."""
+    special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+    if token_id in special_ids:
+        piece = tokenizer.convert_ids_to_tokens(token_id)
+        if piece is not None:
+            return str(piece)
+    piece = tokenizer.convert_ids_to_tokens(token_id)
+    decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+    if piece is not None and (decoded == "" or decoded.isspace()):
+        return str(piece)
+    if decoded:
+        return decoded
+    if piece is not None:
+        return str(piece)
+    return f"[{token_id}]"
+
+
+def build_raw_tokens(tokenizer, token_ids, role: str) -> list[dict]:
+    special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+    tokens = []
+    for token_id in token_ids:
+        tid = int(token_id)
+        tokens.append(
+            {
+                "id": tid,
+                "token": format_raw_token(tokenizer, tid),
+                "role": role,
+                "special": tid in special_ids,
+            }
+        )
+    return tokens
+
+
 def generate_batch(model, processor, samples, args):
     import torch
 
@@ -480,22 +520,34 @@ def generate_batch(model, processor, samples, args):
         generated_ids,
         skip_special_tokens=True,
     )
-    # True raw decode kept for inspection (special tokens retained).
-    decoded_raw = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=False,
-    )
 
+    tokenizer = _processor_tokenizer(processor)
+    attention_mask = inputs.get("attention_mask")
     results = []
-    for sample, clean_output, raw_output in zip(samples, decoded_clean, decoded_raw):
+    for index, (sample, clean_output) in enumerate(zip(samples, decoded_clean)):
+        if attention_mask is not None:
+            mask = attention_mask[index].bool()
+            input_ids = inputs["input_ids"][index][mask].tolist()
+        else:
+            input_ids = inputs["input_ids"][index].tolist()
+        gen_ids = generated_ids[index].tolist()
+        raw_tokens = build_raw_tokens(tokenizer, input_ids, "input") + build_raw_tokens(
+            tokenizer, gen_ids, "generated"
+        )
+        # Continuous decode of prompt + generation with specials retained.
+        full_ids = input_ids + gen_ids
+        raw_text = tokenizer.decode(full_ids, skip_special_tokens=False)
+
         thinking_prediction, answer_prediction = parse_af3_output(
             clean_output,
             sample["choices"],
         )
         results.append(
             {
-                # Full decoded generation with special tokens retained.
-                "model_output": raw_output,
+                # Full prompt + generation decode (special tokens retained).
+                "model_output": raw_text,
+                # Per-token view: input + specials + model-generated tokens.
+                "raw_tokens": raw_tokens,
                 # Parsed chain-of-thought / reasoning trace.
                 "thinking_prediction": thinking_prediction,
                 # Parsed final answer choice / text.
@@ -568,7 +620,9 @@ def unscored_prediction_ids(predictions_path: Path, evaluated_path: Path) -> set
     return pred_ids - eval_ids
 
 
-def run_rubrics_scoring(predictions_path, meta_path, evaluated_path, *, required: bool = True):
+def run_rubrics_scoring(
+    predictions_path, meta_path, evaluated_path, *, required: bool = True
+):
     """Run OpenAI rubric grading; write ``predictions.evaluated.jsonl``."""
     api_key = os.environ.get("OPENAI_API_KEY") or ""
     if not api_key.strip():
@@ -666,7 +720,9 @@ class StreamingRubricGrader:
         self._scorer = rubrics.Scorer(
             api_max_retries=rubrics.DEFAULT_API_MAX_RETRIES,
             api_retry_interval=rubrics.DEFAULT_API_RETRY_INTERVAL,
-            max_workers=max_workers if max_workers is not None else rubrics.DEFAULT_MAX_WORKERS,
+            max_workers=max_workers
+            if max_workers is not None
+            else rubrics.DEFAULT_MAX_WORKERS,
             qps=qps if qps is not None else rubrics.DEFAULT_QPS,
             timeout=rubrics.DEFAULT_TIMEOUT,
         )
@@ -743,9 +799,7 @@ class StreamingRubricGrader:
             if result.exception is not None:
                 with self._submit_lock:
                     self._inflight.discard(record_id)
-                    self._errors.append(
-                        {"id": record_id, "error": result.exception}
-                    )
+                    self._errors.append({"id": record_id, "error": result.exception})
                 print(f"Rubric grade failed for {record_id}: {result.exception}")
                 return
 
@@ -843,7 +897,9 @@ def count_wavs(audio_dir: Path) -> int:
     if not audio_dir.is_dir():
         return 0
     return sum(
-        1 for path in audio_dir.iterdir() if path.is_file() and path.suffix.lower() == ".wav"
+        1
+        for path in audio_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".wav"
     )
 
 
@@ -960,9 +1016,12 @@ def finalize_scored_run(
         "scored": scored,
         "predictions": str(predictions_path),
         "evaluated": str(evaluated_path) if evaluated_path.exists() else None,
-        "scores": str(run_dir / "scores.json") if (run_dir / "scores.json").exists() else None,
+        "scores": str(run_dir / "scores.json")
+        if (run_dir / "scores.json").exists()
+        else None,
         "fields": {
-            "model_output": "full decoded generation (special tokens retained)",
+            "model_output": "full prompt + generation decode (special tokens retained)",
+            "raw_tokens": "per-token list covering input + specials + generated tokens",
             "thinking_prediction": "parsed CoT / reasoning trace",
             "answer_prediction": "parsed final answer",
             "score": "MMAR-Rubrics aggregate score (evaluated file)",
@@ -1073,7 +1132,11 @@ def run_mmar(
             else:
                 raise SystemExit(
                     f"No predictions found at {predictions_path}"
-                    + (f" (and no run under {args.output_dir})" if newest is None else "")
+                    + (
+                        f" (and no run under {args.output_dir})"
+                        if newest is None
+                        else ""
+                    )
                 )
         published = finalize_scored_run(
             run_dir,
@@ -1099,7 +1162,9 @@ def run_mmar(
 
     meta_items = load_jsonl(meta_path)
     expected_wavs = len(meta_items)
-    resolved_audio_dir = Path(args.audio_dir) if args.audio_dir else data_root_path / "audio"
+    resolved_audio_dir = (
+        Path(args.audio_dir) if args.audio_dir else data_root_path / "audio"
+    )
     wav_count = count_wavs(resolved_audio_dir)
     if wav_count < expected_wavs:
         raise SystemExit(
@@ -1175,7 +1240,9 @@ def run_mmar(
             except (OSError, ValueError, RuntimeError) as exc:
                 ids = ", ".join(item["id"] for item in batch)
                 print(f"Skipping batch ({ids}): {exc}")
-                failures.append({"ids": [item["id"] for item in batch], "error": str(exc)})
+                failures.append(
+                    {"ids": [item["id"] for item in batch], "error": str(exc)}
+                )
                 continue
 
             records = []
