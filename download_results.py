@@ -7,6 +7,7 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       predictions.evaluated.jsonl    # OpenAI rubric grades
       scores.json
       manifest.json
+    mmar/af-next-think/<run_id>/     # Audio Flamingo Next Think runs
 
 The Volume root maps flatly to ``./outputs``, so a full sync yields
 ``outputs/mmar/af3/<run_id>/...``.
@@ -16,6 +17,7 @@ Usage:
     uv run modal run download_results.py
     uv run modal run download_results.py --list-only
     uv run modal run download_results.py --remote-path mmar/af3
+    uv run modal run download_results.py --remote-path mmar/af-next-think
     uv run modal run download_results.py --remote-path mmar/af3/20260712T185300Z
 """
 

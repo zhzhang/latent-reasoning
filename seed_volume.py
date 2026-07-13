@@ -10,6 +10,7 @@ Layout on the ``latent-reasoning`` Volume:
     /data/mcr/                  # optional local MCR-Bench upload
       AQA/ SER/ VSC/
     /models/nvidia/audio-flamingo-3-hf/
+    /models/nvidia/audio-flamingo-next-think-hf/
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
     ...
@@ -23,6 +24,7 @@ Usage:
 
     uv run modal run seed_volume.py
     uv run modal run seed_volume.py --datasets mmar,aha --models af3
+    uv run modal run seed_volume.py --datasets mmar --models af-next-think
     uv run modal run seed_volume.py --datasets mmar --models none
     uv run modal run seed_volume.py --datasets none --models af3,af2 --force
     uv run modal run seed_volume.py --datasets mcr --mcr-local-dir ./MCR-Bench --models none
@@ -63,6 +65,10 @@ MODEL_ALIASES: dict[str, str] = {
     "af3": "nvidia/audio-flamingo-3-hf",
     "audio-flamingo-3": "nvidia/audio-flamingo-3-hf",
     "audio-flamingo-3-hf": "nvidia/audio-flamingo-3-hf",
+    "af-next-think": "nvidia/audio-flamingo-next-think-hf",
+    "afnext-think": "nvidia/audio-flamingo-next-think-hf",
+    "audio-flamingo-next-think": "nvidia/audio-flamingo-next-think-hf",
+    "audio-flamingo-next-think-hf": "nvidia/audio-flamingo-next-think-hf",
     "af2": "nvidia/audio-flamingo-2",
     "audio-flamingo-2": "nvidia/audio-flamingo-2",
     "qwen3-omni": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
@@ -73,7 +79,14 @@ MODEL_ALIASES: dict[str, str] = {
 
 DEFAULT_DATASETS = ("mmar", "aha")
 DEFAULT_MODELS = ("af3",)
-ALL_MODELS = ("af3", "af2", "qwen3-omni", "qwen3-4b", "qwen3-4b-thinking")
+ALL_MODELS = (
+    "af3",
+    "af-next-think",
+    "af2",
+    "qwen3-omni",
+    "qwen3-4b",
+    "qwen3-4b-thinking",
+)
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
@@ -516,7 +529,8 @@ def main(
     Args:
         datasets: Comma-separated subset of ``mmar``, ``aha``, ``mcr``, or ``all``.
             Pass ``none`` to skip datasets.
-        models: Comma-separated aliases (af3, af2, qwen3-omni, ...) or Hub repo ids.
+        models: Comma-separated aliases (af3, af-next-think, af2, qwen3-omni, ...)
+            or Hub repo ids.
             Pass ``none`` to skip models. Ignored when ``repo_id`` is set.
         repo_id: Optional single Hub repo id (overrides --models when set).
         force: Re-download / overwrite even if data already exists.

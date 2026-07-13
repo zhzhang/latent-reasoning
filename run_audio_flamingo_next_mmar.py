@@ -1,45 +1,38 @@
-"""Run Audio Flamingo 3 on MMAR with think-mode CoT on Modal.
+"""Run Audio Flamingo Next Think on MMAR with MMAR-Rubrics grading on Modal.
 
 Uses the shared ``latent-reasoning`` Volume from ``seed_volume.py`` for data
 and weights, and writes eval outputs to ``latent-reasoning-results``:
 
     /cache/data/mmar/          # MMAR audio + MMAR-meta.jsonl
-    /cache/models/<repo_id>/   # AF3 weights
-    /results/mmar/af3/<run_id>/
+    /cache/models/<repo_id>/   # AF-Next-Think weights
+    /results/mmar/af-next-think/<run_id>/
       predictions.jsonl              # generations + CoT + answers
       predictions.evaluated.jsonl    # OpenAI rubric grades (pipelined)
       scores.json
       manifest.json
 
-Local mirror (via ``download_results.py``): ``<repo>/outputs/mmar/af3/<run_id>/``.
+Local mirror (via ``download_results.py``):
+``<repo>/outputs/mmar/af-next-think/<run_id>/``.
+
+Model card: https://huggingface.co/nvidia/audio-flamingo-next-think-hf
 
 Prereqs (one-time):
 
-    uv run modal run seed_volume.py --datasets mmar --models af3
+    uv run modal run seed_volume.py --datasets mmar --models af-next-think
 
 Usage:
 
-    uv run modal run run_audio_flamingo3_mmar.py
-    uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
-    uv run modal run run_audio_flamingo3_mmar.py --no-think --num-samples 4
-    # (--no-think disables the AF-Think adapter)
-    uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
-    # Rubric scoring is pipelined with generation by default; pass --no-score to skip.
+    uv run modal run run_audio_flamingo_next_mmar.py
+    uv run modal run run_audio_flamingo_next_mmar.py --num-samples 8
+    uv run modal run run_audio_flamingo_next_mmar.py --no-score --num-samples 4
 
 Download results locally:
 
-    uv run modal run download_results.py
-    uv run modal run download_results.py --list-only
+    uv run modal run download_results.py --remote-path mmar/af-next-think
 
-Each published run includes:
-  - predictions.jsonl            full generations + parsed CoT + answers
-  - predictions.evaluated.jsonl  OpenAI MMAR-Rubrics grades
-  - scores.json                  aggregate accuracy / rubric score
-  - manifest.json
-
-OpenAI grading runs concurrently with AF3 generation: each written prediction
-batch is submitted to a background rubric grader so API traffic is spread over
-the run (fewer burst rate-limit hits) and wall time overlaps GPU + API work.
+AF-Next-Think may emit ``<think>...</think>`` reasoning traces. Prompting asks
+for timestamp-grounded step-by-step reasoning before the final answer.
+``max_new_tokens`` defaults to 4096 because reasoning traces can be long.
 
 Requires Modal Secrets:
   - ``huggingface-secret`` with ``HF_TOKEN``
@@ -48,14 +41,12 @@ Requires Modal Secrets:
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import modal
 
 from audio_flamingo_runtime import (
     audio_tower_dtype,
-    cast_floating_state_dict,
     cast_model_floating_tensors,
     generate_batch,
     model_input_device,
@@ -64,9 +55,9 @@ from audio_flamingo_runtime import (
     torch_dtype_value,
 )
 from mmar_common import (
-    AF3_THINK_SUFFIX,
+    AF_NEXT_THINK_SUFFIX,
     build_mmar_prompt,
-    parse_choice_output,
+    parse_think_tagged_output,
     run_mmar_evaluation,
 )
 from modal_cache import (
@@ -81,81 +72,64 @@ from modal_cache import (
     volume,
 )
 
-DEFAULT_MODEL_ID = "nvidia/audio-flamingo-3-hf"
-DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "mmar" / "af3"
-DEFAULT_LOCAL_MODEL_DIR = VOLUME_MOUNT / "models" / DEFAULT_MODEL_ID
+DEFAULT_MODEL_ID = "nvidia/audio-flamingo-next-think-hf"
+DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "mmar" / "af-next-think"
+DEFAULT_REPETITION_PENALTY = 1.2
 
 image = mmar_eval_image()
-app = modal.App("audio-flamingo3-mmar", image=image)
+app = modal.App("audio-flamingo-next-mmar", image=image)
 
 
-def load_audio_flamingo3(args):
+def load_audio_flamingo_next(args):
     import torch
-    from peft import PeftModel
-    from transformers import AudioFlamingo3ForConditionalGeneration, AutoProcessor
+    from transformers import AutoModelForSeq2SeqLM, AutoProcessor
 
     target_dtype = torch_dtype_value(torch, args.torch_dtype)
+    # AF-Next Hub weights are MusicFlamingoForConditionalGeneration
+    # (model_type musicflamingo). AutoModel loads the base MusicFlamingoModel,
+    # which has no generate(); use the seq2seq auto class instead.
+    # See: https://huggingface.co/nvidia/audio-flamingo-next-think-hf
     kwargs = {
         "device_map": args.device_map,
-        "torch_dtype": target_dtype,
+        "dtype": target_dtype,
     }
     if args.attn_implementation:
         kwargs["attn_implementation"] = args.attn_implementation
 
     local_id = resolve_model_dir(args.model_id, args.local_model_dir)
     processor = AutoProcessor.from_pretrained(local_id)
-    model = AudioFlamingo3ForConditionalGeneration.from_pretrained(local_id, **kwargs)
+    model = AutoModelForSeq2SeqLM.from_pretrained(local_id, **kwargs)
 
-    if not args.no_think:
-        non_lora_path = os.path.join(local_id, "think", "non_lora_trainables.bin")
-        if not os.path.exists(non_lora_path):
-            raise SystemExit(
-                f"Think adapter weights not found at {non_lora_path}. "
-                "Re-seed with seed_volume.py --models af3 (think/*.bin must be kept), "
-                "or pass --no-think."
-            )
-
-        print("Loading AF-Think PEFT adapter ...")
-        # non_lora weights are typically saved as float32; cast before load so we
-        # do not silently mix Float and BFloat16 parameters inside the encoder.
-        resolve_dtype = (
-            model_param_dtype(model) if target_dtype == "auto" else target_dtype
-        )
-        non_lora_trainables = cast_floating_state_dict(
-            torch.load(
-                non_lora_path,
-                map_location="cpu",
-                weights_only=False,
-            ),
-            resolve_dtype,
-        )
-        model.load_state_dict(non_lora_trainables, strict=False)
-        model = PeftModel.from_pretrained(model, local_id, subfolder="think")
-
-    # Unify floating dtypes after adapter load. Think non_lora weights and some
-    # embeddings/LayerNorms otherwise remain float32 while convs are bf16.
-    unify_dtype = model_param_dtype(model) if target_dtype == "auto" else target_dtype
-    cast_model_floating_tensors(model, unify_dtype)
+    # Some AF-Next tensors initialized by the MusicFlamingo wrapper are not
+    # loaded from the checkpoint and can remain float32 even when ``dtype`` is
+    # bfloat16. The processor follows the model card and supplies audio
+    # features in the model dtype, so mixed float32/bfloat16 modules fail in
+    # the audio path. Normalize parameters and buffers after loading.
+    uniform_dtype = (
+        model_param_dtype(model) if target_dtype == "auto" else target_dtype
+    )
+    cast_model_floating_tensors(model, uniform_dtype)
     model.eval()
     print(
-        f"Model ready: param_dtype={model_param_dtype(model)}, "
+        f"Model ready: class={type(model).__name__}, "
+        f"param_dtype={model_param_dtype(model)}, "
         f"audio_tower_dtype={audio_tower_dtype(model)}, "
         f"device={model_input_device(model)}"
     )
     return model, processor
 
 
-def generate_af3_batch(model, processor, samples, args):
-    use_think = not args.no_think
+def generate_af_next_batch(model, processor, samples, args):
     return generate_batch(
         model,
         processor,
         samples,
         args,
         build_prompt=lambda sample: build_mmar_prompt(
-            sample, think_suffix=AF3_THINK_SUFFIX if use_think else None
+            sample, think_suffix=AF_NEXT_THINK_SUFFIX
         ),
-        parse_output=parse_choice_output,
+        parse_output=parse_think_tagged_output,
+        generation_extra={"repetition_penalty": args.repetition_penalty},
     )
 
 
@@ -179,20 +153,20 @@ def run_mmar(
     num_samples: int = -1,
     start: int = 0,
     batch_size: int = 1,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 4096,
     temperature: float = 0.0,
     top_p: float = 1.0,
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     attn_implementation: str | None = None,
     torch_dtype: str = "bfloat16",
     device_map: str = "auto",
     seed: int = 42,
-    think: bool = True,
     score: bool = True,
     score_only: bool = False,
     print_every: int = 10,
     run_id: str | None = None,
 ) -> dict:
-    """Run AF3 inference with pipelined MMAR-Rubrics OpenAI grading on Modal."""
+    """Run AF-Next-Think inference with pipelined MMAR-Rubrics grading on Modal."""
     args = SimpleNamespace(
         model_id=model_id,
         local_model_dir=local_model_dir,
@@ -206,11 +180,11 @@ def run_mmar(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        repetition_penalty=repetition_penalty,
         attn_implementation=attn_implementation,
         torch_dtype=torch_dtype,
         device_map=device_map,
         seed=seed,
-        no_think=not think,
         score=score,
         score_only=score_only,
         print_every=print_every,
@@ -218,10 +192,10 @@ def run_mmar(
     )
     return run_mmar_evaluation(
         args=args,
-        load_model=load_audio_flamingo3,
-        generate_batch_fn=generate_af3_batch,
-        model_label="af3",
-        manifest_extra={"think": think},
+        load_model=load_audio_flamingo_next,
+        generate_batch_fn=generate_af_next_batch,
+        model_label="af-next-think",
+        manifest_extra={"repetition_penalty": repetition_penalty},
     )
 
 
@@ -236,42 +210,43 @@ def main(
     num_samples: int = -1,
     start: int = 0,
     batch_size: int = 1,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 4096,
     temperature: float = 0.0,
     top_p: float = 1.0,
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     attn_implementation: str | None = None,
     torch_dtype: str = "bfloat16",
     device_map: str = "auto",
     seed: int = 42,
-    think: bool = True,
     score: bool = True,
     score_only: bool = False,
     print_every: int = 10,
     run_id: str | None = None,
 ):
-    """Launch AF3 MMAR eval on Modal.
+    """Launch AF-Next-Think MMAR eval on Modal.
 
     Args:
-        model_id: Hugging Face repo id (default nvidia/audio-flamingo-3-hf).
+        model_id: Hugging Face repo id
+            (default nvidia/audio-flamingo-next-think-hf).
         local_model_dir: Optional path under the models subpath; defaults to
             /cache/models/<model_id> when seeded.
         meta: Path to MMAR-meta.jsonl on the data subpath.
         data_root: MMAR root used to resolve ./audio paths.
         audio_dir: Optional override for wav directory.
         output_dir: Results Volume directory for run folders
-            (default /results/mmar/af3).
+            (default /results/mmar/af-next-think).
         num_samples: Number of items (-1 = all). Subsets are randomly
             sampled by index (seeded).
         start: Offset into the meta file before sampling.
         batch_size: Generation batch size.
-        max_new_tokens: Generation length cap.
+        max_new_tokens: Generation length cap (default 4096 for long CoT).
         temperature: Sampling temperature (0 = greedy).
         top_p: Nucleus sampling parameter.
+        repetition_penalty: Generation repetition penalty (model-card default 1.2).
         attn_implementation: Optional sdpa or flash_attention_2.
         torch_dtype: auto / float16 / bfloat16 / float32.
         device_map: Transformers device_map.
         seed: RNG seed.
-        think: Load AF-Think adapter and append the think suffix (default True).
         score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
             (default True). Grades each batch while the next generates.
         score_only: Skip inference; only score existing predictions.
@@ -291,11 +266,11 @@ def main(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        repetition_penalty=repetition_penalty,
         attn_implementation=attn_implementation,
         torch_dtype=torch_dtype,
         device_map=device_map,
         seed=seed,
-        think=think,
         score=score,
         score_only=score_only,
         print_every=print_every,
