@@ -30,6 +30,7 @@ Usage:
     uv run modal run seed_volume.py --datasets mcr --mcr-local-dir ./MCR-Bench --models none
     uv run modal run seed_volume.py --repo-id nvidia/audio-flamingo-3-hf --datasets none
     uv run modal run seed_volume.py --list-only
+    uv run modal run --detach seed_volume.py --datasets none --models af-next-think
 
 Requires a Modal Secret named ``huggingface-secret`` with key ``HF_TOKEN``
 (for higher HF rate limits / gated repos).
@@ -558,10 +559,12 @@ def main(
         if not wanted:
             raise SystemExit("Pass at least one dataset via --datasets (or none to skip)")
 
+        # Use .spawn().get() (not .remote()) so `modal run --detach` keeps
+        # long downloads alive after the local client disconnects.
         if "mmar" in wanted:
-            results.append(seed_mmar.remote(force=force))
+            results.append(seed_mmar.spawn(force=force).get())
         if "aha" in wanted:
-            results.append(seed_aha.remote(force=force))
+            results.append(seed_aha.spawn(force=force).get())
         if "mcr" in wanted:
             results.append(_upload_mcr_local(mcr_local_dir, force=force))
 
@@ -583,14 +586,14 @@ def main(
     # De-dupe while preserving order.
     targets = list(dict.fromkeys(targets))
     for target in targets:
-        results.append(
-            seed_model.remote(
-                repo_id=target,
-                force=force,
-                revision=revision,
-                hub_cache_layout=hub_cache_layout,
-            )
+        call = seed_model.spawn(
+            repo_id=target,
+            force=force,
+            revision=revision,
+            hub_cache_layout=hub_cache_layout,
         )
+        print(f"Spawned seed_model({target}) call_id={call.object_id}")
+        results.append(call.get())
 
     if not results:
         raise SystemExit(

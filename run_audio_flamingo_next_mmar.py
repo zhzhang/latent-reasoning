@@ -25,6 +25,7 @@ Usage:
     uv run modal run run_audio_flamingo_next_mmar.py
     uv run modal run run_audio_flamingo_next_mmar.py --num-samples 8
     uv run modal run run_audio_flamingo_next_mmar.py --no-score --num-samples 4
+    uv run modal run --detach run_audio_flamingo_next_mmar.py --num-samples 200
 
 Download results locally:
 
@@ -253,7 +254,9 @@ def main(
         print_every: Progress print interval.
         run_id: Optional run folder name; default is a UTC timestamp.
     """
-    result = run_mmar.remote(
+    # Use .spawn().get() (not .remote()) so `modal run --detach` keeps the job
+    # alive after the local client disconnects.
+    call = run_mmar.spawn(
         model_id=model_id,
         local_model_dir=local_model_dir,
         meta=meta,
@@ -276,6 +279,8 @@ def main(
         print_every=print_every,
         run_id=run_id,
     )
+    print(f"Spawned run_mmar call_id={call.object_id}")
+    result = call.get()
     print("Done:", result)
     if isinstance(result, dict) and result.get("volume_path"):
         print(
