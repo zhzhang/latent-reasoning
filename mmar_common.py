@@ -200,6 +200,69 @@ def parse_think_tagged_output(raw_text, choices):
     return parse_choice_output(text, choices)
 
 
+def string_match(answer, prediction, choices):
+    """MMAR answer match: GT tokens present, no exclusive tokens from wrong choices."""
+
+    def tokenize(text):
+        return set(re.findall(r"\b\w+\b", str(text).lower()))
+
+    prediction_tokens = tokenize(prediction)
+    answer_tokens = tokenize(answer)
+    if not prediction_tokens:
+        return False
+
+    incorrect_tokens = set()
+    for choice in choices:
+        choice_tokens = tokenize(choice)
+        if choice_tokens != answer_tokens:
+            incorrect_tokens.update(choice_tokens - answer_tokens)
+
+    return answer_tokens.issubset(prediction_tokens) and prediction_tokens.isdisjoint(
+        incorrect_tokens
+    )
+
+
+def score_answer_prediction(item: dict, answer_prediction: str) -> bool:
+    return string_match(
+        item.get("answer", ""),
+        answer_prediction or "",
+        item.get("choices") or [],
+    )
+
+
+def aggregate_n_shot_record(item: dict, shot_outputs: list[dict]) -> dict:
+    """Build one prediction record from ``n`` independent generation outputs."""
+    shots = []
+    for shot_index, output in enumerate(shot_outputs):
+        correct = score_answer_prediction(item, output.get("answer_prediction", ""))
+        shots.append(
+            {
+                "shot_index": shot_index,
+                "model_output": output.get("model_output"),
+                "raw_tokens": output.get("raw_tokens"),
+                "thinking_prediction": output.get("thinking_prediction"),
+                "answer_prediction": output.get("answer_prediction"),
+                "correct": correct,
+            }
+        )
+
+    n_shots = len(shots)
+    n_shot_correct = sum(1 for shot in shots if shot["correct"])
+    primary = next((shot for shot in shots if shot["correct"]), shots[0])
+    return {
+        **item,
+        "model_output": primary.get("model_output"),
+        "raw_tokens": primary.get("raw_tokens"),
+        "thinking_prediction": primary.get("thinking_prediction"),
+        "answer_prediction": primary.get("answer_prediction"),
+        "n_shots": n_shots,
+        "shots": shots,
+        "correct": n_shot_correct > 0,
+        "n_shot_correct": n_shot_correct,
+        "shot_success_rate": (n_shot_correct / n_shots) if n_shots else 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Rubric metadata / scoring
 # ---------------------------------------------------------------------------
@@ -496,6 +559,24 @@ class StreamingRubricGrader:
         self._thread.join(timeout=60)
 
 
+def _finalize_group_stats(bucket: dict, *, include_score: bool) -> dict:
+    out = {}
+    for key, stats in bucket.items():
+        total = stats["n"] or 1
+        entry = {
+            "n": stats["n"],
+            "accuracy": stats["correct"] / total,
+        }
+        if include_score:
+            entry["avg_score"] = stats["score_sum"] / total
+        if stats.get("shot_rate_n"):
+            entry["avg_shot_success_rate"] = (
+                stats["shot_rate_sum"] / stats["shot_rate_n"]
+            )
+        out[key] = entry
+    return out
+
+
 def summarize_evaluated(evaluated_path: Path) -> dict:
     """Aggregate accuracy / rubric score from an evaluated predictions file."""
     if not evaluated_path.exists():
@@ -520,24 +601,71 @@ def summarize_evaluated(evaluated_path: Path) -> dict:
             stats["correct"] += int(bool(item.get("correct")))
             stats["score_sum"] += float(item.get("score") or 0.0)
 
-    def finalize(bucket: dict) -> dict:
-        out = {}
-        for key, stats in bucket.items():
-            total = stats["n"] or 1
-            out[key] = {
-                "n": stats["n"],
-                "accuracy": stats["correct"] / total,
-                "avg_score": stats["score_sum"] / total,
-            }
-        return out
-
     return {
         "n": n,
         "accuracy": n_correct / n,
         "avg_score": score_sum / n,
-        "by_modality": finalize(by_modality),
-        "by_category": finalize(by_category),
+        "by_modality": _finalize_group_stats(by_modality, include_score=True),
+        "by_category": _finalize_group_stats(by_category, include_score=True),
     }
+
+
+def summarize_predictions(predictions_path: Path) -> dict:
+    """Aggregate any-shot accuracy from predictions that carry ``correct``."""
+    if not predictions_path.exists():
+        return {}
+
+    records = [item for item in load_jsonl(predictions_path) if "correct" in item]
+    if not records:
+        return {}
+
+    n = len(records)
+    n_correct = sum(1 for item in records if item.get("correct"))
+    shot_rates = [
+        float(item["shot_success_rate"])
+        for item in records
+        if item.get("shot_success_rate") is not None
+    ]
+    n_shots_values = {
+        int(item["n_shots"]) for item in records if item.get("n_shots") is not None
+    }
+    by_modality: dict[str, dict] = {}
+    by_category: dict[str, dict] = {}
+    for item in records:
+        for key, bucket in (
+            (item.get("modality") or "unknown", by_modality),
+            (item.get("category") or "unknown", by_category),
+        ):
+            stats = bucket.setdefault(
+                key,
+                {
+                    "n": 0,
+                    "correct": 0,
+                    "score_sum": 0.0,
+                    "shot_rate_sum": 0.0,
+                    "shot_rate_n": 0,
+                },
+            )
+            stats["n"] += 1
+            stats["correct"] += int(bool(item.get("correct")))
+            if item.get("shot_success_rate") is not None:
+                stats["shot_rate_sum"] += float(item["shot_success_rate"])
+                stats["shot_rate_n"] += 1
+
+    summary = {
+        "n": n,
+        "accuracy": n_correct / n,
+        "scoring": "any_shot_string_match",
+        "by_modality": _finalize_group_stats(by_modality, include_score=False),
+        "by_category": _finalize_group_stats(by_category, include_score=False),
+    }
+    if shot_rates:
+        summary["avg_shot_success_rate"] = sum(shot_rates) / len(shot_rates)
+    if len(n_shots_values) == 1:
+        summary["n_shots"] = next(iter(n_shots_values))
+    elif n_shots_values:
+        summary["n_shots"] = sorted(n_shots_values)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +757,7 @@ def finalize_scored_run(
 ) -> dict:
     """Ensure rubric grading + summary scores are on disk, then publish."""
     scored = False
+    summary: dict = {}
     if score:
         scored = run_rubrics_scoring(
             predictions_path,
@@ -644,6 +773,19 @@ def finalize_scored_run(
                 f"acc={summary.get('accuracy', 0):.3f} "
                 f"avg_score={summary.get('avg_score', 0):.3f}"
             )
+    else:
+        summary = summarize_predictions(predictions_path)
+        if summary:
+            write_json(run_dir / "scores.json", summary)
+            rate = summary.get("avg_shot_success_rate")
+            rate_msg = (
+                f" avg_shot_success_rate={rate:.3f}" if rate is not None else ""
+            )
+            print(
+                f"Prediction summary: n={summary.get('n')} "
+                f"acc={summary.get('accuracy', 0):.3f}"
+                f"{rate_msg}"
+            )
 
     manifest = {
         **base_manifest,
@@ -658,8 +800,15 @@ def finalize_scored_run(
             "raw_tokens": "per-token list covering input + specials + generated tokens",
             "thinking_prediction": "parsed CoT / reasoning trace",
             "answer_prediction": "parsed final answer",
+            "n_shots": "number of independent generation attempts per example",
+            "shots": "per-attempt generations + string-match correctness",
+            "correct": (
+                "answer correctness (any-shot string match when n_shots>1; "
+                "else rubric grader when scored)"
+            ),
+            "n_shot_correct": "how many of the n shots matched the gold answer",
+            "shot_success_rate": "n_shot_correct / n_shots",
             "score": "MMAR-Rubrics aggregate score (evaluated file)",
-            "correct": "answer correctness from rubric grader",
             "raw_responses": "OpenAI grader raw responses",
             "rubric_results": "per-criterion rubric judgments",
         },
@@ -688,6 +837,15 @@ def run_mmar_evaluation(
     args.run_id = run_id
     random.seed(args.seed)
 
+    n_shots = max(1, int(getattr(args, "n_shots", 1) or 1))
+    args.n_shots = n_shots
+    if n_shots > 1 and args.score:
+        print(
+            f"n_shots={n_shots} > 1: disabling rubric evaluation "
+            "(scoring each shot with string match instead)."
+        )
+        args.score = False
+
     data_root_path = Path(args.data_root).expanduser().resolve()
     meta_path = Path(args.meta).expanduser().resolve()
     run_dir = resolve_run_output_dir(args.output_dir, run_id=run_id)
@@ -705,6 +863,7 @@ def run_mmar_evaluation(
         "seed": args.seed,
         "torch_dtype": args.torch_dtype,
         "max_new_tokens": args.max_new_tokens,
+        "n_shots": n_shots,
         "created_at": datetime.now(timezone.utc).isoformat(),
         **(manifest_extra or {}),
     }
@@ -794,7 +953,10 @@ def run_mmar_evaluation(
         )
         return {"status": "noop", "pending": 0, **published}
 
-    print(f"Evaluating {len(pending_items)} MMAR items with {args.model_id} ...")
+    print(
+        f"Evaluating {len(pending_items)} MMAR items with {args.model_id} "
+        f"(n_shots={n_shots}) ..."
+    )
     print(f"Writing run artifacts to {run_dir}")
     model, processor = load_model(args)
 
@@ -824,7 +986,29 @@ def run_mmar_evaluation(
         for batch_start in range(0, len(pending_items), args.batch_size):
             batch = pending_items[batch_start : batch_start + args.batch_size]
             try:
-                outputs = generate_batch_fn(model, processor, batch, args)
+                if n_shots == 1:
+                    outputs = generate_batch_fn(model, processor, batch, args)
+                    records = []
+                    for item, output in zip(batch, outputs):
+                        record = {**item, **output}
+                        if not args.score:
+                            record["correct"] = score_answer_prediction(
+                                item, output.get("answer_prediction", "")
+                            )
+                            record["n_shots"] = 1
+                            record["n_shot_correct"] = int(record["correct"])
+                            record["shot_success_rate"] = float(record["correct"])
+                        records.append(record)
+                else:
+                    shot_outputs_by_index: list[list[dict]] = [[] for _ in batch]
+                    for shot_index in range(n_shots):
+                        outputs = generate_batch_fn(model, processor, batch, args)
+                        for item_index, output in enumerate(outputs):
+                            shot_outputs_by_index[item_index].append(output)
+                    records = [
+                        aggregate_n_shot_record(item, shot_outputs)
+                        for item, shot_outputs in zip(batch, shot_outputs_by_index)
+                    ]
             except (OSError, ValueError, RuntimeError) as exc:
                 ids = ", ".join(item["id"] for item in batch)
                 print(f"Skipping batch ({ids}): {exc}")
@@ -833,16 +1017,21 @@ def run_mmar_evaluation(
                 )
                 continue
 
-            records = []
-            for item, output in zip(batch, outputs):
-                record = {**item, **output}
-                records.append(record)
+            for item, record in zip(batch, records):
                 completed += 1
                 if args.print_every > 0 and completed % args.print_every == 0:
                     elapsed = time.time() - start_time
+                    rate = record.get("shot_success_rate")
+                    rate_msg = (
+                        f" shots={record.get('n_shot_correct', 0)}/"
+                        f"{record.get('n_shots', 1)}"
+                        if rate is not None and n_shots > 1
+                        else ""
+                    )
                     print(
                         f"[{completed}/{len(pending_items)}] "
-                        f"id={item['id']} answer={output['answer_prediction']!r} "
+                        f"id={item['id']} answer={record.get('answer_prediction')!r}"
+                        f"{rate_msg} "
                         f"({elapsed:.1f}s elapsed)"
                     )
 

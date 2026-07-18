@@ -8,6 +8,7 @@ Reads:
   - Local wavs under ``data/mmar/audio/``
   - Run folders under ``outputs/`` (direct or nested ``mmar/af3/<run>/``):
       predictions.jsonl, predictions.evaluated.jsonl, scores.json, manifest.json
+  - Optional ``attentions/<id>.npz`` artifacts captured on demand
 
 Usage:
 
@@ -15,6 +16,9 @@ Usage:
     uv run python view_mmar_results.py --port 7860
     uv run python view_mmar_results.py --results-dir ./outputs
     uv run python view_mmar_results.py --meta ./data/mmar/MMAR-meta.jsonl
+
+Capture attentions for the selected example via the detail-panel button
+(runs ``capture_mmar_attention.py`` on Modal, then syncs artifacts locally).
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import argparse
 import json
 import mimetypes
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import urllib.error
@@ -33,11 +38,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from audio_flamingo_runtime import (
+    attention_artifact_id,
+    load_attention_meta,
+    load_attention_token_layer_matrix,
+    load_attention_vector,
+)
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS_DIR = ROOT / "outputs"
 DEFAULT_DATA_DIR = ROOT / "data" / "mmar"
 DEFAULT_META = DEFAULT_DATA_DIR / "MMAR-meta.jsonl"
 DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
+RESULTS_VOLUME_NAME = "latent-reasoning-results"
 MMAR_META_URL = (
     "https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl"
 )
@@ -190,6 +203,8 @@ def iter_run_dirs(results_dir: Path) -> list[Path]:
     _add_from(results_dir)
     _add_from(results_dir / "mmar" / "af3")
     _add_from(results_dir / "af3")
+    _add_from(results_dir / "mmar" / "af-next-think")
+    _add_from(results_dir / "af-next-think")
 
     return sorted(found.values(), key=lambda p: p.name, reverse=True)
 
@@ -310,6 +325,16 @@ def build_examples(run_dir: Path | None, *, only_generated: bool = False) -> lis
 
 def summarize_example(item: dict) -> dict:
     """Strip bulky fields for the list API; keep enough for the card."""
+    n_shots = item.get("n_shots")
+    n_shot_correct = item.get("n_shot_correct")
+    shot_success_rate = item.get("shot_success_rate")
+    shots = item.get("shots") or []
+    if n_shots is None and shots:
+        n_shots = len(shots)
+    if n_shot_correct is None and shots:
+        n_shot_correct = sum(1 for shot in shots if shot.get("correct"))
+    if shot_success_rate is None and n_shots:
+        shot_success_rate = (n_shot_correct or 0) / n_shots
     return {
         "id": item.get("id"),
         "question": item.get("question"),
@@ -326,6 +351,12 @@ def summarize_example(item: dict) -> dict:
         "correct": item.get("correct"),
         "score": item.get("score"),
         "answer_prediction": item.get("answer_prediction"),
+        "n_shots": n_shots,
+        "n_shot_correct": n_shot_correct,
+        "shot_success_rate": shot_success_rate,
+        "any_shot_success": bool(item.get("correct"))
+        if item.get("correct") is not None
+        else None,
         "n_rubric": len(item.get("rubric") or []),
         "n_cues": len(item.get("cue") or []),
     }
@@ -347,7 +378,189 @@ def full_example(item_id: str, run_dir: Path | None) -> dict | None:
             if key in meta[item_id]:
                 example[key] = meta[item_id][key]
     example["local_audio"] = resolve_local_audio(example.get("audio_path"))
+    attn_meta = load_attention_meta(run_dir, item_id) if run_dir is not None else None
+    example["has_attention"] = attn_meta is not None
+    example["attention_meta"] = attn_meta
     return example
+
+
+def infer_results_subdir(run_dir: Path, manifest: dict | None = None) -> str:
+    """Infer Modal volume subdir (mmar/af3 or mmar/af-next-think) for a local run."""
+    manifest = manifest or load_json(run_dir / "manifest.json") or {}
+    parts = list(run_dir.resolve().parts)
+    if "mmar" in parts:
+        idx = parts.index("mmar")
+        if idx + 1 < len(parts) and parts[idx + 1] in {"af3", "af-next-think"}:
+            return f"mmar/{parts[idx + 1]}"
+    label = str(manifest.get("model_label") or "").lower()
+    model_id = str(manifest.get("model_id") or "").lower()
+    if "next" in label or "next" in model_id:
+        return "mmar/af-next-think"
+    return "mmar/af3"
+
+
+def attention_paths(run_dir: Path, sample_id: str) -> tuple[Path, Path, Path, str]:
+    artifact_id = attention_artifact_id(sample_id)
+    attn_dir = run_dir / "attentions"
+    return (
+        attn_dir,
+        attn_dir / f"{artifact_id}.npz",
+        attn_dir / f"{artifact_id}.json",
+        artifact_id,
+    )
+
+
+def remote_attention_prefix(
+    run_dir: Path,
+    sample_id: str,
+    manifest: dict | None = None,
+) -> str:
+    """Volume-relative path prefix for an attention artifact (no extension)."""
+    results_subdir = infer_results_subdir(run_dir, manifest)
+    artifact_id = attention_artifact_id(sample_id)
+    return f"{results_subdir}/{run_dir.name}/attentions/{artifact_id}"
+
+
+def sync_attention_from_volume(
+    run_dir: Path,
+    sample_id: str,
+    *,
+    remote_prefix: str | None = None,
+    manifest: dict | None = None,
+) -> dict:
+    """Download attention artifacts for ``sample_id`` into ``run_dir/attentions``."""
+    manifest = manifest if manifest is not None else (load_json(run_dir / "manifest.json") or {})
+    prefix = remote_prefix or remote_attention_prefix(run_dir, sample_id, manifest)
+    artifact_id = attention_artifact_id(sample_id)
+    saved = download_attention_artifacts(prefix, run_dir, artifact_id)
+    meta = load_attention_meta(run_dir, sample_id) or {}
+    return {
+        "status": "ok",
+        "downloaded": True,
+        "attentions_remote": prefix,
+        "files": saved,
+        "attention_meta": meta,
+    }
+
+
+def download_attention_artifacts(
+    remote_prefix: str,
+    run_dir: Path,
+    artifact_id: str,
+    *,
+    max_attempts: int = 10,
+    initial_delay_s: float = 1.0,
+) -> dict[str, str]:
+    """Fetch ``attentions/<id>.{npz,json}`` from the results Volume into ``run_dir``.
+
+    Large npz writes can be briefly listed on the Volume before their blocks are
+    readable (``404 block not found``). Retry with backoff, and prefer the
+    Python Volume API over ``modal volume get``.
+    """
+    import time
+
+    import modal
+
+    dest = run_dir / "attentions"
+    dest.mkdir(parents=True, exist_ok=True)
+    vol = modal.Volume.from_name(RESULTS_VOLUME_NAME)
+    saved: dict[str, str] = {}
+
+    # JSON first (small); then the large npz.
+    for ext in (".json", ".npz"):
+        remote = f"{remote_prefix}{ext}"
+        local = dest / f"{artifact_id}{ext}"
+        tmp = local.with_suffix(local.suffix + ".partial")
+        last_err: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                print(
+                    f"[viewer] downloading {remote} -> {local} "
+                    f"(attempt {attempt}/{max_attempts})",
+                    flush=True,
+                )
+                with open(tmp, "wb") as handle:
+                    nbytes = vol.read_file_into_fileobj(remote, handle)
+                tmp.replace(local)
+                print(f"[viewer] wrote {nbytes} bytes to {local}", flush=True)
+                saved[ext.lstrip(".")] = str(local)
+                last_err = None
+                break
+            except Exception as exc:  # noqa: BLE001 — retry volume races
+                last_err = exc
+                msg = str(exc).lower()
+                retryable = (
+                    "404" in msg
+                    or "not found" in msg
+                    or "block not found" in msg
+                    or "no such file" in msg
+                )
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                if not retryable or attempt >= max_attempts:
+                    break
+                delay = min(initial_delay_s * (2 ** (attempt - 1)), 30.0)
+                print(
+                    f"[viewer] download not ready ({exc}); retrying in {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+        if last_err is not None:
+            raise RuntimeError(
+                f"Failed to download {remote} after {max_attempts} attempts: {last_err}"
+            ) from last_err
+    return saved
+
+
+def run_capture_attention_job(
+    run_id: str,
+    sample_id: str,
+    results_subdir: str,
+) -> dict:
+    """Spawn Modal capture via ``modal run`` and parse the CAPTURE_RESULT line."""
+    cmd = [
+        "uv",
+        "run",
+        "modal",
+        "run",
+        str(ROOT / "capture_mmar_attention.py"),
+        "--run-id",
+        run_id,
+        "--sample-id",
+        sample_id,
+        "--results-subdir",
+        results_subdir,
+    ]
+    print(f"[viewer] running: {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    if stdout:
+        print(stdout, flush=True)
+    if stderr:
+        print(stderr, flush=True)
+    result = None
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("CAPTURE_RESULT:"):
+            result = json.loads(line[len("CAPTURE_RESULT:") :])
+            break
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"modal capture failed (exit {proc.returncode}). "
+            f"{(stderr or stdout)[-2000:]}"
+        )
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "modal capture finished without CAPTURE_RESULT JSON in stdout"
+        )
+    return result
 
 
 def resolve_local_audio(audio_path: str | None) -> str | None:
@@ -506,6 +719,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     margin: 0 0 0.55rem; font-size: 0.78rem; letter-spacing: 0.05em;
     text-transform: uppercase; color: var(--muted); font-weight: 600;
   }
+  .section-head {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.55rem;
+    margin-bottom: 0.55rem;
+  }
+  .section-head h3 { margin: 0; }
+  .section-head select {
+    font: inherit; color: var(--ink);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.25rem 0.5rem; min-width: 8rem;
+    text-transform: none; letter-spacing: normal; font-size: 0.82rem;
+  }
   .choices { display: grid; gap: 0.4rem; }
   .choice {
     border: 1px solid var(--line); border-radius: 8px; padding: 0.55rem 0.75rem;
@@ -588,6 +812,59 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .audio-player .missing { color: var(--muted); font-size: 0.9rem; }
   a { color: var(--accent); }
+  .btn {
+    font: inherit; cursor: pointer; color: #fff;
+    background: var(--accent); border: 1px solid var(--accent);
+    border-radius: 8px; padding: 0.5rem 0.85rem;
+  }
+  .btn:hover { filter: brightness(1.05); }
+  .btn:disabled { opacity: 0.55; cursor: wait; }
+  .btn.secondary {
+    background: var(--card); color: var(--ink); border-color: var(--line);
+  }
+  .attn-controls {
+    display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: end;
+    margin-bottom: 0.75rem;
+  }
+  .attn-controls label { min-width: 6rem; }
+  .attn-controls select { min-width: 6.5rem; }
+  .attn-status { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.65rem; }
+  .attn-heatmap-wrap {
+    border: 1px solid var(--line); border-radius: 10px; padding: 0.75rem;
+    background: var(--bg); overflow: auto; max-height: min(70vh, 48rem);
+  }
+  .attn-axis-label {
+    font-size: 0.72rem; color: var(--muted); margin: 0 0 0.35rem;
+  }
+  .attn-grid {
+    display: grid;
+    grid-template-columns: minmax(7rem, max-content) 1fr;
+    gap: 0.35rem 0.55rem;
+    align-items: start;
+  }
+  .attn-layer-labels {
+    grid-column: 2;
+    display: flex; font-family: "IBM Plex Mono", monospace;
+    font-size: 0.62rem; color: var(--muted); line-height: 1;
+  }
+  .attn-layer-labels span {
+    flex: 1 1 0; text-align: center; min-width: 0;
+  }
+  .attn-token-col {
+    display: flex; flex-direction: column;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.72rem; line-height: 1;
+  }
+  .attn-token-col .tok {
+    display: block; margin: 0; padding: 0 0.35rem;
+    height: 16px; line-height: 16px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 14rem; border-radius: 2px;
+  }
+  .attn-canvas {
+    display: block; width: 100%;
+    image-rendering: pixelated;
+  }
 </style>
 </head>
 <body>
@@ -635,7 +912,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </main>
 <script>
 const LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-let state = { runs: [], examples: [], selectedId: null, runId: null };
+let state = { runs: [], examples: [], selectedId: null, runId: null, selectedShotIndex: 0, currentExample: null };
 
 async function api(path) {
   const res = await fetch(path);
@@ -665,13 +942,20 @@ function renderStats(run) {
     ["Examples", state.examples.length],
     ["Generated", state.examples.filter(e => e.has_generation).length],
     ["Accuracy", scores.accuracy != null ? (100*scores.accuracy).toFixed(1)+"%" : "—"],
-    ["Avg rubric", scores.avg_score != null ? fmtScore(scores.avg_score) : "—"],
+    [
+      scores.avg_shot_success_rate != null ? "Avg shot rate" : "Avg rubric",
+      scores.avg_shot_success_rate != null
+        ? (100*scores.avg_shot_success_rate).toFixed(1)+"%"
+        : (scores.avg_score != null ? fmtScore(scores.avg_score) : "—"),
+    ],
   ];
   document.getElementById("stats").innerHTML = cards.map(([k,v]) =>
     `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
   ).join("");
+  const nShots = scores.n_shots ?? m.n_shots;
+  const model = m.model_id ? m.model_id.split("/").pop() : (run?.id || "");
   document.getElementById("run-label").textContent =
-    m.model_id ? m.model_id.split("/").pop() : (run?.id || "");
+    nShots && nShots > 1 ? `${model} · ${nShots}-shot` : model;
 }
 
 function filteredExamples() {
@@ -683,7 +967,7 @@ function filteredExamples() {
     if (filter === "generated" && !e.has_generation) return false;
     if (filter === "graded" && !e.has_grade) return false;
     if (filter === "correct" && e.correct !== true) return false;
-    if (filter === "incorrect" && !(e.has_grade && e.correct === false)) return false;
+    if (filter === "incorrect" && e.correct !== false) return false;
     if (filter === "ungenerated" && e.has_generation) return false;
     if (q) {
       const hay = [e.id, e.question, e.answer, e.answer_prediction, e.category, e.modality]
@@ -702,8 +986,15 @@ function renderList() {
     const tags = [];
     if (e.modality) tags.push(tag(e.modality));
     if (e.category) tags.push(tag(e.category));
-    if (e.has_grade) {
-      tags.push(tag(e.correct ? "correct" : "incorrect", e.correct ? "good" : "bad"));
+    if (e.correct === true || e.correct === false) {
+      const label = e.n_shots && e.n_shots > 1
+        ? (e.correct ? "any success" : "no success")
+        : (e.correct ? "correct" : "incorrect");
+      tags.push(tag(label, e.correct ? "good" : "bad"));
+    }
+    if (e.n_shots && e.n_shots > 1 && e.n_shot_correct != null) {
+      tags.push(tag(`${e.n_shot_correct}/${e.n_shots} shots`, "neutral"));
+    } else if (e.has_grade) {
       tags.push(tag(`score ${fmtScore(e.score)}`, "neutral"));
     } else if (e.has_generation) {
       tags.push(tag("generated", "neutral"));
@@ -724,6 +1015,33 @@ function choiceClass(choice, answer, pred) {
   if (choice === answer) classes.push("correct");
   if (pred && choice === pred) classes.push("pred");
   return classes.join(" ");
+}
+
+function exampleShots(example) {
+  return Array.isArray(example?.shots) ? example.shots : [];
+}
+
+function defaultShotIndex(example) {
+  const shots = exampleShots(example);
+  if (!shots.length) return 0;
+  const firstSuccess = shots.findIndex(s => s.correct);
+  return firstSuccess >= 0 ? firstSuccess : 0;
+}
+
+function viewForShot(example, shotIndex) {
+  const shots = exampleShots(example);
+  if (!shots.length) return example;
+  const idx = Math.max(0, Math.min(shotIndex, shots.length - 1));
+  const shot = shots[idx] || {};
+  return {
+    ...example,
+    selected_shot_index: idx,
+    answer_prediction: shot.answer_prediction ?? example.answer_prediction,
+    thinking_prediction: shot.thinking_prediction ?? example.thinking_prediction,
+    model_output: shot.model_output ?? example.model_output,
+    raw_tokens: shot.raw_tokens ?? example.raw_tokens,
+    shot_correct: shot.correct,
+  };
 }
 
 function renderRawText(example) {
@@ -785,7 +1103,199 @@ function renderRubric(example) {
   }).join("")}</div>`;
 }
 
-async function selectExample(id) {
+function renderShotSelectOptions(example, selectedIndex) {
+  const shots = exampleShots(example);
+  if (shots.length <= 1) return "";
+  return shots.map((shot, i) => {
+    const idx = shot.shot_index ?? i;
+    const ok = !!shot.correct;
+    const label = `Shot ${idx}${ok ? " · success" : " · fail"}`;
+    return `<option value="${i}" ${i === selectedIndex ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
+
+function renderAttentionSection(example) {
+  const meta = example.attention_meta;
+  const matchBadge = meta
+    ? (meta.token_match
+        ? tag("token match", "good")
+        : tag("token mismatch", "bad"))
+    : "";
+  const status = meta
+    ? `${meta.num_steps || "?"} gen steps · ${meta.num_layers || "?"} layers · ${meta.num_heads || "?"} heads · seed ${meta.seed ?? "?"} ${matchBadge}`
+    : "No attention artifact yet. Capture re-runs this example on Modal with eager attention.";
+  const heads = meta?.num_heads || 28;
+  const steps = meta?.num_steps || 0;
+  const layers = meta?.num_layers || 28;
+  const headOpts = Array.from({length: heads}, (_, i) =>
+    `<option value="${i}">${i}</option>`).join("");
+  const stepOpts = Array.from({length: Math.max(steps, 1)}, (_, i) =>
+    `<option value="${i}">${i}</option>`).join("");
+  const layerAxis = Array.from({length: layers}, (_, i) =>
+    `<span title="layer ${i}">${i}</span>`).join("");
+  return `
+    <div class="section" id="attention-section">
+      <h3>Attention<span class="section-hint">tokens × layers · selected head</span></h3>
+      <div class="attn-status" id="attn-status">${status}</div>
+      <div class="attn-controls">
+        <button type="button" class="btn" id="capture-attn">
+          ${meta ? "Re-capture attention" : "Capture attention"}
+        </button>
+        <button type="button" class="btn secondary" id="sync-attn">
+          Pull from volume
+        </button>
+        ${meta ? `
+        <label>Gen token
+          <select id="attn-step">${stepOpts}</select>
+        </label>
+        <label>Head
+          <select id="attn-head">${headOpts}</select>
+        </label>
+        <button type="button" class="btn secondary" id="attn-refresh">Load heatmap</button>
+        ` : ""}
+      </div>
+      ${meta ? `
+        <div class="attn-heatmap-wrap">
+          <div class="attn-axis-label">Horizontal: layers 0…${layers - 1} · Vertical: key tokens</div>
+          <div class="attn-grid">
+            <div></div>
+            <div class="attn-layer-labels" id="attn-layer-labels">${layerAxis}</div>
+            <div class="attn-token-col" id="attn-tokens"></div>
+            <canvas class="attn-canvas" id="attn-canvas"></canvas>
+          </div>
+        </div>
+      ` : ""}
+    </div>`;
+}
+
+function paintAttentionHeatmap(matrix, tokens) {
+  const canvas = document.getElementById("attn-canvas");
+  const tokenCol = document.getElementById("attn-tokens");
+  if (!canvas || !matrix?.length) return;
+  const keyLen = matrix.length;
+  const numLayers = matrix[0]?.length || 0;
+  if (!numLayers) return;
+
+  const rowH = 16;
+  const colW = Math.max(10, Math.floor(
+    Math.max((canvas.parentElement?.clientWidth || 320) - 4, numLayers * 10) / numLayers
+  ));
+  canvas.width = numLayers * colW;
+  canvas.height = keyLen * rowH;
+  canvas.style.width = `${canvas.width}px`;
+  canvas.style.height = `${canvas.height}px`;
+
+  let max = 1e-8;
+  for (const row of matrix) {
+    for (const v of row) if (v > max) max = v;
+  }
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (let ti = 0; ti < keyLen; ti++) {
+    const row = matrix[ti];
+    for (let li = 0; li < numLayers; li++) {
+      const t = Math.max(0, Math.min(1, row[li] / max));
+      const r = Math.round(30 + 40 * (1 - t));
+      const g = Math.round(60 + 120 * t);
+      const b = Math.round(90 + 50 * (1 - t));
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(li * colW, ti * rowH, colW, rowH);
+    }
+  }
+
+  if (tokenCol) {
+    const slice = tokens.slice(0, keyLen);
+    // Pad if matrix is longer than labeled tokens (shouldn't happen often).
+    while (slice.length < keyLen) {
+      slice.push({ token: `[${slice.length}]`, role: "input", special: false });
+    }
+    tokenCol.innerHTML = slice.map((t, i) => {
+      const role = t.role === "generated" ? "generated" : "input";
+      const cls = ["tok", role].concat(t.special ? ["special"] : []).join(" ");
+      const label = String(t.token ?? "");
+      return `<span class="${cls}" title="${escapeHtml(label)} @${i}">${escapeHtml(label)}</span>`;
+    }).join("");
+  }
+}
+
+async function loadAttentionHeatmap(example) {
+  const step = Number(document.getElementById("attn-step")?.value || 0);
+  const head = Number(document.getElementById("attn-head")?.value || 0);
+  const run = encodeURIComponent(state.runId || "");
+  const status = document.getElementById("attn-status");
+  try {
+    const data = await api(
+      `/api/attention-data?run=${run}&id=${encodeURIComponent(example.id)}&gen_index=${step}&head=${head}`
+    );
+    paintAttentionHeatmap(data.matrix || [], example.raw_tokens || []);
+    if (status && example.attention_meta) {
+      const meta = example.attention_meta;
+      const matchBadge = meta.token_match
+        ? tag("token match", "good")
+        : tag("token mismatch", "bad");
+      status.innerHTML = `gen ${step} · head ${head} · ${data.key_len} tokens × ${data.num_layers} layers · seed ${meta.seed ?? "?"} ${matchBadge}`;
+    }
+  } catch (err) {
+    if (status) status.textContent = String(err);
+  }
+}
+
+async function syncAttention(example) {
+  const btn = document.getElementById("sync-attn");
+  const status = document.getElementById("attn-status");
+  if (btn) { btn.disabled = true; btn.textContent = "Pulling…"; }
+  if (status) status.textContent = "Downloading attentions from Modal volume…";
+  try {
+    const res = await fetch("/api/sync-attention", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ run: state.runId, id: example.id }),
+    });
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload.error || res.statusText);
+    if (status) status.textContent = "Downloaded attention artifact from volume.";
+    await selectExample(example.id);
+  } catch (err) {
+    if (status) status.textContent = String(err);
+    if (btn) { btn.disabled = false; btn.textContent = "Pull from volume"; }
+  }
+}
+
+async function captureAttention(example) {
+  const btn = document.getElementById("capture-attn");
+  const status = document.getElementById("attn-status");
+  if (btn) { btn.disabled = true; btn.textContent = "Capturing on Modal…"; }
+  if (status) status.textContent = "Running capture on Modal (model load + generate). This can take several minutes…";
+  try {
+    const res = await fetch("/api/capture-attention", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ run: state.runId, id: example.id }),
+    });
+    const payload = await res.json();
+    if (!res.ok && res.status !== 202) throw new Error(payload.error || res.statusText);
+    if (payload.downloaded === false) {
+      if (status) {
+        status.textContent =
+          `Capture succeeded on Modal, but local download failed: ${payload.download_error || "unknown"}. Use Pull from volume.`;
+      }
+      const syncBtn = document.getElementById("sync-attn");
+      if (syncBtn) syncBtn.disabled = false;
+      if (btn) { btn.disabled = false; btn.textContent = "Re-capture attention"; }
+      return;
+    }
+    if (status) {
+      status.textContent = `Captured · token_match=${payload.token_match} · ${payload.num_steps} steps · ${(payload.estimated_bytes/1e6).toFixed(1)} MB`;
+    }
+    await selectExample(example.id);
+  } catch (err) {
+    if (status) status.textContent = String(err);
+    if (btn) { btn.disabled = false; btn.textContent = "Capture attention"; }
+  }
+}
+
+async function selectExample(id, preferredShotIndex = null) {
   state.selectedId = id;
   renderList();
   const detail = document.getElementById("detail");
@@ -793,16 +1303,43 @@ async function selectExample(id) {
   detail.innerHTML = `<div style="color:var(--muted)">Loading…</div>`;
   const run = encodeURIComponent(state.runId || "");
   const example = await api(`/api/example?id=${encodeURIComponent(id)}&run=${run}`);
+  state.currentExample = example;
+  const shots = exampleShots(example);
+  if (preferredShotIndex != null && preferredShotIndex >= 0 && preferredShotIndex < shots.length) {
+    state.selectedShotIndex = preferredShotIndex;
+  } else {
+    state.selectedShotIndex = defaultShotIndex(example);
+  }
+  renderExampleDetail(example, state.selectedShotIndex);
+}
+
+function renderExampleDetail(example, shotIndex) {
+  const detail = document.getElementById("detail");
+  detail.classList.remove("empty");
+  const view = viewForShot(example, shotIndex);
   const choices = example.choices || [];
   const cues = example.cue || [];
+  const shots = exampleShots(example);
+  const shotOptions = renderShotSelectOptions(example, view.selected_shot_index);
   detail.innerHTML = `
     <h2>${escapeHtml(example.question || "")}</h2>
     <div class="meta-row">
       ${example.modality ? tag(example.modality) : ""}
       ${example.category ? tag(example.category) : ""}
       ${example["sub-category"] ? tag(example["sub-category"]) : ""}
-      ${example.has_grade ? tag(example.correct ? "correct" : "incorrect", example.correct ? "good" : "bad") : ""}
+      ${example.correct === true || example.correct === false
+        ? tag(
+            (example.n_shots && example.n_shots > 1)
+              ? (example.correct ? "any success" : "no success")
+              : (example.correct ? "correct" : "incorrect"),
+            example.correct ? "good" : "bad"
+          )
+        : ""}
+      ${example.n_shots && example.n_shots > 1 && example.n_shot_correct != null
+        ? tag(`${example.n_shot_correct}/${example.n_shots} shots`, "neutral")
+        : ""}
       ${example.has_grade ? tag("score " + fmtScore(example.score), "neutral") : ""}
+      ${example.has_attention ? tag("attention", "good") : ""}
       ${tag(example.id, "")}
     </div>
 
@@ -821,10 +1358,10 @@ async function selectExample(id) {
       <h3>Choices</h3>
       <div class="choices">
         ${choices.map((c,i) => `
-          <div class="${choiceClass(c, example.answer, example.answer_prediction)}">
+          <div class="${choiceClass(c, example.answer, view.answer_prediction)}">
             <span class="label">(${LABELS[i] || i})</span>${escapeHtml(c)}
             ${c === example.answer ? " · GT" : ""}
-            ${example.answer_prediction && c === example.answer_prediction ? " · pred" : ""}
+            ${view.answer_prediction && c === view.answer_prediction ? " · pred" : ""}
           </div>`).join("")}
       </div>
     </div>
@@ -835,8 +1372,11 @@ async function selectExample(id) {
         <div class="box">${escapeHtml(example.thinking || "—")}</div>
       </div>
       <div>
-        <h3>Model reasoning</h3>
-        <div class="box">${escapeHtml(example.thinking_prediction || (example.has_generation ? "—" : "No generation in this run"))}</div>
+        <div class="section-head">
+          <h3>Model reasoning</h3>
+          ${shotOptions ? `<select id="shot-select" aria-label="Select shot">${shotOptions}</select>` : ""}
+        </div>
+        <div class="box">${escapeHtml(view.thinking_prediction || (example.has_generation ? "—" : "No generation in this run"))}</div>
       </div>
     </div>
 
@@ -847,16 +1387,18 @@ async function selectExample(id) {
       </div>
       <div>
         <h3>Model answer</h3>
-        <div class="box">${escapeHtml(example.answer_prediction || "—")}</div>
+        <div class="box">${escapeHtml(view.answer_prediction || "—")}</div>
       </div>
     </div>
 
     ${cues.length ? `<div class="section"><h3>Reasoning cues</h3><div class="tags">${cues.map(c => tag(c)).join("")}</div></div>` : ""}
 
     <div class="section">
-      <h3>Raw text<span class="section-hint">all tokens · input + specials + model-generated</span></h3>
-      ${renderRawText(example)}
+      <h3>Raw text<span class="section-hint">${shots.length > 1 ? `shot ${view.selected_shot_index} · ` : ""}all tokens · input + specials + model-generated</span></h3>
+      ${renderRawText(view)}
     </div>
+
+    ${example.has_generation ? renderAttentionSection(example) : ""}
 
     <div class="section">
       <h3>Instance rubric${example.has_grade ? " + grades" : ""}</h3>
@@ -865,6 +1407,31 @@ async function selectExample(id) {
   `;
   const audio = detail.querySelector("audio");
   if (audio) audio.volume = 0.5;
+
+  const shotSelect = document.getElementById("shot-select");
+  if (shotSelect) {
+    shotSelect.addEventListener("change", () => {
+      state.selectedShotIndex = Number(shotSelect.value);
+      renderExampleDetail(example, state.selectedShotIndex);
+    });
+  }
+
+  const captureBtn = document.getElementById("capture-attn");
+  if (captureBtn) {
+    captureBtn.addEventListener("click", () => captureAttention(example));
+  }
+  const syncBtn = document.getElementById("sync-attn");
+  if (syncBtn) {
+    syncBtn.addEventListener("click", () => syncAttention(example));
+  }
+  const refreshBtn = document.getElementById("attn-refresh");
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", () => loadAttentionHeatmap(view));
+    ["attn-step", "attn-head"].forEach(id => {
+      document.getElementById(id)?.addEventListener("change", () => loadAttentionHeatmap(view));
+    });
+    loadAttentionHeatmap(view);
+  }
 }
 
 function fillModalities() {
@@ -998,6 +1565,81 @@ class Handler(BaseHTTPRequestHandler):
             self._json(example)
             return
 
+        if path == "/api/attention":
+            item_id = (qs.get("id") or [None])[0]
+            if not item_id:
+                self._json({"error": "missing id"}, 400)
+                return
+            run_id = (qs.get("run") or [None])[0] or None
+            run_dir = resolve_run_dir(results_dir, run_id)
+            if run_dir is None:
+                self._json({"error": "run not found"}, 404)
+                return
+            meta = load_attention_meta(run_dir, item_id)
+            if meta is None:
+                self._json({"error": "attention artifact not found", "has_attention": False}, 404)
+                return
+            self._json({"has_attention": True, **meta})
+            return
+
+        if path == "/api/attention-data":
+            item_id = (qs.get("id") or [None])[0]
+            if not item_id:
+                self._json({"error": "missing id"}, 400)
+                return
+            run_id = (qs.get("run") or [None])[0] or None
+            run_dir = resolve_run_dir(results_dir, run_id)
+            if run_dir is None:
+                self._json({"error": "run not found"}, 404)
+                return
+            try:
+                gen_index = int((qs.get("gen_index") or ["0"])[0])
+                head = int((qs.get("head") or ["0"])[0])
+                layer_raw = (qs.get("layer") or [None])[0]
+                if layer_raw is None:
+                    payload = load_attention_token_layer_matrix(
+                        run_dir,
+                        item_id,
+                        gen_index=gen_index,
+                        head=head,
+                    )
+                    self._json(
+                        {
+                            "id": item_id,
+                            "run": run_dir.name,
+                            "gen_index": gen_index,
+                            "head": head,
+                            **payload,
+                        }
+                    )
+                    return
+                layer = int(layer_raw)
+                values = load_attention_vector(
+                    run_dir,
+                    item_id,
+                    gen_index=gen_index,
+                    layer=layer,
+                    head=head,
+                )
+            except FileNotFoundError as exc:
+                self._json({"error": str(exc)}, 404)
+                return
+            except (KeyError, IndexError, ValueError) as exc:
+                self._json({"error": str(exc)}, 400)
+                return
+            self._json(
+                {
+                    "id": item_id,
+                    "run": run_dir.name,
+                    "gen_index": gen_index,
+                    "layer": layer,
+                    "head": head,
+                    "values": values,
+                    "key_len": len(values),
+                }
+            )
+            return
+
         if path.startswith("/audio/"):
             name = unquote(path[len("/audio/") :])
             audio = find_audio_file(name)
@@ -1010,6 +1652,94 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path not in ("/api/capture-attention", "/api/sync-attention"):
+            self._json({"error": "not found"}, 404)
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._json({"error": "invalid JSON body"}, 400)
+            return
+
+        item_id = payload.get("id")
+        run_id = payload.get("run")
+        if not item_id or not run_id:
+            self._json({"error": "missing id or run"}, 400)
+            return
+
+        results_dir = Path(CONFIG["results_dir"])
+        run_dir = resolve_run_dir(results_dir, run_id)
+        if run_dir is None:
+            self._json({"error": f"run not found: {run_id}"}, 404)
+            return
+
+        example = full_example(item_id, run_dir)
+        if example is None or not example.get("has_generation"):
+            self._json(
+                {"error": "example not found or has no generation in this run"},
+                404,
+            )
+            return
+
+        manifest = load_json(run_dir / "manifest.json") or {}
+        results_subdir = infer_results_subdir(run_dir, manifest)
+
+        if path == "/api/sync-attention":
+            try:
+                remote = payload.get("attentions_remote") or remote_attention_prefix(
+                    run_dir, item_id, manifest
+                )
+                result = sync_attention_from_volume(
+                    run_dir,
+                    item_id,
+                    remote_prefix=remote,
+                    manifest=manifest,
+                )
+                self._json({**result, "local_run": str(run_dir)})
+            except Exception as exc:  # noqa: BLE001 — surface to UI
+                self._json({"error": str(exc)}, 500)
+            return
+
+        try:
+            result = run_capture_attention_job(
+                run_id=run_dir.name,
+                sample_id=item_id,
+                results_subdir=results_subdir,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface to UI
+            self._json({"error": str(exc)}, 500)
+            return
+
+        remote = result.get("attentions_remote")
+        artifact_id = attention_artifact_id(item_id)
+        downloaded = False
+        download_error = None
+        if remote:
+            try:
+                download_attention_artifacts(remote, run_dir, artifact_id)
+                downloaded = True
+            except Exception as exc:  # noqa: BLE001 — capture still succeeded
+                download_error = str(exc)
+                print(f"[viewer] post-capture download failed: {exc}", flush=True)
+
+        meta = load_attention_meta(run_dir, item_id) or {}
+        self._json(
+            {
+                **result,
+                "downloaded": downloaded,
+                "download_error": download_error,
+                "attention_meta": meta,
+                "local_run": str(run_dir),
+            },
+            code=200 if downloaded else 202,
+        )
 
 
 def parse_args() -> argparse.Namespace:

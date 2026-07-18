@@ -25,6 +25,7 @@ Usage:
     uv run modal run run_audio_flamingo_next_mmar.py
     uv run modal run run_audio_flamingo_next_mmar.py --num-samples 8
     uv run modal run run_audio_flamingo_next_mmar.py --no-score --num-samples 4
+    uv run modal run run_audio_flamingo_next_mmar.py --n-shots 5 --temperature 0.7 --num-samples 8
     uv run modal run --detach run_audio_flamingo_next_mmar.py --num-samples 200
 
 Download results locally:
@@ -164,6 +165,7 @@ def run_mmar(
     seed: int = 42,
     score: bool = True,
     score_only: bool = False,
+    n_shots: int = 1,
     print_every: int = 10,
     run_id: str | None = None,
 ) -> dict:
@@ -188,6 +190,7 @@ def run_mmar(
         seed=seed,
         score=score,
         score_only=score_only,
+        n_shots=n_shots,
         print_every=print_every,
         run_id=run_id,
     )
@@ -221,6 +224,7 @@ def main(
     seed: int = 42,
     score: bool = True,
     score_only: bool = False,
+    n_shots: int = 1,
     print_every: int = 10,
     run_id: str | None = None,
 ):
@@ -250,7 +254,11 @@ def main(
         seed: RNG seed.
         score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
             (default True). Grades each batch while the next generates.
+            Forced off when n_shots > 1.
         score_only: Skip inference; only score existing predictions.
+        n_shots: Independent generation attempts per example (default 1).
+            When > 1, rubric grading is disabled and each shot is scored with
+            string match; example is correct if any shot succeeds.
         print_every: Progress print interval.
         run_id: Optional run folder name; default is a UTC timestamp.
     """
@@ -276,6 +284,7 @@ def main(
         seed=seed,
         score=score,
         score_only=score_only,
+        n_shots=n_shots,
         print_every=print_every,
         run_id=run_id,
     )

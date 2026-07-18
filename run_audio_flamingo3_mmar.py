@@ -23,8 +23,8 @@ Usage:
     uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
     uv run modal run run_audio_flamingo3_mmar.py --no-think --num-samples 4
     # (--no-think disables the AF-Think adapter)
-    uv run modal run run_audio_flamingo3_mmar.py --num-samples 8
-    # Rubric scoring is pipelined with generation by default; pass --no-score to skip.
+    uv run modal run run_audio_flamingo3_mmar.py --n-shots 5 --temperature 0.7 --num-samples 8
+    # (n_shots>1 disables rubric grading; accuracy = any-shot string match)
     uv run modal run --detach run_audio_flamingo3_mmar.py --num-samples 200
 
 Download results locally:
@@ -190,6 +190,7 @@ def run_mmar(
     think: bool = True,
     score: bool = True,
     score_only: bool = False,
+    n_shots: int = 1,
     print_every: int = 10,
     run_id: str | None = None,
 ) -> dict:
@@ -214,6 +215,7 @@ def run_mmar(
         no_think=not think,
         score=score,
         score_only=score_only,
+        n_shots=n_shots,
         print_every=print_every,
         run_id=run_id,
     )
@@ -247,6 +249,7 @@ def main(
     think: bool = True,
     score: bool = True,
     score_only: bool = False,
+    n_shots: int = 1,
     print_every: int = 10,
     run_id: str | None = None,
 ):
@@ -275,7 +278,11 @@ def main(
         think: Load AF-Think adapter and append the think suffix (default True).
         score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
             (default True). Grades each batch while the next generates.
+            Forced off when n_shots > 1.
         score_only: Skip inference; only score existing predictions.
+        n_shots: Independent generation attempts per example (default 1).
+            When > 1, rubric grading is disabled and each shot is scored with
+            string match; example is correct if any shot succeeds.
         print_every: Progress print interval.
         run_id: Optional run folder name; default is a UTC timestamp.
     """
@@ -301,6 +308,7 @@ def main(
         think=think,
         score=score,
         score_only=score_only,
+        n_shots=n_shots,
         print_every=print_every,
         run_id=run_id,
     )

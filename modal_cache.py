@@ -48,6 +48,7 @@ def mmar_eval_image(*extra_python_sources: str) -> modal.Image:
             "soundfile",
             "openai>=1.82.0",
             "tqdm>=4.67.0",
+            "numpy",
         )
         .env({"HF_XET_HIGH_PERFORMANCE": "1"})
         .add_local_python_source(*sources)

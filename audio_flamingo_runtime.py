@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 
-from modal_cache import MODELS_ROOT, volume
+# AF3 / AF-Next text stack (Qwen2).
+DEFAULT_NUM_LAYERS = 28
+DEFAULT_NUM_HEADS = 28
+ATTENTION_BYTES_PER_ELEM = 2  # float16
+MAX_ATTENTION_ARTIFACT_BYTES = 2 * 1024**3  # 2 GiB
 
 
 def torch_dtype_value(torch_module, dtype_name):
@@ -15,6 +21,23 @@ def torch_dtype_value(torch_module, dtype_name):
         "bfloat16": torch_module.bfloat16,
         "float32": torch_module.float32,
     }[dtype_name]
+
+
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and Torch RNGs for reproducible greedy decode."""
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def generation_kwargs(args, *, extra: dict | None = None):
@@ -27,6 +50,210 @@ def generation_kwargs(args, *, extra: dict | None = None):
     if extra:
         kwargs.update(extra)
     return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def estimate_attention_bytes(
+    prompt_len: int,
+    gen_len: int,
+    *,
+    layers: int = DEFAULT_NUM_LAYERS,
+    heads: int = DEFAULT_NUM_HEADS,
+    bytes_per_elem: int = ATTENTION_BYTES_PER_ELEM,
+) -> int:
+    """Packed size for per-generated-token layer×head attention (ragged keys)."""
+    if prompt_len < 0 or gen_len < 0:
+        raise ValueError("prompt_len and gen_len must be non-negative")
+    # Σ_{t=1..T} (P + t) = T*P + T*(T+1)/2
+    key_positions = gen_len * prompt_len + gen_len * (gen_len + 1) // 2
+    return int(key_positions * layers * heads * bytes_per_elem)
+
+
+def attention_artifact_id(sample_id: str) -> str:
+    """Filesystem-safe id for attention artifact filenames."""
+    cleaned = re.sub(r"[^\w.\-]+", "_", sample_id.strip())
+    return cleaned or "sample"
+
+
+def compare_generated_token_ids(
+    generated_ids: list[int],
+    stored_raw_tokens: list[dict] | None,
+) -> dict:
+    """Compare newly generated ids to stored ``raw_tokens`` with role=generated."""
+    stored: list[int] = []
+    if stored_raw_tokens:
+        stored = [
+            int(tok["id"])
+            for tok in stored_raw_tokens
+            if tok.get("role") == "generated"
+        ]
+    match = generated_ids == stored
+    mismatch_index = None
+    if not match:
+        limit = min(len(generated_ids), len(stored))
+        mismatch_index = next(
+            (i for i in range(limit) if generated_ids[i] != stored[i]),
+            limit if len(generated_ids) != len(stored) else None,
+        )
+    return {
+        "token_match": match,
+        "mismatch_index": mismatch_index,
+        "generated_len": len(generated_ids),
+        "stored_generated_len": len(stored),
+    }
+
+
+def pack_decoder_attentions_for_generated(
+    attentions,
+    *,
+    prompt_len: int,
+    gen_len: int,
+    batch_index: int = 0,
+):
+    """Slice full-seq decoder attentions into per-generated-token (L, H, K) arrays.
+
+    ``attentions`` is the HF forward tuple: one ``(batch, heads, seq, seq)``
+    tensor per decoder layer.
+    """
+    import numpy as np
+
+    if not attentions:
+        raise ValueError("Model returned no attentions; use attn_implementation=eager")
+
+    packed = []
+    for step in range(gen_len):
+        query_pos = prompt_len + step
+        key_len = query_pos + 1
+        layers = []
+        for layer_attn in attentions:
+            # (H, key_len)
+            row = (
+                layer_attn[batch_index, :, query_pos, :key_len]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+                .astype(np.float16, copy=False)
+            )
+            layers.append(row)
+        packed.append(np.stack(layers, axis=0))
+    return packed
+
+
+def pack_generate_step_attentions(step_attentions, *, batch_index: int = 0):
+    """Pack one generate-step attention tuple into (L, H, key_len) float16."""
+    import numpy as np
+
+    layers = []
+    for layer_attn in step_attentions:
+        # Prefer the last query row (prefill step has q_len=prompt_len).
+        row = layer_attn[batch_index, :, -1, :].detach().float().cpu().numpy()
+        layers.append(row.astype(np.float16, copy=False))
+    return np.stack(layers, axis=0)
+
+
+def save_attention_artifact(
+    run_dir: Path | str,
+    sample_id: str,
+    attentions: list,
+    meta: dict,
+) -> dict:
+    """Write ``attentions/<id>.npz`` + ``attentions/<id>.json`` under ``run_dir``."""
+    import numpy as np
+
+    run_path = Path(run_dir)
+    attn_dir = run_path / "attentions"
+    attn_dir.mkdir(parents=True, exist_ok=True)
+    artifact_id = attention_artifact_id(sample_id)
+    npz_path = attn_dir / f"{artifact_id}.npz"
+    json_path = attn_dir / f"{artifact_id}.json"
+
+    arrays = {f"t{i}": np.asarray(arr) for i, arr in enumerate(attentions)}
+    if not arrays:
+        raise ValueError("No attention steps to save")
+    np.savez_compressed(npz_path, **arrays)
+
+    payload = {
+        **meta,
+        "sample_id": sample_id,
+        "artifact_id": artifact_id,
+        "npz_path": str(npz_path),
+        "num_steps": len(attentions),
+        "num_layers": int(attentions[0].shape[0]),
+        "num_heads": int(attentions[0].shape[1]),
+        "dtype": "float16",
+        "layout": "per_generated_token: (num_layers, num_heads, key_len)",
+    }
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return payload
+
+
+def load_attention_meta(run_dir: Path | str, sample_id: str) -> dict | None:
+    path = Path(run_dir) / "attentions" / f"{attention_artifact_id(sample_id)}.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_attention_vector(
+    run_dir: Path | str,
+    sample_id: str,
+    *,
+    gen_index: int,
+    layer: int,
+    head: int,
+) -> list[float]:
+    """Load one (generated-token, layer, head) attention vector as plain floats."""
+    import numpy as np
+
+    artifact_id = attention_artifact_id(sample_id)
+    npz_path = Path(run_dir) / "attentions" / f"{artifact_id}.npz"
+    if not npz_path.is_file():
+        raise FileNotFoundError(f"Attention artifact not found: {npz_path}")
+    with np.load(npz_path) as data:
+        key = f"t{gen_index}"
+        if key not in data:
+            raise KeyError(f"Missing attention step {gen_index} in {npz_path.name}")
+        arr = data[key]
+        if layer < 0 or layer >= arr.shape[0]:
+            raise IndexError(f"layer {layer} out of range for shape {arr.shape}")
+        if head < 0 or head >= arr.shape[1]:
+            raise IndexError(f"head {head} out of range for shape {arr.shape}")
+        return arr[layer, head].astype(np.float32).tolist()
+
+
+def load_attention_token_layer_matrix(
+    run_dir: Path | str,
+    sample_id: str,
+    *,
+    gen_index: int,
+    head: int,
+) -> dict:
+    """Load attention over keys × layers for one generated token and head.
+
+    Returns a matrix shaped ``(key_len, num_layers)`` so callers can render
+    tokens as rows and layers as columns.
+    """
+    import numpy as np
+
+    artifact_id = attention_artifact_id(sample_id)
+    npz_path = Path(run_dir) / "attentions" / f"{artifact_id}.npz"
+    if not npz_path.is_file():
+        raise FileNotFoundError(f"Attention artifact not found: {npz_path}")
+    with np.load(npz_path) as data:
+        key = f"t{gen_index}"
+        if key not in data:
+            raise KeyError(f"Missing attention step {gen_index} in {npz_path.name}")
+        arr = data[key]
+        if head < 0 or head >= arr.shape[1]:
+            raise IndexError(f"head {head} out of range for shape {arr.shape}")
+        # arr: (num_layers, num_heads, key_len) -> (key_len, num_layers)
+        matrix = arr[:, head, :].astype(np.float32).T
+        return {
+            "matrix": matrix.tolist(),
+            "key_len": int(matrix.shape[0]),
+            "num_layers": int(matrix.shape[1]),
+            "num_heads": int(arr.shape[1]),
+        }
 
 
 def model_input_device(model):
@@ -174,6 +401,8 @@ def resolve_model_dir(model_id: str, local_model_dir: str | None) -> str:
     """Prefer a seeded Volume snapshot; otherwise download into the models subpath."""
     from huggingface_hub import snapshot_download
 
+    from modal_cache import MODELS_ROOT, volume
+
     if local_model_dir:
         path = Path(local_model_dir).expanduser()
         if path.is_dir() and any(path.iterdir()):
@@ -242,19 +471,7 @@ def build_raw_tokens(tokenizer, token_ids, role: str) -> list[dict]:
     return tokens
 
 
-def generate_batch(
-    model,
-    processor,
-    samples,
-    args,
-    *,
-    build_prompt,
-    parse_output,
-    generation_extra: dict | None = None,
-):
-    """Run chat-template generation for a batch of MMAR samples."""
-    import torch
-
+def _build_conversations(samples, build_prompt):
     conversations = []
     for sample in samples:
         prompt_text = build_prompt(sample)
@@ -269,7 +486,23 @@ def generate_batch(
                 }
             ]
         )
+    return conversations
 
+
+def generate_batch(
+    model,
+    processor,
+    samples,
+    args,
+    *,
+    build_prompt,
+    parse_output,
+    generation_extra: dict | None = None,
+):
+    """Run chat-template generation for a batch of MMAR samples."""
+    import torch
+
+    conversations = _build_conversations(samples, build_prompt)
     inputs = prepare_model_inputs(
         processor.apply_chat_template(
             conversations,
@@ -321,3 +554,137 @@ def generate_batch(
             }
         )
     return results
+
+
+def generate_one_with_attentions(
+    model,
+    processor,
+    sample,
+    args,
+    *,
+    build_prompt,
+    parse_output,
+    generation_extra: dict | None = None,
+    stored_raw_tokens: list[dict] | None = None,
+    max_artifact_bytes: int = MAX_ATTENTION_ARTIFACT_BYTES,
+):
+    """Greedy-generate one sample, then capture layer-wise attentions via forward.
+
+    Requires ``attn_implementation=\"eager\"`` (or another backend that returns
+    attention weights). Uses a second teacher-forced forward over
+    prompt+generation so each generated token has a clean query row.
+    """
+    import torch
+
+    conversations = _build_conversations([sample], build_prompt)
+    inputs = prepare_model_inputs(
+        processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        ),
+        model,
+    )
+
+    prompt_len = int(inputs["input_ids"].shape[1])
+    stored_gen_len = None
+    if stored_raw_tokens:
+        stored_gen_len = sum(
+            1 for tok in stored_raw_tokens if tok.get("role") == "generated"
+        )
+    estimate_gen = stored_gen_len if stored_gen_len else int(args.max_new_tokens)
+    estimated_bytes = estimate_attention_bytes(prompt_len, estimate_gen)
+    if estimated_bytes > max_artifact_bytes:
+        raise RuntimeError(
+            f"Estimated attention artifact {estimated_bytes / 1e9:.2f} GB exceeds "
+            f"limit {max_artifact_bytes / 1e9:.2f} GB "
+            f"(prompt_len={prompt_len}, gen_len≈{estimate_gen})."
+        )
+
+    gen_kwargs = generation_kwargs(args, extra=generation_extra)
+    with torch.inference_mode():
+        outputs = model.generate(**inputs, **gen_kwargs)
+
+    generated = outputs[:, prompt_len:]
+    gen_ids = generated[0].tolist()
+    gen_len = len(gen_ids)
+    actual_bytes = estimate_attention_bytes(prompt_len, gen_len)
+    if actual_bytes > max_artifact_bytes:
+        raise RuntimeError(
+            f"Attention artifact {actual_bytes / 1e9:.2f} GB exceeds "
+            f"limit {max_artifact_bytes / 1e9:.2f} GB "
+            f"(prompt_len={prompt_len}, gen_len={gen_len})."
+        )
+
+    # Teacher-force prompt + generated tokens to get per-position attentions.
+    full_ids = torch.cat([inputs["input_ids"], generated], dim=1)
+    forward_inputs = dict(inputs)
+    forward_inputs["input_ids"] = full_ids
+    if "attention_mask" in forward_inputs and forward_inputs["attention_mask"] is not None:
+        ones = torch.ones_like(generated, dtype=forward_inputs["attention_mask"].dtype)
+        forward_inputs["attention_mask"] = torch.cat(
+            [forward_inputs["attention_mask"], ones], dim=1
+        )
+
+    with torch.inference_mode():
+        forward_out = model(
+            **forward_inputs,
+            output_attentions=True,
+            use_cache=False,
+            return_dict=True,
+        )
+
+    attentions = getattr(forward_out, "attentions", None)
+    if attentions is None:
+        attentions = getattr(forward_out, "decoder_attentions", None)
+    if attentions is None:
+        raise RuntimeError(
+            "Model forward returned no attentions. "
+            "Load with attn_implementation='eager'."
+        )
+
+    packed = pack_decoder_attentions_for_generated(
+        attentions,
+        prompt_len=prompt_len,
+        gen_len=gen_len,
+        batch_index=0,
+    )
+    # Free GPU attention tensors promptly.
+    del forward_out, attentions
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    tokenizer = processor_tokenizer(processor)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        mask = attention_mask[0].bool()
+        input_ids = inputs["input_ids"][0][mask].tolist()
+    else:
+        input_ids = inputs["input_ids"][0].tolist()
+
+    # Align packed keys to unpadded input length when left/right padding differs.
+    # For batch_size=1 MMAR capture, prompt_len from input_ids shape is correct.
+    raw_tokens = build_raw_tokens(tokenizer, input_ids, "input") + build_raw_tokens(
+        tokenizer, gen_ids, "generated"
+    )
+    clean_output = processor.batch_decode(generated, skip_special_tokens=True)[0]
+    thinking_prediction, answer_prediction = parse_output(
+        clean_output,
+        sample["choices"],
+    )
+    full_text_ids = input_ids + gen_ids
+    raw_text = tokenizer.decode(full_text_ids, skip_special_tokens=False)
+    match_info = compare_generated_token_ids(gen_ids, stored_raw_tokens)
+
+    return {
+        "model_output": raw_text,
+        "raw_tokens": raw_tokens,
+        "thinking_prediction": thinking_prediction,
+        "answer_prediction": answer_prediction,
+        "attentions": packed,
+        "prompt_len": prompt_len,
+        "generated_ids": gen_ids,
+        "estimated_bytes": actual_bytes,
+        **match_info,
+    }
