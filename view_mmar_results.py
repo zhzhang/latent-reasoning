@@ -40,9 +40,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from audio_flamingo_runtime import (
     attention_artifact_id,
+    audio_token_indices,
+    load_attention_audio_gen_layer_matrix,
     load_attention_meta,
-    load_attention_token_layer_matrix,
-    load_attention_vector,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -826,8 +826,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: end;
     margin-bottom: 0.75rem;
   }
-  .attn-controls label { min-width: 6rem; }
-  .attn-controls select { min-width: 6.5rem; }
+  .attn-controls label { min-width: 5rem; }
+  .attn-controls select { min-width: 5.5rem; }
   .attn-status { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.65rem; }
   .attn-heatmap-wrap {
     border: 1px solid var(--line); border-radius: 10px; padding: 0.75rem;
@@ -835,6 +835,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .attn-axis-label {
     font-size: 0.72rem; color: var(--muted); margin: 0 0 0.35rem;
+  }
+  .attn-legend {
+    display: flex; align-items: center; gap: 0.55rem;
+    margin: 0 0 0.55rem; font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem; color: var(--muted);
+  }
+  .attn-legend-bar {
+    flex: 0 0 10rem; height: 0.7rem; border-radius: 3px;
+    border: 1px solid var(--line);
+    background: linear-gradient(
+      90deg,
+      rgb(70, 60, 140) 0%,
+      rgb(50, 120, 115) 50%,
+      rgb(30, 180, 40) 100%
+    );
+  }
+  .attn-legend-labels {
+    display: flex; justify-content: space-between; gap: 0.75rem;
+    min-width: 10rem;
   }
   .attn-grid {
     display: grid;
@@ -862,7 +881,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     max-width: 14rem; border-radius: 2px;
   }
   .attn-canvas {
-    display: block; width: 100%;
+    display: block;
     image-rendering: pixelated;
   }
 </style>
@@ -1124,18 +1143,12 @@ function renderAttentionSection(example) {
   const status = meta
     ? `${meta.num_steps || "?"} gen steps · ${meta.num_layers || "?"} layers · ${meta.num_heads || "?"} heads · seed ${meta.seed ?? "?"} ${matchBadge}`
     : "No attention artifact yet. Capture re-runs this example on Modal with eager attention.";
-  const heads = meta?.num_heads || 28;
-  const steps = meta?.num_steps || 0;
   const layers = meta?.num_layers || 28;
-  const headOpts = Array.from({length: heads}, (_, i) =>
-    `<option value="${i}">${i}</option>`).join("");
-  const stepOpts = Array.from({length: Math.max(steps, 1)}, (_, i) =>
-    `<option value="${i}">${i}</option>`).join("");
   const layerAxis = Array.from({length: layers}, (_, i) =>
     `<span title="layer ${i}">${i}</span>`).join("");
   return `
     <div class="section" id="attention-section">
-      <h3>Attention<span class="section-hint">tokens × layers · selected head</span></h3>
+      <h3>Attention<span class="section-hint">generated tokens × layers · audio attention</span></h3>
       <div class="attn-status" id="attn-status">${status}</div>
       <div class="attn-controls">
         <button type="button" class="btn" id="capture-attn">
@@ -1145,18 +1158,28 @@ function renderAttentionSection(example) {
           Pull from volume
         </button>
         ${meta ? `
-        <label>Gen token
-          <select id="attn-step">${stepOpts}</select>
+        <label>Reduce
+          <select id="attn-reduce">
+            <option value="avg" selected>avg</option>
+            <option value="sum">sum</option>
+            <option value="max">max</option>
+          </select>
         </label>
-        <label>Head
-          <select id="attn-head">${headOpts}</select>
-        </label>
-        <button type="button" class="btn secondary" id="attn-refresh">Load heatmap</button>
         ` : ""}
       </div>
       ${meta ? `
         <div class="attn-heatmap-wrap">
-          <div class="attn-axis-label">Horizontal: layers 0…${layers - 1} · Vertical: key tokens</div>
+          <div class="attn-axis-label">Horizontal: layers 0…${layers - 1} · Vertical: generated tokens · cell = reduce over heads of post-softmax audio probability mass</div>
+          <div class="attn-legend" id="attn-legend">
+            <span>0</span>
+            <div class="attn-legend-bar" aria-hidden="true"></div>
+            <div class="attn-legend-labels">
+              <span id="attn-legend-min">0</span>
+              <span id="attn-legend-mid">0.5</span>
+              <span id="attn-legend-max">1</span>
+            </div>
+            <span>1</span>
+          </div>
           <div class="attn-grid">
             <div></div>
             <div class="attn-layer-labels" id="attn-layer-labels">${layerAxis}</div>
@@ -1168,73 +1191,105 @@ function renderAttentionSection(example) {
     </div>`;
 }
 
+function generatedTokensForAttention(example) {
+  const tokens = example.raw_tokens || [];
+  const generated = tokens.filter(t => t.role === "generated");
+  if (generated.length) return generated;
+  const ids = example.attention_meta?.generated_ids || [];
+  return ids.map((id, i) => ({ id, token: `[${i}]`, role: "generated", special: false }));
+}
+
+function attnColor(t) {
+  const u = Math.max(0, Math.min(1, t));
+  const r = Math.round(30 + 40 * (1 - u));
+  const g = Math.round(60 + 120 * u);
+  const b = Math.round(90 + 50 * (1 - u));
+  return `rgb(${r},${g},${b})`;
+}
+
+function paintAttentionLegend() {
+  const minEl = document.getElementById("attn-legend-min");
+  const midEl = document.getElementById("attn-legend-mid");
+  const maxEl = document.getElementById("attn-legend-max");
+  const bar = document.querySelector(".attn-legend-bar");
+  if (!minEl || !midEl || !maxEl) return;
+  minEl.textContent = "0";
+  midEl.textContent = "0.5";
+  maxEl.textContent = "1";
+  if (bar) {
+    bar.style.background = `linear-gradient(90deg, ${attnColor(0)}, ${attnColor(0.5)}, ${attnColor(1)})`;
+  }
+}
+
 function paintAttentionHeatmap(matrix, tokens) {
   const canvas = document.getElementById("attn-canvas");
   const tokenCol = document.getElementById("attn-tokens");
   if (!canvas || !matrix?.length) return;
-  const keyLen = matrix.length;
+  const numSteps = matrix.length;
   const numLayers = matrix[0]?.length || 0;
   if (!numLayers) return;
 
+  // Measure from the scroll wrap (stable), not the grid — sizing the canvas
+  // from the grid's clientWidth feeds back and grows on every repaint.
+  canvas.style.width = "0px";
+  canvas.style.height = "0px";
+  const wrap = canvas.closest(".attn-heatmap-wrap");
+  const tokenW = tokenCol?.offsetWidth || 112;
+  const availW = Math.max(
+    numLayers * 10,
+    (wrap?.clientWidth || 320) - tokenW - 36
+  );
   const rowH = 16;
-  const colW = Math.max(10, Math.floor(
-    Math.max((canvas.parentElement?.clientWidth || 320) - 4, numLayers * 10) / numLayers
-  ));
+  const colW = Math.max(10, Math.floor(availW / numLayers));
   canvas.width = numLayers * colW;
-  canvas.height = keyLen * rowH;
+  canvas.height = numSteps * rowH;
   canvas.style.width = `${canvas.width}px`;
   canvas.style.height = `${canvas.height}px`;
 
-  let max = 1e-8;
-  for (const row of matrix) {
-    for (const v of row) if (v > max) max = v;
-  }
+  // Fixed 0–1 scale: values are post-softmax audio probability mass (avg/max
+  // in [0,1]; sum can exceed 1 and saturates at the top of the legend).
+  paintAttentionLegend();
 
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  for (let ti = 0; ti < keyLen; ti++) {
+  for (let ti = 0; ti < numSteps; ti++) {
     const row = matrix[ti];
     for (let li = 0; li < numLayers; li++) {
-      const t = Math.max(0, Math.min(1, row[li] / max));
-      const r = Math.round(30 + 40 * (1 - t));
-      const g = Math.round(60 + 120 * t);
-      const b = Math.round(90 + 50 * (1 - t));
-      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillStyle = attnColor(row[li]);
       ctx.fillRect(li * colW, ti * rowH, colW, rowH);
     }
   }
 
   if (tokenCol) {
-    const slice = tokens.slice(0, keyLen);
-    // Pad if matrix is longer than labeled tokens (shouldn't happen often).
-    while (slice.length < keyLen) {
-      slice.push({ token: `[${slice.length}]`, role: "input", special: false });
+    const slice = tokens.slice(0, numSteps);
+    while (slice.length < numSteps) {
+      slice.push({ token: `[${slice.length}]`, role: "generated", special: false });
     }
     tokenCol.innerHTML = slice.map((t, i) => {
-      const role = t.role === "generated" ? "generated" : "input";
-      const cls = ["tok", role].concat(t.special ? ["special"] : []).join(" ");
+      const cls = ["tok", "generated"].concat(t.special ? ["special"] : []).join(" ");
       const label = String(t.token ?? "");
-      return `<span class="${cls}" title="${escapeHtml(label)} @${i}">${escapeHtml(label)}</span>`;
+      return `<span class="${cls}" title="${escapeHtml(label)} · gen ${i}">${escapeHtml(label)}</span>`;
     }).join("");
   }
 }
 
 async function loadAttentionHeatmap(example) {
-  const step = Number(document.getElementById("attn-step")?.value || 0);
-  const head = Number(document.getElementById("attn-head")?.value || 0);
+  const reduce = document.getElementById("attn-reduce")?.value || "avg";
   const run = encodeURIComponent(state.runId || "");
   const status = document.getElementById("attn-status");
   try {
     const data = await api(
-      `/api/attention-data?run=${run}&id=${encodeURIComponent(example.id)}&gen_index=${step}&head=${head}`
+      `/api/attention-data?run=${run}&id=${encodeURIComponent(example.id)}&reduce=${encodeURIComponent(reduce)}`
     );
-    paintAttentionHeatmap(data.matrix || [], example.raw_tokens || []);
+    paintAttentionHeatmap(data.matrix || [], generatedTokensForAttention(example));
     if (status && example.attention_meta) {
       const meta = example.attention_meta;
       const matchBadge = meta.token_match
         ? tag("token match", "good")
         : tag("token mismatch", "bad");
-      status.innerHTML = `gen ${step} · head ${head} · ${data.key_len} tokens × ${data.num_layers} layers · seed ${meta.seed ?? "?"} ${matchBadge}`;
+      status.innerHTML =
+        `${reduce} · ${data.num_steps} gen tokens × ${data.num_layers} layers · ` +
+        `${data.num_audio_keys} audio keys · ${data.num_heads} heads · seed ${meta.seed ?? "?"} ${matchBadge}`;
     }
   } catch (err) {
     if (status) status.textContent = String(err);
@@ -1424,12 +1479,9 @@ function renderExampleDetail(example, shotIndex) {
   if (syncBtn) {
     syncBtn.addEventListener("click", () => syncAttention(example));
   }
-  const refreshBtn = document.getElementById("attn-refresh");
-  if (refreshBtn) {
-    refreshBtn.addEventListener("click", () => loadAttentionHeatmap(view));
-    ["attn-step", "attn-head"].forEach(id => {
-      document.getElementById(id)?.addEventListener("change", () => loadAttentionHeatmap(view));
-    });
+  const reduceSelect = document.getElementById("attn-reduce");
+  if (reduceSelect) {
+    reduceSelect.addEventListener("change", () => loadAttentionHeatmap(view));
     loadAttentionHeatmap(view);
   }
 }
@@ -1592,34 +1644,21 @@ class Handler(BaseHTTPRequestHandler):
             if run_dir is None:
                 self._json({"error": "run not found"}, 404)
                 return
+            reduce = (qs.get("reduce") or ["avg"])[0] or "avg"
+            example = full_example(item_id, run_dir)
+            if example is None:
+                self._json({"error": "example not found"}, 404)
+                return
+            indices = audio_token_indices(example.get("raw_tokens"))
+            if not indices:
+                self._json({"error": "no <sound> audio tokens in raw_tokens"}, 400)
+                return
             try:
-                gen_index = int((qs.get("gen_index") or ["0"])[0])
-                head = int((qs.get("head") or ["0"])[0])
-                layer_raw = (qs.get("layer") or [None])[0]
-                if layer_raw is None:
-                    payload = load_attention_token_layer_matrix(
-                        run_dir,
-                        item_id,
-                        gen_index=gen_index,
-                        head=head,
-                    )
-                    self._json(
-                        {
-                            "id": item_id,
-                            "run": run_dir.name,
-                            "gen_index": gen_index,
-                            "head": head,
-                            **payload,
-                        }
-                    )
-                    return
-                layer = int(layer_raw)
-                values = load_attention_vector(
+                payload = load_attention_audio_gen_layer_matrix(
                     run_dir,
                     item_id,
-                    gen_index=gen_index,
-                    layer=layer,
-                    head=head,
+                    audio_indices=indices,
+                    reduce=reduce,
                 )
             except FileNotFoundError as exc:
                 self._json({"error": str(exc)}, 404)
@@ -1631,11 +1670,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "id": item_id,
                     "run": run_dir.name,
-                    "gen_index": gen_index,
-                    "layer": layer,
-                    "head": head,
-                    "values": values,
-                    "key_len": len(values),
+                    **payload,
                 }
             )
             return

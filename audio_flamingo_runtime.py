@@ -256,6 +256,92 @@ def load_attention_token_layer_matrix(
         }
 
 
+SOUND_TOKEN = "<sound>"
+ATTENTION_AUDIO_REDUCE_OPS = ("avg", "sum", "max")
+
+
+def audio_token_indices(raw_tokens: list[dict] | None) -> list[int]:
+    """Return key positions of ``<sound>`` audio tokens in the full sequence."""
+    if not raw_tokens:
+        return []
+    return [
+        i
+        for i, tok in enumerate(raw_tokens)
+        if str(tok.get("token") or "") == SOUND_TOKEN
+    ]
+
+
+def load_attention_audio_gen_layer_matrix(
+    run_dir: Path | str,
+    sample_id: str,
+    *,
+    audio_indices: list[int],
+    reduce: str = "avg",
+) -> dict:
+    """Load generated-token × layer matrix of audio attention probability mass.
+
+    Stored attentions are post-softmax weights (each head sums to ~1 over keys).
+    For each generated step and layer we first sum over audio key positions to
+    get per-head probability mass on audio in ``[0, 1]``, then reduce across
+    heads with ``avg``, ``sum``, or ``max``.
+
+    Returns a matrix shaped ``(num_steps, num_layers)``.
+    """
+    import numpy as np
+
+    op = (reduce or "avg").strip().lower()
+    if op not in ATTENTION_AUDIO_REDUCE_OPS:
+        raise ValueError(
+            f"reduce must be one of {ATTENTION_AUDIO_REDUCE_OPS}, got {reduce!r}"
+        )
+    if not audio_indices:
+        raise ValueError("No audio token indices provided")
+
+    artifact_id = attention_artifact_id(sample_id)
+    npz_path = Path(run_dir) / "attentions" / f"{artifact_id}.npz"
+    if not npz_path.is_file():
+        raise FileNotFoundError(f"Attention artifact not found: {npz_path}")
+
+    audio_idx = np.asarray(sorted(set(int(i) for i in audio_indices)), dtype=np.int64)
+    rows: list[list[float]] = []
+    num_layers = 0
+    num_heads = 0
+    with np.load(npz_path) as data:
+        step = 0
+        while f"t{step}" in data:
+            arr = data[f"t{step}"]  # (L, H, K)
+            num_layers = int(arr.shape[0])
+            num_heads = int(arr.shape[1])
+            key_len = int(arr.shape[2])
+            valid = audio_idx[audio_idx < key_len]
+            if valid.size == 0:
+                rows.append([0.0] * num_layers)
+                step += 1
+                continue
+            # Post-softmax probs → per-head mass on audio: (L, H)
+            mass = arr[:, :, valid].astype(np.float32, copy=False).sum(axis=-1)
+            if op == "avg":
+                values = mass.mean(axis=-1)
+            elif op == "sum":
+                values = mass.sum(axis=-1)
+            else:
+                values = mass.max(axis=-1)
+            rows.append(values.tolist())
+            step += 1
+
+    if not rows:
+        raise KeyError(f"No attention steps in {npz_path.name}")
+
+    return {
+        "matrix": rows,
+        "num_steps": len(rows),
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "num_audio_keys": int(audio_idx.size),
+        "reduce": op,
+    }
+
+
 def model_input_device(model):
     device = getattr(model, "device", None)
     if device is not None:
