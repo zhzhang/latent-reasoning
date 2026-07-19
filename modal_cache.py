@@ -32,6 +32,7 @@ def mmar_eval_image(*extra_python_sources: str) -> modal.Image:
         "modal_cache",
         "mmar_common",
         "audio_flamingo_runtime",
+        "audio_flamingo_next",
         *extra_python_sources,
     )
     return (
@@ -46,6 +47,7 @@ def mmar_eval_image(*extra_python_sources: str) -> modal.Image:
             "huggingface-hub>=0.30.0",
             "librosa>=0.11.0",
             "soundfile",
+            "safetensors>=0.8.0",
             "openai>=1.82.0",
             "tqdm>=4.67.0",
             "numpy",
