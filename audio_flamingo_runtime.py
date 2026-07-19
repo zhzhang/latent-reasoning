@@ -278,12 +278,14 @@ def load_attention_audio_gen_layer_matrix(
     audio_indices: list[int],
     reduce: str = "avg",
 ) -> dict:
-    """Load generated-token × layer matrix of audio attention probability mass.
+    """Load generated-token × layer matrix of audio attention.
 
     Stored attentions are post-softmax weights (each head sums to ~1 over keys).
-    For each generated step and layer we first sum over audio key positions to
-    get per-head probability mass on audio in ``[0, 1]``, then reduce across
-    heads with ``avg``, ``sum``, or ``max``.
+    For each generated step and layer, reduce over audio key positions and heads:
+
+    - ``avg``: mean over audio tokens, then mean over heads
+    - ``sum``: sum over audio tokens, then sum over heads / num_heads
+    - ``max``: max over audio tokens, then max over heads
 
     Returns a matrix shaped ``(num_steps, num_layers)``.
     """
@@ -318,14 +320,15 @@ def load_attention_audio_gen_layer_matrix(
                 rows.append([0.0] * num_layers)
                 step += 1
                 continue
-            # Post-softmax probs → per-head mass on audio: (L, H)
-            mass = arr[:, :, valid].astype(np.float32, copy=False).sum(axis=-1)
+            # (L, H, A) post-softmax weights on audio keys
+            audio = arr[:, :, valid].astype(np.float32, copy=False)
             if op == "avg":
-                values = mass.mean(axis=-1)
+                values = audio.mean(axis=-1).mean(axis=-1)
             elif op == "sum":
-                values = mass.sum(axis=-1)
+                # sum over audio keys and heads, normalized by head count
+                values = audio.sum(axis=-1).sum(axis=-1) / float(num_heads)
             else:
-                values = mass.max(axis=-1)
+                values = audio.max(axis=-1).max(axis=-1)
             rows.append(values.tolist())
             step += 1
 

@@ -837,12 +837,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 0.72rem; color: var(--muted); margin: 0 0 0.35rem;
   }
   .attn-legend {
-    display: flex; align-items: center; gap: 0.55rem;
+    display: flex; align-items: flex-start; gap: 0.55rem;
     margin: 0 0 0.55rem; font-family: "IBM Plex Mono", monospace;
     font-size: 0.72rem; color: var(--muted);
   }
+  .attn-legend-scale {
+    display: flex; flex-direction: column; gap: 0.2rem;
+    width: 10rem; flex: 0 0 10rem;
+  }
   .attn-legend-bar {
-    flex: 0 0 10rem; height: 0.7rem; border-radius: 3px;
+    width: 100%; height: 0.7rem; border-radius: 3px;
     border: 1px solid var(--line);
     background: linear-gradient(
       90deg,
@@ -852,8 +856,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     );
   }
   .attn-legend-labels {
-    display: flex; justify-content: space-between; gap: 0.75rem;
-    min-width: 10rem;
+    display: flex; justify-content: space-between; width: 100%;
   }
   .attn-grid {
     display: grid;
@@ -883,7 +886,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .attn-canvas {
     display: block;
     image-rendering: pixelated;
+    cursor: crosshair;
   }
+  .attn-tooltip {
+    position: fixed; z-index: 40; pointer-events: none;
+    display: none; padding: 0.35rem 0.5rem; border-radius: 6px;
+    background: rgba(18, 18, 22, 0.92); color: #f2f2f4;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    font-family: "IBM Plex Mono", monospace; font-size: 0.72rem;
+    line-height: 1.35; white-space: nowrap; box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+  }
+  .attn-tooltip.visible { display: block; }
 </style>
 </head>
 <body>
@@ -1169,16 +1182,16 @@ function renderAttentionSection(example) {
       </div>
       ${meta ? `
         <div class="attn-heatmap-wrap">
-          <div class="attn-axis-label">Horizontal: layers 0…${layers - 1} · Vertical: generated tokens · cell = reduce over heads of post-softmax audio probability mass</div>
+          <div class="attn-axis-label">Horizontal: layers 0…${layers - 1} · Vertical: generated tokens · cell = avg/sum/max over audio tokens and heads (sum ÷ heads)</div>
           <div class="attn-legend" id="attn-legend">
-            <span>0</span>
-            <div class="attn-legend-bar" aria-hidden="true"></div>
-            <div class="attn-legend-labels">
-              <span id="attn-legend-min">0</span>
-              <span id="attn-legend-mid">0.5</span>
-              <span id="attn-legend-max">1</span>
+            <div class="attn-legend-scale">
+              <div class="attn-legend-bar" aria-hidden="true"></div>
+              <div class="attn-legend-labels">
+                <span id="attn-legend-min">0</span>
+                <span id="attn-legend-mid">0.5</span>
+                <span id="attn-legend-max">1</span>
+              </div>
             </div>
-            <span>1</span>
           </div>
           <div class="attn-grid">
             <div></div>
@@ -1187,6 +1200,7 @@ function renderAttentionSection(example) {
             <canvas class="attn-canvas" id="attn-canvas"></canvas>
           </div>
         </div>
+        <div class="attn-tooltip" id="attn-tooltip" role="tooltip"></div>
       ` : ""}
     </div>`;
 }
@@ -1221,6 +1235,55 @@ function paintAttentionLegend() {
   }
 }
 
+function formatAttnValue(v) {
+  if (!Number.isFinite(v)) return "—";
+  return Number(v).toFixed(4);
+}
+
+function hideAttnTooltip() {
+  const tip = document.getElementById("attn-tooltip");
+  if (tip) tip.classList.remove("visible");
+}
+
+function bindAttentionHover(canvas, hit) {
+  canvas._attnHit = hit;
+  if (canvas._attnHoverBound) return;
+  canvas._attnHoverBound = true;
+
+  canvas.addEventListener("mousemove", (ev) => {
+    const h = canvas._attnHit;
+    const tip = document.getElementById("attn-tooltip");
+    if (!h || !tip) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    const y = ev.clientY - rect.top;
+    const li = Math.floor(x / h.colW);
+    const ti = Math.floor(y / h.rowH);
+    if (li < 0 || ti < 0 || li >= h.numLayers || ti >= h.numSteps) {
+      tip.classList.remove("visible");
+      return;
+    }
+    const value = h.matrix[ti]?.[li];
+    const tok = h.tokens[ti];
+    const label = tok?.token != null ? String(tok.token) : `[${ti}]`;
+    tip.innerHTML =
+      `<strong>${formatAttnValue(value)}</strong>` +
+      `<br>layer ${li} · gen ${ti} · ${escapeHtml(label)}`;
+    const pad = 12;
+    let left = ev.clientX + pad;
+    let top = ev.clientY + pad;
+    tip.classList.add("visible");
+    const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
+    if (left + tw > window.innerWidth - 8) left = ev.clientX - tw - pad;
+    if (top + th > window.innerHeight - 8) top = ev.clientY - th - pad;
+    tip.style.left = `${Math.max(8, left)}px`;
+    tip.style.top = `${Math.max(8, top)}px`;
+  });
+
+  canvas.addEventListener("mouseleave", hideAttnTooltip);
+}
+
 function paintAttentionHeatmap(matrix, tokens) {
   const canvas = document.getElementById("attn-canvas");
   const tokenCol = document.getElementById("attn-tokens");
@@ -1246,8 +1309,8 @@ function paintAttentionHeatmap(matrix, tokens) {
   canvas.style.width = `${canvas.width}px`;
   canvas.style.height = `${canvas.height}px`;
 
-  // Fixed 0–1 scale: values are post-softmax audio probability mass (avg/max
-  // in [0,1]; sum can exceed 1 and saturates at the top of the legend).
+  // Fixed 0–1 scale: avg/max are means/maxima over audio×heads; sum is
+  // total audio mass averaged over heads (also in [0,1]).
   paintAttentionLegend();
 
   const ctx = canvas.getContext("2d");
@@ -1260,17 +1323,22 @@ function paintAttentionHeatmap(matrix, tokens) {
     }
   }
 
+  const slice = tokens.slice(0, numSteps);
+  while (slice.length < numSteps) {
+    slice.push({ token: `[${slice.length}]`, role: "generated", special: false });
+  }
   if (tokenCol) {
-    const slice = tokens.slice(0, numSteps);
-    while (slice.length < numSteps) {
-      slice.push({ token: `[${slice.length}]`, role: "generated", special: false });
-    }
     tokenCol.innerHTML = slice.map((t, i) => {
       const cls = ["tok", "generated"].concat(t.special ? ["special"] : []).join(" ");
       const label = String(t.token ?? "");
       return `<span class="${cls}" title="${escapeHtml(label)} · gen ${i}">${escapeHtml(label)}</span>`;
     }).join("");
   }
+
+  bindAttentionHover(canvas, {
+    matrix, tokens: slice, colW, rowH, numLayers, numSteps,
+  });
+  hideAttnTooltip();
 }
 
 async function loadAttentionHeatmap(example) {
