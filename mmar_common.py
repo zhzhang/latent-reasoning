@@ -845,6 +845,9 @@ def run_mmar_evaluation(
             "(scoring each shot with string match instead)."
         )
         args.score = False
+    if getattr(args, "latent_cot", False) and args.score:
+        print("latent_cot=True: disabling OpenAI MMAR-Rubrics grading.")
+        args.score = False
 
     data_root_path = Path(args.data_root).expanduser().resolve()
     meta_path = Path(args.meta).expanduser().resolve()

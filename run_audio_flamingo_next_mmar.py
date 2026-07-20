@@ -29,6 +29,7 @@ Usage:
     uv run modal run run_audio_flamingo_next_mmar.py
     uv run modal run run_audio_flamingo_next_mmar.py --num-samples 8
     uv run modal run run_audio_flamingo_next_mmar.py --no-score --num-samples 4
+    uv run modal run run_audio_flamingo_next_mmar.py --latent-cot --num-samples 8
     uv run modal run run_audio_flamingo_next_mmar.py --n-shots 5 --temperature 0.7 --num-samples 8
     uv run modal run --detach run_audio_flamingo_next_mmar.py --num-samples 200
 
@@ -57,6 +58,7 @@ from audio_flamingo_runtime import (
     generate_batch,
     model_input_device,
     model_param_dtype,
+    processor_tokenizer,
     resolve_model_dir,
     torch_dtype_value,
 )
@@ -137,6 +139,20 @@ def load_audio_flamingo_next(args):
 
 
 def generate_af_next_batch(model, processor, samples, args):
+    generation_extra = {"repetition_penalty": args.repetition_penalty}
+    if getattr(args, "latent_cot", False):
+        tokenizer = processor_tokenizer(processor)
+        generation_extra.update(
+            {
+                "latent_cot": True,
+                "think_start_ids": tokenizer.encode(
+                    "<think>", add_special_tokens=False
+                ),
+                "think_end_ids": tokenizer.encode(
+                    "</think>", add_special_tokens=False
+                ),
+            }
+        )
     return generate_batch(
         model,
         processor,
@@ -146,7 +162,7 @@ def generate_af_next_batch(model, processor, samples, args):
             sample, think_suffix=AF_NEXT_THINK_SUFFIX
         ),
         parse_output=parse_think_tagged_output,
-        generation_extra={"repetition_penalty": args.repetition_penalty},
+        generation_extra=generation_extra,
     )
 
 
@@ -183,6 +199,7 @@ def run_mmar(
     n_shots: int = 1,
     print_every: int = 10,
     run_id: str | None = None,
+    latent_cot: bool = False,
 ) -> dict:
     """Run AF-Next-Think inference with pipelined MMAR-Rubrics grading on Modal."""
     args = SimpleNamespace(
@@ -208,6 +225,7 @@ def run_mmar(
         n_shots=n_shots,
         print_every=print_every,
         run_id=run_id,
+        latent_cot=latent_cot,
     )
     return run_mmar_evaluation(
         args=args,
@@ -216,6 +234,7 @@ def run_mmar(
         model_label="af-next-think",
         manifest_extra={
             "repetition_penalty": repetition_penalty,
+            "latent_cot": latent_cot,
             "model_implementation": "audio_flamingo_next.AudioFlamingoNextForConditionalGeneration",
         },
     )
@@ -245,6 +264,7 @@ def main(
     n_shots: int = 1,
     print_every: int = 10,
     run_id: str | None = None,
+    latent_cot: bool = False,
 ):
     """Launch AF-Next-Think MMAR eval on Modal.
 
@@ -272,13 +292,17 @@ def main(
         seed: RNG seed.
         score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
             (default True). Grades each batch while the next generates.
-            Forced off when n_shots > 1.
+            Forced off when n_shots > 1 or latent_cot is on.
         score_only: Skip inference; only score existing predictions.
         n_shots: Independent generation attempts per example (default 1).
             When > 1, rubric grading is disabled and each shot is scored with
             string match; example is correct if any shot succeeds.
         print_every: Progress print interval.
         run_id: Optional run folder name; default is a UTC timestamp.
+        latent_cot: After ``<think>``, feed remapped residuals as
+            the next inputs instead of sampling tokens until
+            ``</think>`` is the argmax next token. Forces rubric
+            grading off.
     """
     # Use .spawn().get() (not .remote()) so `modal run --detach` keeps the job
     # alive after the local client disconnects.
@@ -305,6 +329,7 @@ def main(
         n_shots=n_shots,
         print_every=print_every,
         run_id=run_id,
+        latent_cot=latent_cot,
     )
     print(f"Spawned run_mmar call_id={call.object_id}")
     result = call.get()

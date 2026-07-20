@@ -784,6 +784,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #f3ebe0; border-color: #d8c4a4; color: #6a4a1a;
     font-weight: 500;
   }
+  .tok.latent {
+    background: #ebe6f5; border-color: #c4b8e0; color: #4a3868;
+    font-style: italic;
+  }
   .tok.special.input { background: #efe6d8; }
   .tok.special.generated { background: #e9efd9; }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
@@ -1081,18 +1085,28 @@ function renderRawText(example) {
   if (Array.isArray(tokens) && tokens.length) {
     const nIn = tokens.filter(t => t.role === "input").length;
     const nGen = tokens.filter(t => t.role === "generated").length;
-    const nSp = tokens.filter(t => t.special).length;
+    const nSp = tokens.filter(t => t.special && !t.latent).length;
+    const nLatent = tokens.filter(t => t.latent).length;
     const chips = tokens.map(t => {
       const role = t.role === "generated" ? "generated" : "input";
-      const cls = ["tok", role].concat(t.special ? ["special"] : []).join(" ");
-      const title = `id=${t.id} · ${role}${t.special ? " · special" : ""}`;
+      const cls = ["tok", role]
+        .concat(t.latent ? ["latent"] : [])
+        .concat(t.special && !t.latent ? ["special"] : [])
+        .join(" ");
+      const title = t.latent
+        ? `latent · ${role}`
+        : `id=${t.id} · ${role}${t.special ? " · special" : ""}`;
       return `<span class="${cls}" title="${escapeHtml(title)}">${escapeHtml(String(t.token ?? ""))}</span>`;
     }).join("");
+    const latentLegend = nLatent
+      ? `<span class="swatch"><span class="tok latent generated">&lt;latent/&gt;</span> latent (${nLatent})</span>`
+      : "";
     return `
       <div class="token-legend">
         <span class="swatch"><span class="tok input">in</span> input (${nIn})</span>
         <span class="swatch"><span class="tok generated">gen</span> generated (${nGen})</span>
         <span class="swatch"><span class="tok special">sp</span> special (${nSp})</span>
+        ${latentLegend}
         <span>${tokens.length} tokens</span>
       </div>
       <div class="token-viewer">${chips}</div>`;

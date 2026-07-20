@@ -560,6 +560,51 @@ def build_raw_tokens(tokenizer, token_ids, role: str) -> list[dict]:
     return tokens
 
 
+def build_generated_raw_tokens(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    is_latent: list[bool] | None = None,
+) -> list[dict]:
+    """Build generated-role raw tokens, marking latent-CoT steps as ``<latent/>``."""
+    special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+    tokens = []
+    for index, token_id in enumerate(token_ids):
+        if is_latent and index < len(is_latent) and is_latent[index]:
+            tokens.append(
+                {
+                    "id": None,
+                    "token": "<latent/>",
+                    "role": "generated",
+                    "special": True,
+                    "latent": True,
+                }
+            )
+            continue
+        tid = int(token_id)
+        tokens.append(
+            {
+                "id": tid,
+                "token": format_raw_token(tokenizer, tid),
+                "role": "generated",
+                "special": tid in special_ids,
+            }
+        )
+    return tokens
+
+
+def _unpack_generate_output(outputs, prompt_len: int):
+    """Normalize ``model.generate`` return value to sequences + optional latent mask."""
+    is_latent = None
+    if hasattr(outputs, "sequences"):
+        sequences = outputs.sequences
+        if hasattr(outputs, "is_latent") and outputs.is_latent is not None:
+            is_latent = outputs.is_latent[:, prompt_len:]
+    else:
+        sequences = outputs
+    return sequences, is_latent
+
+
 def _build_conversations(samples, build_prompt):
     conversations = []
     for sample in samples:
@@ -603,31 +648,39 @@ def generate_batch(
     )
 
     with torch.inference_mode():
-        outputs = model.generate(
+        gen_out = model.generate(
             **inputs, **generation_kwargs(args, extra=generation_extra)
         )
 
     prompt_len = inputs["input_ids"].shape[1]
-    generated_ids = outputs[:, prompt_len:]
-    decoded_clean = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=True,
-    )
+    sequences, gen_is_latent = _unpack_generate_output(gen_out, prompt_len)
+    generated_ids = sequences[:, prompt_len:]
 
     tokenizer = processor_tokenizer(processor)
     attention_mask = inputs.get("attention_mask")
     results = []
-    for index, (sample, clean_output) in enumerate(zip(samples, decoded_clean)):
+    for index, sample in enumerate(samples):
         if attention_mask is not None:
             mask = attention_mask[index].bool()
             input_ids = inputs["input_ids"][index][mask].tolist()
         else:
             input_ids = inputs["input_ids"][index].tolist()
         gen_ids = generated_ids[index].tolist()
-        raw_tokens = build_raw_tokens(tokenizer, input_ids, "input") + build_raw_tokens(
-            tokenizer, gen_ids, "generated"
+        latent_flags = None
+        if gen_is_latent is not None:
+            latent_flags = gen_is_latent[index].tolist()
+        decode_ids = [
+            token_id
+            for token_id, latent in zip(gen_ids, latent_flags or [False] * len(gen_ids))
+            if not latent
+        ]
+        clean_output = processor.decode(decode_ids, skip_special_tokens=True)
+        raw_tokens = build_raw_tokens(tokenizer, input_ids, "input") + build_generated_raw_tokens(
+            tokenizer,
+            gen_ids,
+            is_latent=latent_flags,
         )
-        full_ids = input_ids + gen_ids
+        full_ids = input_ids + decode_ids
         raw_text = tokenizer.decode(full_ids, skip_special_tokens=False)
 
         thinking_prediction, answer_prediction = parse_output(

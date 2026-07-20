@@ -968,6 +968,22 @@ def _sample_next_token(
     return torch.multinomial(probs, num_samples=1)
 
 
+def _compute_w_remap(model: "AudioFlamingoNextForConditionalGeneration") -> torch.Tensor:
+    """Precompute ``pinv(W_out) @ W_emb`` for latent-CoT residual remapping."""
+    w_out = model.lm_head.weight.float()
+    w_emb = model.get_input_embeddings().weight.float()
+    return torch.linalg.pinv(w_out) @ w_emb
+
+
+def _suffix_matches(generated: torch.LongTensor, suffix_ids: list[int]) -> torch.Tensor:
+    """Return a (batch,) bool mask: True when each row ends with ``suffix_ids``."""
+    if not suffix_ids:
+        return torch.zeros(generated.shape[0], dtype=torch.bool, device=generated.device)
+    suffix = torch.tensor(suffix_ids, device=generated.device, dtype=generated.dtype)
+    tail = generated[:, -len(suffix_ids) :]
+    return (tail == suffix.unsqueeze(0)).all(dim=1)
+
+
 class AudioFlamingoNextForConditionalGeneration(nn.Module):
     """Local AF-Next / MusicFlamingo causal LM with audio conditioning."""
 
@@ -1048,8 +1064,11 @@ class AudioFlamingoNextForConditionalGeneration(nn.Module):
         repetition_penalty: float | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
+        latent_cot: bool = False,
+        think_start_ids: list[int] | None = None,
+        think_end_ids: list[int] | None = None,
         **kwargs,
-    ) -> torch.LongTensor:
+    ):
         """Autoregressive decode with KV-cache; audio features used on prefill only."""
         _ = kwargs  # tolerate HF generate extras
         if eos_token_id is None:
@@ -1060,6 +1079,23 @@ class AudioFlamingoNextForConditionalGeneration(nn.Module):
             eos_ids = [eos_token_id]
         else:
             eos_ids = list(eos_token_id or [])
+
+        if latent_cot:
+            if not think_start_ids or not think_end_ids:
+                raise ValueError(
+                    "latent_cot=True requires non-empty think_start_ids and think_end_ids"
+                )
+            think_start_ids = [int(t) for t in think_start_ids]
+            think_end_ids = [int(t) for t in think_end_ids]
+            think_end_first = think_end_ids[0]
+            w_remap = _compute_w_remap(self)
+            embed_layer = self.get_input_embeddings()
+        else:
+            think_start_ids = []
+            think_end_ids = []
+            think_end_first = None
+            w_remap = None
+            embed_layer = None
 
         batch_size = input_ids.shape[0]
         if attention_mask is None:
@@ -1077,26 +1113,76 @@ class AudioFlamingoNextForConditionalGeneration(nn.Module):
         past = outputs.past_key_values
         generated = input_ids
         finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        in_latent = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        is_latent = torch.zeros(
+            batch_size,
+            input_ids.shape[1],
+            dtype=torch.bool,
+            device=input_ids.device,
+        )
 
         for _ in range(max_new_tokens):
             step_logits = outputs.logits[:, -1, :].float()
-            step_logits = _apply_repetition_penalty(
-                step_logits, generated, repetition_penalty if repetition_penalty is not None else 1.0
-            )
-            next_token = _sample_next_token(
-                step_logits,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-            )
+            argmax_ids = step_logits.argmax(dim=-1)
+
+            if latent_cot:
+                latent_exit = in_latent & (argmax_ids == think_end_first)
+                latent_continue = in_latent & ~latent_exit
+
+                penalized = _apply_repetition_penalty(
+                    step_logits,
+                    generated,
+                    repetition_penalty if repetition_penalty is not None else 1.0,
+                )
+                sampled = _sample_next_token(
+                    penalized,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                next_token = sampled
+                if latent_continue.any():
+                    next_token = torch.where(
+                        latent_continue.unsqueeze(1),
+                        torch.full_like(next_token, pad_token_id),
+                        next_token,
+                    )
+                if latent_exit.any():
+                    next_token = torch.where(
+                        latent_exit.unsqueeze(1),
+                        torch.full_like(next_token, think_end_first),
+                        next_token,
+                    )
+                in_latent = in_latent & ~latent_exit
+            else:
+                latent_continue = None
+                step_logits = _apply_repetition_penalty(
+                    step_logits,
+                    generated,
+                    repetition_penalty if repetition_penalty is not None else 1.0,
+                )
+                next_token = _sample_next_token(
+                    step_logits,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+
             if eos_ids:
                 next_token = torch.where(
                     finished.unsqueeze(1),
-                    torch.full_like(next_token, pad_token_id if pad_token_id is not None else eos_ids[0]),
+                    torch.full_like(
+                        next_token,
+                        pad_token_id if pad_token_id is not None else eos_ids[0],
+                    ),
                     next_token,
                 )
                 for eid in eos_ids:
                     finished = finished | (next_token.squeeze(1) == eid)
+
+            if latent_cot:
+                step_is_latent = latent_continue.unsqueeze(1)
+                is_latent = torch.cat([is_latent, step_is_latent], dim=1)
 
             generated = torch.cat([generated, next_token], dim=1)
             attention_mask = torch.cat(
@@ -1110,18 +1196,43 @@ class AudioFlamingoNextForConditionalGeneration(nn.Module):
                 ],
                 dim=1,
             )
+
+            if latent_cot:
+                enter_latent = (
+                    _suffix_matches(generated, think_start_ids) & ~in_latent & ~finished
+                )
+                in_latent = in_latent | enter_latent
+
             if bool(finished.all()):
                 break
 
-            outputs = self.forward(
-                input_ids=next_token,
-                attention_mask=attention_mask,
-                past_key_values=past,
-                use_cache=True,
-                return_dict=True,
-            )
+            if latent_cot and latent_continue is not None and latent_continue.any():
+                h = outputs.last_hidden_state[:, -1, :]
+                remapped = (h.float() @ w_remap).to(dtype=h.dtype)
+                token_embeds = embed_layer(next_token.squeeze(1))
+                use_remapped = latent_continue & ~finished
+                next_embed = torch.where(use_remapped.unsqueeze(1), remapped, token_embeds)
+                outputs = self.forward(
+                    inputs_embeds=next_embed.unsqueeze(1),
+                    attention_mask=attention_mask,
+                    past_key_values=past,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            else:
+                outputs = self.forward(
+                    input_ids=next_token,
+                    attention_mask=attention_mask,
+                    past_key_values=past,
+                    use_cache=True,
+                    return_dict=True,
+                )
             past = outputs.past_key_values
 
+        if latent_cot:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(sequences=generated, is_latent=is_latent)
         return generated
 
     @classmethod
