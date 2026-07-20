@@ -219,15 +219,23 @@ def free_model(model) -> None:
         torch.mps.empty_cache()
 
 
+def _as_mapping(out):
+    if isinstance(out, dict):
+        return out
+    return vars(out)
+
+
 @torch.no_grad()
 def run_local(model, inputs: dict) -> dict[str, torch.Tensor | tuple]:
-    out = model(
-        input_ids=inputs["input_ids"],
-        input_features=inputs.get("input_features"),
-        input_features_mask=inputs.get("input_features_mask"),
-        attention_mask=inputs.get("attention_mask"),
-        output_attentions=True,
-        output_hidden_states=True,
+    out = _as_mapping(
+        model(
+            input_ids=inputs["input_ids"],
+            input_features=inputs.get("input_features"),
+            input_features_mask=inputs.get("input_features_mask"),
+            attention_mask=inputs.get("attention_mask"),
+            output_attentions=True,
+            output_hidden_states=True,
+        )
     )
     return {
         "logits": out["logits"].detach().cpu(),

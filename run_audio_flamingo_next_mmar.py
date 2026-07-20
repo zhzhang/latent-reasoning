@@ -1,5 +1,9 @@
 """Run Audio Flamingo Next Think on MMAR with MMAR-Rubrics grading on Modal.
 
+Loads the local ``AudioFlamingoNextForConditionalGeneration`` nn.Module (not
+HuggingFace ``MusicFlamingoForConditionalGeneration``) with hub/Volume weights.
+The processor still comes from Transformers.
+
 Uses the shared ``latent-reasoning`` Volume from ``seed_volume.py`` for data
 and weights, and writes eval outputs to ``latent-reasoning-results``:
 
@@ -47,9 +51,9 @@ from types import SimpleNamespace
 
 import modal
 
+from audio_flamingo_next import AudioFlamingoNextForConditionalGeneration
 from audio_flamingo_runtime import (
     audio_tower_dtype,
-    cast_model_floating_tensors,
     generate_batch,
     model_input_device,
     model_param_dtype,
@@ -82,38 +86,49 @@ image = mmar_eval_image()
 app = modal.App("audio-flamingo-next-mmar", image=image)
 
 
+def _resolve_device(device_map: str | None):
+    import torch
+
+    if device_map in (None, "auto", "cuda", "cuda:0"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if device_map == "cpu":
+        return torch.device("cpu")
+    if device_map == "mps":
+        return torch.device("mps")
+    # e.g. "cuda:1"
+    return torch.device(device_map)
+
+
 def load_audio_flamingo_next(args):
     import torch
-    from transformers import AutoModelForSeq2SeqLM, AutoProcessor
+    from transformers import AutoProcessor
 
     target_dtype = torch_dtype_value(torch, args.torch_dtype)
-    # AF-Next Hub weights are MusicFlamingoForConditionalGeneration
-    # (model_type musicflamingo). AutoModel loads the base MusicFlamingoModel,
-    # which has no generate(); use the seq2seq auto class instead.
-    # See: https://huggingface.co/nvidia/audio-flamingo-next-think-hf
-    kwargs = {
-        "device_map": args.device_map,
-        "dtype": target_dtype,
-    }
-    if args.attn_implementation:
-        kwargs["attn_implementation"] = args.attn_implementation
+    if target_dtype == "auto":
+        target_dtype = torch.bfloat16
 
     local_id = resolve_model_dir(args.model_id, args.local_model_dir)
-    processor = AutoProcessor.from_pretrained(local_id)
-    model = AutoModelForSeq2SeqLM.from_pretrained(local_id, **kwargs)
+    device = _resolve_device(getattr(args, "device_map", "auto"))
+    if getattr(args, "attn_implementation", None):
+        print(
+            f"Note: local AudioFlamingoNext ignores attn_implementation="
+            f"{args.attn_implementation!r} (eager only)."
+        )
 
-    # Some AF-Next tensors initialized by the MusicFlamingo wrapper are not
-    # loaded from the checkpoint and can remain float32 even when ``dtype`` is
-    # bfloat16. The processor follows the model card and supplies audio
-    # features in the model dtype, so mixed float32/bfloat16 modules fail in
-    # the audio path. Normalize parameters and buffers after loading.
-    uniform_dtype = (
-        model_param_dtype(model) if target_dtype == "auto" else target_dtype
+    processor = AutoProcessor.from_pretrained(local_id)
+    model = AudioFlamingoNextForConditionalGeneration.from_pretrained(
+        local_id,
+        dtype=target_dtype,
+        device=device,
+        strict=True,
     )
-    cast_model_floating_tensors(model, uniform_dtype)
     model.eval()
     print(
-        f"Model ready: class={type(model).__name__}, "
+        f"Model ready: class={type(model).__name__} (local nn.Module), "
         f"param_dtype={model_param_dtype(model)}, "
         f"audio_tower_dtype={audio_tower_dtype(model)}, "
         f"device={model_input_device(model)}"
@@ -199,7 +214,10 @@ def run_mmar(
         load_model=load_audio_flamingo_next,
         generate_batch_fn=generate_af_next_batch,
         model_label="af-next-think",
-        manifest_extra={"repetition_penalty": repetition_penalty},
+        manifest_extra={
+            "repetition_penalty": repetition_penalty,
+            "model_implementation": "audio_flamingo_next.AudioFlamingoNextForConditionalGeneration",
+        },
     )
 
 
@@ -248,9 +266,9 @@ def main(
         temperature: Sampling temperature (0 = greedy).
         top_p: Nucleus sampling parameter.
         repetition_penalty: Generation repetition penalty (model-card default 1.2).
-        attn_implementation: Optional sdpa or flash_attention_2.
+        attn_implementation: Ignored for the local nn.Module (eager only).
         torch_dtype: auto / float16 / bfloat16 / float32.
-        device_map: Transformers device_map.
+        device_map: Device for the local module (auto/cuda/cpu/mps).
         seed: RNG seed.
         score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
             (default True). Grades each batch while the next generates.

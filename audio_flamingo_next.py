@@ -205,23 +205,26 @@ def build_bidirectional_mask(
 def build_causal_mask(
     attention_mask: torch.Tensor | None,
     batch_size: int,
-    seq_len: int,
+    q_len: int,
     dtype: torch.dtype,
     device: torch.device,
+    past_seen_tokens: int = 0,
+    kv_len: int | None = None,
 ) -> torch.Tensor | None:
-    """HF-eager style causal + padding mask: (B, 1, S, S) additive."""
-    q = torch.arange(seq_len, device=device)
-    k = torch.arange(seq_len, device=device)
-    causal_keep = k[None, :] <= q[:, None]  # (S, S)
+    """HF-eager style causal + padding mask: (B, 1, q_len, kv_len) additive."""
+    if kv_len is None:
+        kv_len = past_seen_tokens + q_len
+    q = torch.arange(past_seen_tokens, past_seen_tokens + q_len, device=device)
+    k = torch.arange(kv_len, device=device)
+    causal_keep = k[None, :] <= q[:, None]  # (q_len, kv_len)
     if attention_mask is None:
-        keep = causal_keep[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
+        keep = causal_keep[None, None, :, :].expand(batch_size, 1, q_len, kv_len)
         return _additive_mask_from_bool(keep, dtype)
 
     if attention_mask.ndim == 4:
         return attention_mask.to(dtype=dtype, device=device)
 
-    pad_keep = attention_mask.to(device=device, dtype=torch.bool)  # (B, S)
-    # Keys that are padding must be masked; also standard causal.
+    pad_keep = attention_mask.to(device=device, dtype=torch.bool)  # (B, kv_len)
     keep = causal_keep[None, None, :, :] & pad_keep[:, None, None, :]
     return _additive_mask_from_bool(keep, dtype)
 
@@ -602,8 +605,10 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -613,6 +618,11 @@ class Qwen2Attention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        present = (key_states, value_states) if use_cache else None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -626,7 +636,7 @@ class Qwen2Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights if output_attentions else None
+        return attn_output, attn_weights if output_attentions else None, present
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -642,15 +652,19 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states, attn_weights, present = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
             output_attentions=output_attentions,
+            use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
 
@@ -658,7 +672,7 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states, attn_weights
+        return hidden_states, attn_weights, present
 
 
 class Qwen2Model(nn.Module):
@@ -679,7 +693,9 @@ class Qwen2Model(nn.Module):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> dict[str, Any]:
@@ -689,31 +705,47 @@ class Qwen2Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         batch_size, seq_len, _ = inputs_embeds.shape
+        past_seen = 0
+        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
+            past_seen = past_key_values[0][0].shape[2]
+        kv_len = past_seen + seq_len
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0)
+            position_ids = (
+                torch.arange(past_seen, past_seen + seq_len, device=inputs_embeds.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
 
         causal_mask = build_causal_mask(
             attention_mask,
             batch_size=batch_size,
-            seq_len=seq_len,
+            q_len=seq_len,
             dtype=inputs_embeds.dtype,
             device=inputs_embeds.device,
+            past_seen_tokens=past_seen,
+            kv_len=kv_len,
         )
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
         all_hidden_states: list[torch.Tensor] = []
         all_attentions: list[torch.Tensor] = []
+        next_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if use_cache else None
         if output_hidden_states:
             all_hidden_states.append(hidden_states)
 
-        for decoder_layer in self.layers:
-            hidden_states, attn_weights = decoder_layer(
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            layer_past = past_key_values[layer_idx] if past_key_values is not None else None
+            hidden_states, attn_weights, present = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_embeddings=position_embeddings,
+                past_key_value=layer_past,
                 output_attentions=output_attentions,
+                use_cache=use_cache,
             )
+            if use_cache and present is not None:
+                next_cache.append(present)
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
             if output_attentions and attn_weights is not None:
@@ -727,6 +759,7 @@ class Qwen2Model(nn.Module):
 
         return {
             "last_hidden_state": hidden_states,
+            "past_key_values": next_cache,
             "hidden_states": tuple(all_hidden_states) if output_hidden_states else None,
             "attentions": tuple(all_attentions) if output_attentions else None,
         }
@@ -842,16 +875,24 @@ class AudioFlamingoNextModel(nn.Module):
         input_features_mask: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> dict[str, Any]:
+        # Audio features are only fused on the prefill step (no past cache).
+        fuse_audio = (
+            input_features is not None
+            and input_ids is not None
+            and past_key_values is None
+        )
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         audio_embeds = None
         encoder_attentions = None
-        if input_features is not None and input_ids is not None:
+        if fuse_audio:
             audio_out = self.get_audio_features(
                 input_features,
                 input_features_mask,
@@ -871,16 +912,60 @@ class AudioFlamingoNextModel(nn.Module):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
         return {
             "last_hidden_state": outputs["last_hidden_state"],
+            "past_key_values": outputs["past_key_values"],
             "hidden_states": outputs["hidden_states"],
             "attentions": outputs["attentions"],
             "audio_hidden_states": audio_embeds,
             "encoder_attentions": encoder_attentions,
         }
+
+
+def _apply_repetition_penalty(
+    logits: torch.Tensor, token_ids: torch.Tensor, penalty: float
+) -> torch.Tensor:
+    """HF-style repetition penalty over all tokens seen so far."""
+    if penalty is None or penalty == 1.0:
+        return logits
+    logits = logits.clone()
+    # token_ids: (batch, seq)
+    for batch_idx in range(logits.shape[0]):
+        unique = torch.unique(token_ids[batch_idx])
+        score = logits[batch_idx, unique]
+        logits[batch_idx, unique] = torch.where(
+            score < 0, score * penalty, score / penalty
+        )
+    return logits
+
+
+def _sample_next_token(
+    logits: torch.Tensor,
+    *,
+    do_sample: bool,
+    temperature: float | None,
+    top_p: float | None,
+) -> torch.Tensor:
+    """Return next-token ids of shape (batch, 1)."""
+    if not do_sample or temperature is None or temperature <= 0:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    logits = logits / temperature
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove = cum_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
+        sorted_logits = sorted_logits.masked_fill(remove, torch.finfo(sorted_logits.dtype).min)
+        logits = torch.full_like(logits, torch.finfo(logits.dtype).min).scatter(
+            -1, sorted_idx, sorted_logits
+        )
+    probs = torch.softmax(logits.float(), dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
 class AudioFlamingoNextForConditionalGeneration(nn.Module):
@@ -893,6 +978,10 @@ class AudioFlamingoNextForConditionalGeneration(nn.Module):
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -907,29 +996,133 @@ class AudioFlamingoNextForConditionalGeneration(nn.Module):
         input_features_mask: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-    ) -> dict[str, Any]:
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        # Ignore HF-only kwargs (e.g. logits_to_keep) so call sites stay compatible.
+        _ = kwargs
         outputs = self.model(
             input_ids=input_ids,
             input_features=input_features,
             input_features_mask=input_features_mask,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
         logits = self.lm_head(outputs["last_hidden_state"])
-        return {
+        result = {
             "logits": logits,
+            "past_key_values": outputs["past_key_values"],
             "hidden_states": outputs["hidden_states"],
             "attentions": outputs["attentions"],
             "audio_hidden_states": outputs["audio_hidden_states"],
             "encoder_attentions": outputs["encoder_attentions"],
             "last_hidden_state": outputs["last_hidden_state"],
         }
+        if return_dict:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(**result)
+        return result
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        input_features: torch.FloatTensor | None = None,
+        input_features_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int = 64,
+        do_sample: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        eos_token_id: int | list[int] | None = None,
+        pad_token_id: int | None = None,
+        **kwargs,
+    ) -> torch.LongTensor:
+        """Autoregressive decode with KV-cache; audio features used on prefill only."""
+        _ = kwargs  # tolerate HF generate extras
+        if eos_token_id is None:
+            eos_token_id = self.config.text_config.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = self.config.text_config.pad_token_id
+        if isinstance(eos_token_id, int):
+            eos_ids = [eos_token_id]
+        else:
+            eos_ids = list(eos_token_id or [])
+
+        batch_size = input_ids.shape[0]
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        # Prefill
+        outputs = self.forward(
+            input_ids=input_ids,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+        past = outputs.past_key_values
+        generated = input_ids
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+
+        for _ in range(max_new_tokens):
+            step_logits = outputs.logits[:, -1, :].float()
+            step_logits = _apply_repetition_penalty(
+                step_logits, generated, repetition_penalty if repetition_penalty is not None else 1.0
+            )
+            next_token = _sample_next_token(
+                step_logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            if eos_ids:
+                next_token = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(next_token, pad_token_id if pad_token_id is not None else eos_ids[0]),
+                    next_token,
+                )
+                for eid in eos_ids:
+                    finished = finished | (next_token.squeeze(1) == eid)
+
+            generated = torch.cat([generated, next_token], dim=1)
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (batch_size, 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+            if bool(finished.all()):
+                break
+
+            outputs = self.forward(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            past = outputs.past_key_values
+
+        return generated
 
     @classmethod
     def from_pretrained(
