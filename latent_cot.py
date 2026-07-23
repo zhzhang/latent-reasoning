@@ -5,7 +5,7 @@ sampled token ids back through the embedding layer. Latent CoT instead feeds
 remapped final-layer hidden states as ``inputs_embeds`` while inside
 ``<think>...</think>``. This module owns:
 
-  - ``pinv(W_out) @ W_emb`` remapping matrix compute / disk cache
+  - ridge remapping matrix compute / disk cache
   - a thin decode loop that drives a loaded HF model via ``forward``
 """
 
@@ -20,8 +20,13 @@ import torch
 from safetensors.torch import load_file, save_file
 
 
-LATENT_W_REMAP_FILENAME = "latent_w_remap.safetensors"
+# Filename bump invalidates older unregularized pinv caches.
+LATENT_W_REMAP_FILENAME = "latent_w_remap_ridge.safetensors"
 LATENT_W_REMAP_KEY = "weight"
+# Ridge penalty for (W_out^T W_out + λ I)^{-1}.
+LATENT_W_REMAP_LAMBDA = 1e-4
+# Floor for ||h|| when applying 1/β at decode time.
+_LATENT_H_NORM_EPS = 1e-8
 
 # Hub / remapped state-dict keys for latent remapping matrices.
 _LM_HEAD_WEIGHT_KEYS = (
@@ -100,20 +105,46 @@ def latent_w_remap_path(model_dir: str | Path) -> Path:
 
 
 def compute_w_remap_from_weights(
-    w_out: torch.Tensor, w_emb: torch.Tensor
+    w_out: torch.Tensor,
+    w_in: torch.Tensor,
+    *,
+    ridge_lambda: float = LATENT_W_REMAP_LAMBDA,
 ) -> torch.Tensor:
-    """Precompute ``pinv(W_out) @ W_emb`` for latent-CoT residual remapping.
+    """Precompute the h-independent part of ridge latent remapping.
 
-    For tall full-column-rank ``W_out`` (V×H, V≫H) this is
-    ``(W_out.T @ W_out)^{-1} @ (W_out.T @ W_emb)`` — two (H×H) GEMMs plus a
-    solve. Avoids ``torch.linalg.pinv`` on the full V×H matrix, which hangs /
-    OOMs at AF-Next scale (V≈152k, H=3584).
+    Full map at decode time is::
+
+        w_remap(h) = (1/β) (W_out^T W_out + λ I)^{-1} W_out^T W_in
+        β = ||h|| / mean_i(||W_in[i]||)
+
+    This caches ``mean_i(||W_in[i]||) * (W_out^T W_out + λ I)^{-1} W_out^T W_in``
+    so runtime only divides by ``||h||`` (see ``apply_latent_w_remap``).
+
+    For tall ``W_out`` (V×H, V≫H) the solve is on an H×H Gram matrix — avoids
+    ``torch.linalg.pinv`` on the full V×H matrix at AF-Next scale.
     """
     w_out = w_out.float()
-    w_emb = w_emb.float()
+    w_in = w_in.float()
+    hidden = w_out.shape[1]
     gram = w_out.T @ w_out
-    cross = w_out.T @ w_emb
-    return torch.linalg.solve(gram, cross)
+    if ridge_lambda != 0.0:
+        gram = gram + ridge_lambda * torch.eye(
+            hidden, device=gram.device, dtype=gram.dtype
+        )
+    ridge = torch.linalg.solve(gram, w_out.T @ w_in)
+    avg_embed_norm = w_in.norm(dim=-1).mean()
+    return ridge * avg_embed_norm
+
+
+def apply_latent_w_remap(h: torch.Tensor, w_remap: torch.Tensor) -> torch.Tensor:
+    """Apply cached ridge remap: ``(1/β) h @ ridge`` with β = ||h|| / avg_embed_norm.
+
+    ``w_remap`` must be the tensor from ``compute_w_remap_from_weights`` (avg
+    embed norm already folded in).
+    """
+    h_f = h.float()
+    h_norm = h_f.norm(dim=-1, keepdim=True).clamp_min(_LATENT_H_NORM_EPS)
+    return (h_f @ w_remap / h_norm).to(dtype=h.dtype)
 
 
 def _compute_w_remap(model) -> torch.Tensor:
@@ -148,7 +179,7 @@ def compute_and_cache_latent_w_remap(
     force: bool = False,
     device: torch.device | str | None = None,
 ) -> dict[str, object]:
-    """Compute ``pinv(W_out) @ W_emb`` from checkpoint weights and cache on disk.
+    """Compute ridge remapping from checkpoint weights and cache on disk.
 
     Loads only the lm_head / embed_tokens tensors (not the full model). Suitable
     for the model-seeding container so eval containers can load the cache.
@@ -164,17 +195,17 @@ def compute_and_cache_latent_w_remap(
             "shape": list(cached.shape),
         }
 
-    w_out, w_emb = load_latent_remap_source_weights(model_dir)
+    w_out, w_in = load_latent_remap_source_weights(model_dir)
     if device is not None:
         w_out = w_out.to(device=device)
-        w_emb = w_emb.to(device=device)
+        w_in = w_in.to(device=device)
 
     print(
-        f"Computing latent w_remap from {model_dir} "
-        f"(W_out={tuple(w_out.shape)}, W_emb={tuple(w_emb.shape)}, "
+        f"Computing latent w_remap (ridge λ={LATENT_W_REMAP_LAMBDA}) from {model_dir} "
+        f"(W_out={tuple(w_out.shape)}, W_in={tuple(w_in.shape)}, "
         f"device={w_out.device}) ..."
     )
-    w_remap = compute_w_remap_from_weights(w_out, w_emb)
+    w_remap = compute_w_remap_from_weights(w_out, w_in)
     saved = save_latent_w_remap(model_dir, w_remap)
     print(f"Cached latent w_remap at {saved} shape={tuple(w_remap.shape)}")
     return {
@@ -205,7 +236,9 @@ def ensure_latent_w_remap(
             )
 
     if w_remap is None:
-        print("Computing latent w_remap (Gram solve) ...")
+        print(
+            f"Computing latent w_remap (ridge λ={LATENT_W_REMAP_LAMBDA}) ..."
+        )
         w_remap = _compute_w_remap(model)
         if persist and model_dir is not None:
             try:
@@ -481,7 +514,7 @@ def latent_generate(
 
         if latent_continue.any():
             h = _last_hidden(outputs)[:, -1, :]
-            remapped = (h.float() @ w_remap).to(dtype=h.dtype)
+            remapped = apply_latent_w_remap(h, w_remap)
             token_embeds = embed_layer(next_token.squeeze(1))
             use_remapped = latent_continue & ~finished
             next_embed = torch.where(use_remapped.unsqueeze(1), remapped, token_embeds)

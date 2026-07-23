@@ -11,7 +11,7 @@ Layout on the ``latent-reasoning`` Volume:
       AQA/ SER/ VSC/
     /models/nvidia/audio-flamingo-3-hf/
     /models/nvidia/audio-flamingo-next-think-hf/
-      latent_w_remap.safetensors   # precomputed latent-CoT remapping (AF-Next)
+      latent_w_remap_ridge.safetensors  # ridge latent-CoT remapping (AF-Next)
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
     ...
@@ -177,7 +177,7 @@ def _is_af_next_repo(repo_id: str) -> bool:
 
 
 def _cache_af_next_latent_w_remap(dest: Path, *, force: bool = False) -> dict | None:
-    """Precompute pinv remapping matrices for AF-Next and write them beside weights."""
+    """Precompute ridge remapping matrices for AF-Next and write them beside weights."""
     from latent_cot import compute_and_cache_latent_w_remap
 
     import torch
@@ -363,7 +363,7 @@ def seed_model(
     (consumers should set ``HF_HUB_CACHE=/models`` when mounting the models subpath).
 
     For Audio Flamingo Next repos, also precomputes and caches the latent-CoT
-    remapping matrix (``latent_w_remap.safetensors``) beside the weights.
+    remapping matrix (``latent_w_remap_ridge.safetensors``) beside the weights.
     """
     from huggingface_hub import snapshot_download
 
