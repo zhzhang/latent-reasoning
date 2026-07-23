@@ -518,6 +518,13 @@ def resolve_model_dir(model_id: str, local_model_dir: str | None) -> str:
     )
     marker = seeded / ".seed_complete"
     marker.write_text("ok\n", encoding="utf-8")
+    if "audio-flamingo-next" in model_id.lower():
+        from latent_cot import compute_and_cache_latent_w_remap
+
+        import torch
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        compute_and_cache_latent_w_remap(seeded, force=True, device=device)
     volume.commit()
     return str(seeded)
 
@@ -566,30 +573,21 @@ def build_generated_raw_tokens(
     *,
     is_latent: list[bool] | None = None,
 ) -> list[dict]:
-    """Build generated-role raw tokens, marking latent-CoT steps as ``<latent/>``."""
+    """Build generated-role raw tokens, marking latent-CoT steps with ``latent``."""
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     tokens = []
     for index, token_id in enumerate(token_ids):
-        if is_latent and index < len(is_latent) and is_latent[index]:
-            tokens.append(
-                {
-                    "id": None,
-                    "token": "<latent/>",
-                    "role": "generated",
-                    "special": True,
-                    "latent": True,
-                }
-            )
-            continue
         tid = int(token_id)
-        tokens.append(
-            {
-                "id": tid,
-                "token": format_raw_token(tokenizer, tid),
-                "role": "generated",
-                "special": tid in special_ids,
-            }
-        )
+        entry = {
+            "id": tid,
+            "token": format_raw_token(tokenizer, tid),
+            "role": "generated",
+            "special": tid in special_ids,
+        }
+        if is_latent and index < len(is_latent) and is_latent[index]:
+            entry["latent"] = True
+            entry["special"] = True
+        tokens.append(entry)
     return tokens
 
 
@@ -647,10 +645,23 @@ def generate_batch(
         model,
     )
 
+    gen_kwargs = generation_kwargs(args, extra=generation_extra)
     with torch.inference_mode():
-        gen_out = model.generate(
-            **inputs, **generation_kwargs(args, extra=generation_extra)
-        )
+        if gen_kwargs.pop("latent_cot", False):
+            from latent_cot import latent_generate
+
+            # Custom kwargs belong to latent_generate, not HF generate.
+            think_start_ids = gen_kwargs.pop("think_start_ids", None)
+            think_end_ids = gen_kwargs.pop("think_end_ids", None)
+            gen_out = latent_generate(
+                model,
+                **inputs,
+                **gen_kwargs,
+                think_start_ids=think_start_ids,
+                think_end_ids=think_end_ids,
+            )
+        else:
+            gen_out = model.generate(**inputs, **gen_kwargs)
 
     prompt_len = inputs["input_ids"].shape[1]
     sequences, gen_is_latent = _unpack_generate_output(gen_out, prompt_len)

@@ -1,8 +1,8 @@
 """Run Audio Flamingo Next Think on MMAR with MMAR-Rubrics grading on Modal.
 
-Loads the local ``AudioFlamingoNextForConditionalGeneration`` nn.Module (not
-HuggingFace ``MusicFlamingoForConditionalGeneration``) with hub/Volume weights.
-The processor still comes from Transformers.
+Loads HuggingFace ``MusicFlamingoForConditionalGeneration`` (via
+``AutoModelForSeq2SeqLM``) with hub/Volume weights. Latent CoT uses the thin
+custom decode loop in ``latent_cot.latent_generate``.
 
 Uses the shared ``latent-reasoning`` Volume from ``seed_volume.py`` for data
 and weights, and writes eval outputs to ``latent-reasoning-results``:
@@ -52,9 +52,9 @@ from types import SimpleNamespace
 
 import modal
 
-from audio_flamingo_next import AudioFlamingoNextForConditionalGeneration
 from audio_flamingo_runtime import (
     audio_tower_dtype,
+    cast_model_floating_tensors,
     generate_batch,
     model_input_device,
     model_param_dtype,
@@ -62,6 +62,7 @@ from audio_flamingo_runtime import (
     resolve_model_dir,
     torch_dtype_value,
 )
+from latent_cot import ensure_latent_w_remap
 from mmar_common import (
     AF_NEXT_THINK_SUFFIX,
     build_mmar_prompt,
@@ -88,49 +89,37 @@ image = mmar_eval_image()
 app = modal.App("audio-flamingo-next-mmar", image=image)
 
 
-def _resolve_device(device_map: str | None):
-    import torch
-
-    if device_map in (None, "auto", "cuda", "cuda:0"):
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if device_map == "cpu":
-        return torch.device("cpu")
-    if device_map == "mps":
-        return torch.device("mps")
-    # e.g. "cuda:1"
-    return torch.device(device_map)
-
-
 def load_audio_flamingo_next(args):
     import torch
-    from transformers import AutoProcessor
+    from transformers import AutoModelForSeq2SeqLM, AutoProcessor
 
     target_dtype = torch_dtype_value(torch, args.torch_dtype)
     if target_dtype == "auto":
         target_dtype = torch.bfloat16
 
     local_id = resolve_model_dir(args.model_id, args.local_model_dir)
-    device = _resolve_device(getattr(args, "device_map", "auto"))
-    if getattr(args, "attn_implementation", None):
-        print(
-            f"Note: local AudioFlamingoNext ignores attn_implementation="
-            f"{args.attn_implementation!r} (eager only)."
-        )
+    device_map = getattr(args, "device_map", "auto")
+    attn_implementation = getattr(args, "attn_implementation", None)
 
     processor = AutoProcessor.from_pretrained(local_id)
-    model = AudioFlamingoNextForConditionalGeneration.from_pretrained(
-        local_id,
-        dtype=target_dtype,
-        device=device,
-        strict=True,
-    )
+    load_kwargs: dict = {"dtype": target_dtype}
+    if attn_implementation:
+        load_kwargs["attn_implementation"] = attn_implementation
+    if device_map in (None, "auto"):
+        load_kwargs["device_map"] = "auto"
+    elif device_map in ("cuda", "cuda:0"):
+        load_kwargs["device_map"] = {"": "cuda:0"} if torch.cuda.is_available() else "cpu"
+    else:
+        load_kwargs["device_map"] = device_map
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(local_id, **load_kwargs)
+    # Audio-tower LayerNorms can remain float32 after dtype=bfloat16 load.
+    cast_model_floating_tensors(model, target_dtype)
     model.eval()
+    # Prefetch remapping so the first latent-CoT call does not pay Gram-solve cost.
+    ensure_latent_w_remap(model, local_id, persist=True)
     print(
-        f"Model ready: class={type(model).__name__} (local nn.Module), "
+        f"Model ready: class={type(model).__name__} (HF), "
         f"param_dtype={model_param_dtype(model)}, "
         f"audio_tower_dtype={audio_tower_dtype(model)}, "
         f"device={model_input_device(model)}"
@@ -235,7 +224,7 @@ def run_mmar(
         manifest_extra={
             "repetition_penalty": repetition_penalty,
             "latent_cot": latent_cot,
-            "model_implementation": "audio_flamingo_next.AudioFlamingoNextForConditionalGeneration",
+            "model_implementation": "transformers.MusicFlamingoForConditionalGeneration",
         },
     )
 
@@ -286,9 +275,9 @@ def main(
         temperature: Sampling temperature (0 = greedy).
         top_p: Nucleus sampling parameter.
         repetition_penalty: Generation repetition penalty (model-card default 1.2).
-        attn_implementation: Ignored for the local nn.Module (eager only).
+        attn_implementation: Optional HF attention backend (e.g. eager).
         torch_dtype: auto / float16 / bfloat16 / float32.
-        device_map: Device for the local module (auto/cuda/cpu/mps).
+        device_map: HF device_map (auto/cuda/cpu/mps).
         seed: RNG seed.
         score: Pipeline OpenAI MMAR-Rubrics grading alongside inference
             (default True). Grades each batch while the next generates.

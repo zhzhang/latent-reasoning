@@ -32,7 +32,7 @@ def mmar_eval_image(*extra_python_sources: str) -> modal.Image:
         "modal_cache",
         "mmar_common",
         "audio_flamingo_runtime",
-        "audio_flamingo_next",
+        "latent_cot",
         *extra_python_sources,
     )
     return (

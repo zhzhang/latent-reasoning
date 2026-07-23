@@ -11,6 +11,7 @@ Layout on the ``latent-reasoning`` Volume:
       AQA/ SER/ VSC/
     /models/nvidia/audio-flamingo-3-hf/
     /models/nvidia/audio-flamingo-next-think-hf/
+      latent_w_remap.safetensors   # precomputed latent-CoT remapping (AF-Next)
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
     ...
@@ -93,8 +94,16 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install("huggingface-hub>=0.30.0", "tqdm>=4.67.0")
+    .uv_pip_install(
+        "huggingface-hub>=0.30.0",
+        "tqdm>=4.67.0",
+        # Used to precompute / cache latent-CoT remapping matrices for AF-Next.
+        "torch",
+        "numpy",
+        "safetensors>=0.8.0",
+    )
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
+    .add_local_python_source("latent_cot")
 )
 
 app = modal.App("seed-volume", image=image)
@@ -161,6 +170,22 @@ def _looks_seeded(path: Path) -> bool:
     has_config = (path / "config.json").exists() or any(path.glob("*/config.json"))
     has_weights = any(path.rglob("*.safetensors")) or any(path.rglob("*.bin"))
     return bool(has_config and has_weights)
+
+
+def _is_af_next_repo(repo_id: str) -> bool:
+    return "audio-flamingo-next" in repo_id.lower()
+
+
+def _cache_af_next_latent_w_remap(dest: Path, *, force: bool = False) -> dict | None:
+    """Precompute pinv remapping matrices for AF-Next and write them beside weights."""
+    from latent_cot import compute_and_cache_latent_w_remap
+
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    summary = compute_and_cache_latent_w_remap(dest, force=force, device=device)
+    print(f"latent w_remap cache: {summary}")
+    return summary
 
 
 def _parse_noneable(value: str) -> str | None:
@@ -336,6 +361,9 @@ def seed_model(
     Default layout: ``/cache/models/<repo_id>`` (explicit local snapshot).
     With ``hub_cache_layout=True``: standard HF hub cache under ``/cache/models``
     (consumers should set ``HF_HUB_CACHE=/models`` when mounting the models subpath).
+
+    For Audio Flamingo Next repos, also precomputes and caches the latent-CoT
+    remapping matrix (``latent_w_remap.safetensors``) beside the weights.
     """
     from huggingface_hub import snapshot_download
 
@@ -356,18 +384,29 @@ def seed_model(
         marker = MODELS_ROOT / ".seeded" / repo_id.replace("/", "__")
         already = marker.exists() and not force
         dest_label = str(MODELS_ROOT)
+        local_snapshot = (
+            Path(marker.read_text(encoding="utf-8").strip())
+            if marker.exists()
+            else None
+        )
     else:
         dest = model_dir_for(repo_id)
         marker = dest / ".seed_complete"
         already = _looks_seeded(dest) and not force
         dest_label = str(dest)
+        local_snapshot = dest
 
+    remapping: dict | None = None
     if already:
+        if local_snapshot is not None and _is_af_next_repo(repo_id):
+            remapping = _cache_af_next_latent_w_remap(local_snapshot, force=force)
+            volume.commit()
         summary = {
             "repo_id": repo_id,
             "status": "skipped",
             "path": dest_label,
             "layout": "hub-cache" if hub_cache_layout else "local-dir",
+            "latent_w_remap": remapping,
         }
         print(summary)
         return summary
@@ -385,6 +424,7 @@ def seed_model(
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(f"{snapshot_path}\n", encoding="utf-8")
         path_out = snapshot_path
+        local_snapshot = Path(snapshot_path)
     else:
         dest = model_dir_for(repo_id)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +438,10 @@ def seed_model(
         )
         marker.write_text("ok\n", encoding="utf-8")
         path_out = str(dest)
+        local_snapshot = dest
+
+    if local_snapshot is not None and _is_af_next_repo(repo_id):
+        remapping = _cache_af_next_latent_w_remap(local_snapshot, force=True)
 
     volume.commit()
     summary = {
@@ -405,6 +449,7 @@ def seed_model(
         "status": "ok",
         "path": path_out,
         "layout": "hub-cache" if hub_cache_layout else "local-dir",
+        "latent_w_remap": remapping,
     }
     print(summary)
     return summary
