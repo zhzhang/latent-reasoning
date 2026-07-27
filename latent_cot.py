@@ -20,13 +20,15 @@ import torch
 from safetensors.torch import load_file, save_file
 
 
-# Filename bump invalidates older unregularized pinv caches.
-LATENT_W_REMAP_FILENAME = "latent_w_remap_ridge.safetensors"
+LATENT_W_REMAP_FILENAME = "latent_w_remap.safetensors"
 LATENT_W_REMAP_KEY = "weight"
+LATENT_AVG_EMBED_NORM_KEY = "avg_embed_norm"
 # Ridge penalty for (W_out^T W_out + λ I)^{-1}.
 LATENT_W_REMAP_LAMBDA = 1e-4
-# Floor for ||h|| when applying 1/β at decode time.
+# Floor for ||h @ W|| when applying 1/β at decode time.
 _LATENT_H_NORM_EPS = 1e-8
+# Any prior remap artifacts under the model dir (stable name + legacy variants).
+_LATENT_W_REMAP_GLOB = "latent_w_remap*.safetensors"
 
 # Hub / remapped state-dict keys for latent remapping matrices.
 _LM_HEAD_WEIGHT_KEYS = (
@@ -104,24 +106,41 @@ def latent_w_remap_path(model_dir: str | Path) -> Path:
     return Path(model_dir) / LATENT_W_REMAP_FILENAME
 
 
+def _is_latent_w_remap_cache(path: Path) -> bool:
+    return path.name.startswith("latent_w_remap") and path.suffix == ".safetensors"
+
+
+def clear_latent_w_remap_cache(model_dir: str | Path) -> list[Path]:
+    """Remove any latent remap cache files under ``model_dir`` (idempotent)."""
+    model_dir = Path(model_dir)
+    removed: list[Path] = []
+    if not model_dir.is_dir():
+        return removed
+    for path in sorted(model_dir.glob(_LATENT_W_REMAP_GLOB)):
+        if not path.is_file():
+            continue
+        path.unlink()
+        removed.append(path)
+    return removed
+
+
 def compute_w_remap_from_weights(
     w_out: torch.Tensor,
     w_in: torch.Tensor,
     *,
     ridge_lambda: float = LATENT_W_REMAP_LAMBDA,
-) -> torch.Tensor:
-    """Precompute the h-independent part of ridge latent remapping.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute unscaled ridge remapping and mean input-embed norm.
 
     Full map at decode time is::
 
-        w_remap(h) = (1/β) (W_out^T W_out + λ I)^{-1} W_out^T W_in
-        β = ||h|| / mean_i(||W_in[i]||)
+        W = (W_out^T W_out + λ I)^{-1} W_out^T W_in
+        h' = h @ W
+        β = ||h'|| / mean_i(||W_in[i]||)
+        remapped = (1/β) h'
 
-    This caches ``mean_i(||W_in[i]||) * (W_out^T W_out + λ I)^{-1} W_out^T W_in``
-    so runtime only divides by ``||h||`` (see ``apply_latent_w_remap``).
-
-    For tall ``W_out`` (V×H, V≫H) the solve is on an H×H Gram matrix — avoids
-    ``torch.linalg.pinv`` on the full V×H matrix at AF-Next scale.
+    Returns ``(W, mean_i(||W_in[i]||))``. For tall ``W_out`` (V×H, V≫H) the
+    solve is on an H×H Gram matrix — avoids ``torch.linalg.pinv`` on V×H.
     """
     w_out = w_out.float()
     w_in = w_in.float()
@@ -133,43 +152,74 @@ def compute_w_remap_from_weights(
         )
     ridge = torch.linalg.solve(gram, w_out.T @ w_in)
     avg_embed_norm = w_in.norm(dim=-1).mean()
-    return ridge * avg_embed_norm
+    return ridge, avg_embed_norm.detach()
 
 
-def apply_latent_w_remap(h: torch.Tensor, w_remap: torch.Tensor) -> torch.Tensor:
-    """Apply cached ridge remap: ``(1/β) h @ ridge`` with β = ||h|| / avg_embed_norm.
+def apply_latent_w_remap(
+    h: torch.Tensor,
+    w_remap: torch.Tensor,
+    avg_embed_norm: torch.Tensor | float,
+) -> torch.Tensor:
+    """Apply cached ridge remap with β from the post-remap hidden norm.
 
-    ``w_remap`` must be the tensor from ``compute_w_remap_from_weights`` (avg
-    embed norm already folded in).
+    ``β = ||h @ W|| / avg_embed_norm``, so the returned vector has norm
+    ``avg_embed_norm``.
     """
-    h_f = h.float()
-    h_norm = h_f.norm(dim=-1, keepdim=True).clamp_min(_LATENT_H_NORM_EPS)
-    return (h_f @ w_remap / h_norm).to(dtype=h.dtype)
+    mapped = h.float() @ w_remap
+    mapped_norm = mapped.norm(dim=-1, keepdim=True).clamp_min(_LATENT_H_NORM_EPS)
+    scale = avg_embed_norm / mapped_norm
+    return (mapped * scale).to(dtype=h.dtype)
 
 
-def _compute_w_remap(model) -> torch.Tensor:
+def _compute_w_remap(model) -> tuple[torch.Tensor, torch.Tensor]:
     """Precompute remapping from a loaded model's lm_head and input embeddings."""
     return compute_w_remap_from_weights(
         model.lm_head.weight, model.get_input_embeddings().weight
     )
 
 
-def load_latent_w_remap(model_dir: str | Path) -> torch.Tensor | None:
-    """Load a previously cached remapping matrix, or ``None`` if absent."""
+def load_latent_w_remap(
+    model_dir: str | Path,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Load cached ``(w_remap, avg_embed_norm)``, or ``None`` if absent/stale."""
     path = latent_w_remap_path(model_dir)
     if not path.is_file():
+        # Drop any leftover legacy remap filenames.
+        clear_latent_w_remap_cache(model_dir)
         return None
     tensors = load_file(str(path))
-    if LATENT_W_REMAP_KEY not in tensors:
-        raise KeyError(f"{path} missing '{LATENT_W_REMAP_KEY}' tensor")
-    return tensors[LATENT_W_REMAP_KEY]
+    if (
+        LATENT_W_REMAP_KEY not in tensors
+        or LATENT_AVG_EMBED_NORM_KEY not in tensors
+    ):
+        # Incomplete/old schema: wipe and treat as cache miss.
+        clear_latent_w_remap_cache(model_dir)
+        return None
+    # Drop any leftover legacy remap filenames beside the canonical cache.
+    for leftover in Path(model_dir).glob(_LATENT_W_REMAP_GLOB):
+        if leftover != path and leftover.is_file():
+            leftover.unlink()
+    return tensors[LATENT_W_REMAP_KEY], tensors[LATENT_AVG_EMBED_NORM_KEY]
 
 
-def save_latent_w_remap(model_dir: str | Path, w_remap: torch.Tensor) -> Path:
-    """Persist remapping matrix next to the model checkpoint."""
+def save_latent_w_remap(
+    model_dir: str | Path,
+    w_remap: torch.Tensor,
+    avg_embed_norm: torch.Tensor | float,
+) -> Path:
+    """Persist remapping cache, replacing any previous remap artifacts."""
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    clear_latent_w_remap_cache(model_dir)
     path = latent_w_remap_path(model_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    save_file({LATENT_W_REMAP_KEY: w_remap.detach().cpu().contiguous()}, str(path))
+    avg = torch.as_tensor(avg_embed_norm, dtype=torch.float32).reshape(()).cpu()
+    save_file(
+        {
+            LATENT_W_REMAP_KEY: w_remap.detach().cpu().contiguous(),
+            LATENT_AVG_EMBED_NORM_KEY: avg.contiguous(),
+        },
+        str(path),
+    )
     return path
 
 
@@ -183,17 +233,20 @@ def compute_and_cache_latent_w_remap(
 
     Loads only the lm_head / embed_tokens tensors (not the full model). Suitable
     for the model-seeding container so eval containers can load the cache.
+    Writing always replaces any prior remap cache files under ``model_dir``.
     """
     model_dir = Path(model_dir)
     out_path = latent_w_remap_path(model_dir)
-    if out_path.is_file() and not force:
+    if not force:
         cached = load_latent_w_remap(model_dir)
-        assert cached is not None
-        return {
-            "status": "skipped",
-            "path": str(out_path),
-            "shape": list(cached.shape),
-        }
+        if cached is not None:
+            w_remap, avg_embed_norm = cached
+            return {
+                "status": "skipped",
+                "path": str(out_path),
+                "shape": list(w_remap.shape),
+                "avg_embed_norm": float(avg_embed_norm),
+            }
 
     w_out, w_in = load_latent_remap_source_weights(model_dir)
     if device is not None:
@@ -205,13 +258,17 @@ def compute_and_cache_latent_w_remap(
         f"(W_out={tuple(w_out.shape)}, W_in={tuple(w_in.shape)}, "
         f"device={w_out.device}) ..."
     )
-    w_remap = compute_w_remap_from_weights(w_out, w_in)
-    saved = save_latent_w_remap(model_dir, w_remap)
-    print(f"Cached latent w_remap at {saved} shape={tuple(w_remap.shape)}")
+    w_remap, avg_embed_norm = compute_w_remap_from_weights(w_out, w_in)
+    saved = save_latent_w_remap(model_dir, w_remap, avg_embed_norm)
+    print(
+        f"Cached latent w_remap at {saved} shape={tuple(w_remap.shape)} "
+        f"avg_embed_norm={float(avg_embed_norm):.6g}"
+    )
     return {
         "status": "ok",
         "path": str(saved),
         "shape": list(w_remap.shape),
+        "avg_embed_norm": float(avg_embed_norm),
     }
 
 
@@ -220,37 +277,50 @@ def ensure_latent_w_remap(
     model_dir: str | Path | None = None,
     *,
     persist: bool = True,
-) -> torch.Tensor:
-    """Attach ``model._latent_w_remap``, loading disk cache when available."""
-    cached = getattr(model, "_latent_w_remap", None)
-    if cached is not None:
-        return cached
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attach ``model._latent_w_remap`` / ``_latent_avg_embed_norm`` from cache."""
+    cached_w = getattr(model, "_latent_w_remap", None)
+    cached_norm = getattr(model, "_latent_avg_embed_norm", None)
+    if cached_w is not None and cached_norm is not None:
+        return cached_w, cached_norm
 
     w_remap: torch.Tensor | None = None
+    avg_embed_norm: torch.Tensor | None = None
     if model_dir is not None:
-        w_remap = load_latent_w_remap(model_dir)
-        if w_remap is not None:
+        loaded = load_latent_w_remap(model_dir)
+        if loaded is not None:
+            w_remap, avg_embed_norm = loaded
             print(
                 f"Loaded cached latent w_remap from {latent_w_remap_path(model_dir)} "
-                f"shape={tuple(w_remap.shape)}"
+                f"shape={tuple(w_remap.shape)} "
+                f"avg_embed_norm={float(avg_embed_norm):.6g}"
             )
 
-    if w_remap is None:
+    if w_remap is None or avg_embed_norm is None:
         print(
             f"Computing latent w_remap (ridge λ={LATENT_W_REMAP_LAMBDA}) ..."
         )
-        w_remap = _compute_w_remap(model)
+        w_remap, avg_embed_norm = _compute_w_remap(model)
         if persist and model_dir is not None:
             try:
-                saved = save_latent_w_remap(model_dir, w_remap)
-                print(f"Cached latent w_remap at {saved} shape={tuple(w_remap.shape)}")
+                saved = save_latent_w_remap(model_dir, w_remap, avg_embed_norm)
+                print(
+                    f"Cached latent w_remap at {saved} shape={tuple(w_remap.shape)} "
+                    f"avg_embed_norm={float(avg_embed_norm):.6g}"
+                )
             except OSError as exc:
                 print(
                     f"Warning: could not cache latent w_remap under {model_dir}: {exc}"
                 )
 
-    model._latent_w_remap = w_remap.detach().to(device=_model_device(model)).contiguous()
-    return model._latent_w_remap
+    device = _model_device(model)
+    model._latent_w_remap = w_remap.detach().to(device=device).contiguous()
+    model._latent_avg_embed_norm = (
+        torch.as_tensor(avg_embed_norm, dtype=torch.float32, device=device)
+        .reshape(())
+        .detach()
+    )
+    return model._latent_w_remap, model._latent_avg_embed_norm
 
 
 def _hub_keys_for_remapped(remapped_key: str) -> tuple[str, ...]:
@@ -319,7 +389,7 @@ def load_latent_remap_source_weights(
         files = sorted(
             p
             for p in model_dir.glob("*.safetensors")
-            if p.name != LATENT_W_REMAP_FILENAME
+            if not _is_latent_w_remap_cache(p)
         )
         if not files:
             raise FileNotFoundError(f"No safetensors weights found under {model_dir}")
@@ -410,7 +480,7 @@ def latent_generate(
     think_end_first = think_end_ids[0]
     eos_ids, pad_token_id = _resolve_eos_pad(model, eos_token_id, pad_token_id)
 
-    w_remap = ensure_latent_w_remap(model, model_dir, persist=False)
+    w_remap, avg_embed_norm = ensure_latent_w_remap(model, model_dir, persist=False)
     embed_layer = model.get_input_embeddings()
 
     batch_size = input_ids.shape[0]
@@ -514,7 +584,7 @@ def latent_generate(
 
         if latent_continue.any():
             h = _last_hidden(outputs)[:, -1, :]
-            remapped = apply_latent_w_remap(h, w_remap)
+            remapped = apply_latent_w_remap(h, w_remap, avg_embed_norm)
             token_embeds = embed_layer(next_token.squeeze(1))
             use_remapped = latent_continue & ~finished
             next_embed = torch.where(use_remapped.unsqueeze(1), remapped, token_embeds)

@@ -1,0 +1,41 @@
+# Step-Audio2 ASR-only (Thinker) tuned for offline MMAR batch throughput.
+# stage_args format expected by Omni(stage_configs_path=...).
+# Keep max_num_seqs low: encoder profiling allocates max-size audio × seqs and
+# that memory is still held when KV cache is allocated (OOM on L40S/A100 at 16+).
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 4
+    engine_args:
+      model_stage: step_audio2_thinker
+      model_arch: StepAudio2ThinkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      limit_mm_per_prompt:
+        audio: 1
+      max_num_batched_tokens: 4096
+      max_num_seqs: 4
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      engine_output_type: text
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 512
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+      # Qwen <|im_end|> — required so Thinker stops before audio tokens.
+      stop_token_ids: [151645]

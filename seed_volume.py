@@ -11,7 +11,7 @@ Layout on the ``latent-reasoning`` Volume:
       AQA/ SER/ VSC/
     /models/nvidia/audio-flamingo-3-hf/
     /models/nvidia/audio-flamingo-next-think-hf/
-      latent_w_remap_ridge.safetensors  # ridge latent-CoT remapping (AF-Next)
+      latent_w_remap.safetensors   # ridge latent-CoT remapping (AF-Next)
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
     ...
@@ -77,6 +77,20 @@ MODEL_ALIASES: dict[str, str] = {
     "qwen3-omni-thinking": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-4b-thinking": "Qwen/Qwen3-4B-Thinking-2507",
+    "step-audio-2-mini": "stepfun-ai/Step-Audio-2-mini",
+    "step-audio-2": "stepfun-ai/Step-Audio-2-mini",
+    "mimo-audio-7b": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
+    "mimo-audio-7b-instruct": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
+    "mimo-audio-tokenizer": "XiaomiMiMo/MiMo-Audio-Tokenizer",
+    "interactive-omni-8b": "sensenova/InteractiveOmni-8B",
+    "interactive-omni": "sensenova/InteractiveOmni-8B",
+}
+
+# Aliases that should also seed companion repos (e.g. MiMo tokenizer).
+MODEL_SEED_EXTRAS: dict[str, tuple[str, ...]] = {
+    "mimo-audio-7b": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
+    "mimo-audio-7b-instruct": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
+    "XiaomiMiMo/MiMo-Audio-7B-Instruct": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
 }
 
 DEFAULT_DATASETS = ("mmar", "aha")
@@ -88,6 +102,9 @@ ALL_MODELS = (
     "qwen3-omni",
     "qwen3-4b",
     "qwen3-4b-thinking",
+    "step-audio-2-mini",
+    "mimo-audio-7b",
+    "interactive-omni-8b",
 )
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -116,6 +133,20 @@ def resolve_repo_id(name: str) -> str:
     if not key:
         raise ValueError("Empty model name")
     return MODEL_ALIASES.get(key.lower(), key)
+
+
+def expand_seed_targets(names: list[str]) -> list[str]:
+    """Resolve aliases and append companion repos (e.g. MiMo tokenizer)."""
+    targets: list[str] = []
+    for name in names:
+        repo_id = resolve_repo_id(name)
+        targets.append(repo_id)
+        extras = MODEL_SEED_EXTRAS.get(name.strip()) or MODEL_SEED_EXTRAS.get(
+            name.strip().lower()
+        ) or MODEL_SEED_EXTRAS.get(repo_id)
+        if extras:
+            targets.extend(extras)
+    return list(dict.fromkeys(targets))
 
 
 def model_dir_for(repo_id: str) -> Path:
@@ -363,21 +394,23 @@ def seed_model(
     (consumers should set ``HF_HUB_CACHE=/models`` when mounting the models subpath).
 
     For Audio Flamingo Next repos, also precomputes and caches the latent-CoT
-    remapping matrix (``latent_w_remap_ridge.safetensors``) beside the weights.
+    remapping matrix (``latent_w_remap.safetensors``) beside the weights.
     """
     from huggingface_hub import snapshot_download
 
     repo_id = resolve_repo_id(repo_id)
     token = os.environ.get("HF_TOKEN")
     # Prefer safetensors; skip redundant full pytorch dumps. Keep think/*.bin
-    # (AF3 non_lora_trainables) and other small adapter bins.
+    # (AF3 non_lora_trainables) and other small adapter bins. InteractiveOmni
+    # needs campplus.onnx at load time, so do not ignore *.onnx for that repo.
     patterns = ignore_patterns or [
         "*.pt",
         "*.gguf",
-        "*.onnx",
         "*.h5",
         "pytorch_model*.bin",
     ]
+    if "InteractiveOmni" not in repo_id and "interactive-omni" not in repo_id.lower():
+        patterns = ["*.onnx", *patterns]
 
     if hub_cache_layout:
         os.environ["HF_HUB_CACHE"] = str(MODELS_ROOT)
@@ -614,7 +647,7 @@ def main(
             results.append(_upload_mcr_local(mcr_local_dir, force=force))
 
     if repo_id:
-        targets = [resolve_repo_id(repo_id)]
+        targets = expand_seed_targets([repo_id])
     else:
         models_arg = _parse_noneable(models)
         if models_arg is None:
@@ -624,9 +657,9 @@ def main(
             if not raw:
                 raise SystemExit("Pass at least one model via --models or --repo-id (or none to skip)")
             if any(item.lower() == "all" for item in raw):
-                targets = [resolve_repo_id(alias) for alias in ALL_MODELS]
+                targets = expand_seed_targets(list(ALL_MODELS))
             else:
-                targets = [resolve_repo_id(item) for item in raw]
+                targets = expand_seed_targets(raw)
 
     # De-dupe while preserving order.
     targets = list(dict.fromkeys(targets))

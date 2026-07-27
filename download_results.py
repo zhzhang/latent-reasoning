@@ -8,9 +8,16 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       scores.json
       manifest.json
     mmar/af-next-think/<run_id>/     # Audio Flamingo Next Think runs
+    exp-mmar-question-difficulty/<run_id>/
+      difficulty.jsonl
+      scores.json
+      manifest.json
+      models/<label>/predictions.jsonl
 
-The Volume root maps flatly to ``./outputs``, so a full sync yields
-``outputs/mmar/af3/<run_id>/...``.
+``modal volume get`` places the last path component under the local
+destination, so nested downloads must target the parent directory to
+preserve the volume tree. This script computes that destination
+automatically.
 
 Usage:
 
@@ -19,6 +26,9 @@ Usage:
     uv run modal run download_results.py --remote-path mmar/af3
     uv run modal run download_results.py --remote-path mmar/af-next-think
     uv run modal run download_results.py --remote-path mmar/af3/20260712T185300Z
+    uv run modal run download_results.py --remote-path exp-mmar-question-difficulty
+    uv run modal run download_results.py \\
+      --remote-path exp-mmar-question-difficulty/20260727T154400Z
 """
 
 from __future__ import annotations
@@ -42,6 +52,22 @@ def _normalize_remote(path: str) -> str:
     if cleaned != "/":
         cleaned = cleaned.strip("/")
     return cleaned
+
+
+def resolve_local_dest(remote_path: str, local_dir: str | Path) -> Path:
+    """Map a Volume subpath to the local parent dir ``modal volume get`` expects.
+
+    ``modal volume get VOLUME a/b/c DEST`` writes to ``DEST/c/``. To mirror
+    ``outputs/a/b/c/`` we therefore pass ``DEST=outputs/a/b``.
+    """
+    remote = _normalize_remote(remote_path)
+    base = Path(local_dir).expanduser().resolve()
+    if remote == "/":
+        return base
+    parts = remote.split("/")
+    if len(parts) == 1:
+        return base
+    return base.joinpath(*parts[:-1])
 
 
 def list_results(remote_path: str = "/") -> list[str]:
@@ -68,7 +94,7 @@ def download_results(
     Volume root (``/``) maps flatly onto ``local_dir`` (default ``./outputs``).
     """
     remote = _normalize_remote(remote_path)
-    dest = Path(local_dir).expanduser().resolve()
+    dest = resolve_local_dest(remote_path, local_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -86,8 +112,9 @@ def download_results(
 
     print(f"Downloading volume:{RESULTS_VOLUME_NAME}/{remote} -> {dest}")
     subprocess.run(cmd, check=True)
-    print(f"Saved to {dest}")
-    return dest
+    saved = dest / remote.split("/")[-1] if remote != "/" else dest
+    print(f"Saved to {saved}")
+    return saved
 
 
 @app.local_entrypoint()
