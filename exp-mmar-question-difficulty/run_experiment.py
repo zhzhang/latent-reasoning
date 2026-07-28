@@ -5,7 +5,7 @@ model (no rubric grading), then aggregates mean string-match success rates.
 
 Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
-  - step-audio-2-mini / mimo-audio-7b: vLLM-Omni 0.24
+  - mimo-audio-7b: vLLM-Omni 0.24
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
 
 Results layout on ``latent-reasoning-results``:
@@ -20,7 +20,7 @@ Results layout on ``latent-reasoning-results``:
 Prereqs:
 
     uv run modal run seed_volume.py --datasets mmar \\
-      --models af-next-think,step-audio-2-mini,mimo-audio-7b,interactive-omni-8b
+      --models af-next-think,mimo-audio-7b,interactive-omni-8b
 
 Usage:
 
@@ -491,12 +491,6 @@ def _run_model_eval(
 
     start_time = time.time()
     written = 0
-    empty_output = {
-        "model_output": "",
-        "raw_tokens": None,
-        "thinking_prediction": "",
-        "answer_prediction": "",
-    }
     for batch_start in range(0, len(pending), batch_size):
         batch = pending[batch_start : batch_start + batch_size]
         shot_outputs_by_index: list[list[dict]] = [[] for _ in batch]
@@ -516,13 +510,14 @@ def _run_model_eval(
             outputs = generate_batch(
                 model_label, handle, expanded, args, seeds=seeds
             )
-        except Exception as exc:  # noqa: BLE001 — keep run alive
-            print(
-                f"[{model_label}] FAIL batch "
+        except Exception as exc:
+            # Do not swallow OOMs / engine deaths into empty predictions — abort
+            # so resume can retry from the last committed batch.
+            raise RuntimeError(
+                f"[{model_label}] batch failed "
                 f"ids={[item['id'] for item in batch]} "
                 f"n_requests={len(expanded)}: {exc}"
-            )
-            outputs = [{**empty_output, "error": str(exc)} for _ in expanded]
+            ) from exc
         for (item_index, _shot_index), output in zip(owners, outputs):
             shot_outputs_by_index[item_index].append(output)
 
@@ -533,8 +528,8 @@ def _run_model_eval(
         write_jsonl(predictions_path, records, mode="a")
         # Durability before volume commit so a crash mid-batch does not lose
         # already-finished questions (resume skips committed ids).
-        with open(predictions_path, "rb") as handle:
-            os.fsync(handle.fileno())
+        with open(predictions_path, "rb") as pred_file:
+            os.fsync(pred_file.fileno())
         prev_written = written
         written += len(records)
         if print_every > 0:
@@ -577,18 +572,6 @@ def _run_model_eval(
 )
 def run_af_next(**kwargs) -> dict:
     return _run_model_eval(model_label="af-next-think", **kwargs)
-
-
-@app.function(
-    image=omni_image,
-    gpu="A100-80GB",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_step_audio(**kwargs) -> dict:
-    return _run_model_eval(model_label="step-audio-2-mini", **kwargs)
 
 
 @app.function(
@@ -732,7 +715,6 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
 
 _MODEL_FNS = {
     "af-next-think": run_af_next,
-    "step-audio-2-mini": run_step_audio,
     "mimo-audio-7b": run_mimo_audio,
     "interactive-omni-8b": run_interactive_omni,
 }

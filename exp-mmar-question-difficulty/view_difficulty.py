@@ -37,7 +37,6 @@ DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
 
 MODEL_LABELS = (
     "af-next-think",
-    "step-audio-2-mini",
     "mimo-audio-7b",
     "interactive-omni-8b",
 )
@@ -309,7 +308,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 const MODEL_LABELS = [
   "af-next-think",
-  "step-audio-2-mini",
   "mimo-audio-7b",
   "interactive-omni-8b",
 ];

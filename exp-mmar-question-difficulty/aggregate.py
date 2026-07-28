@@ -8,7 +8,6 @@ from typing import Any
 
 MODEL_LABELS = (
     "af-next-think",
-    "step-audio-2-mini",
     "mimo-audio-7b",
     "interactive-omni-8b",
 )

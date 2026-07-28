@@ -40,14 +40,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "enable_prefix_caching": True,
         },
     },
-    "step-audio-2-mini": {
-        "model_id": "stepfun-ai/Step-Audio-2-mini",
-        # Omni Thinker encoder profile needs headroom beyond L40S (~44GB).
-        "gpu": "A100-80GB",
-        "backend": "vllm_omni",
-        "deploy_config": str(DEPLOY_DIR / "step_audio_2_asr_throughput.yaml"),
-        "sampling_rate": 16000,
-    },
     "mimo-audio-7b": {
         "model_id": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
         "tokenizer_id": "XiaomiMiMo/MiMo-Audio-Tokenizer",
@@ -112,12 +104,25 @@ def _output_dict(
     }
 
 
-def _load_audio_tuple(path: str, sampling_rate: int) -> tuple[Any, int]:
+def _load_audio_tuple(
+    path: str,
+    sampling_rate: int,
+    *,
+    max_samples: int | None = None,
+) -> tuple[Any, int]:
     import librosa
     import numpy as np
 
     audio, sr = librosa.load(path, sr=sampling_rate, mono=True)
-    return audio.astype(np.float32), int(sr)
+    audio = audio.astype(np.float32)
+    if max_samples is not None and audio.shape[0] > max_samples:
+        audio = audio[: int(max_samples)]
+    return audio, int(sr)
+
+
+# Step-Audio2 encoder pos-embed is n_audio_ctx=1500 after stride-2 conv, so mel
+# frames must be <= 3000. At 16 kHz that is just under 30s (exactly 30s → 3002).
+STEP_AUDIO_MAX_SAMPLES = 479_680
 
 
 def _sampling_params_for_request(
@@ -528,11 +533,16 @@ def _build_vllm_audio_inputs(
     seeds: list[int],
     stop_token_ids: list[int] | None = None,
     repetition_penalty: float | None = None,
+    max_audio_samples: int | None = None,
 ) -> tuple[list[dict], list[Any]]:
     prompts: list[dict] = []
     sampling: list[Any] = []
     for sample, seed in zip(samples, seeds):
-        audio = _load_audio_tuple(sample["audio_path"], sampling_rate)
+        audio = _load_audio_tuple(
+            sample["audio_path"],
+            sampling_rate,
+            max_samples=max_audio_samples,
+        )
         prompts.append(
             {
                 "prompt": prompt_fn(sample),
@@ -636,6 +646,9 @@ def generate_batch(
             seeds=seeds,
             stop_token_ids=stop_token_ids,
             repetition_penalty=repetition_penalty,
+            max_audio_samples=(
+                STEP_AUDIO_MAX_SAMPLES if label == "step-audio-2-mini" else None
+            ),
         )
         # Text-only MMAR answers: prefer text modality so audio-token stages
         # are skipped / discouraged when the pipeline supports it.
@@ -857,7 +870,6 @@ def _generate_interactive_omni_hf(
 
 _LOADERS = {
     "af-next-think": load_af_next,
-    "step-audio-2-mini": load_step_audio,
     "mimo-audio-7b": load_mimo_audio,
     "interactive-omni-8b": load_interactive_omni,
 }

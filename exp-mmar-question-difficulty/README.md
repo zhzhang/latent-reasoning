@@ -4,7 +4,7 @@ Sample a fixed 200 MMAR questions, generate 10 responses per model at
 temperature 1.0 (string-match scoring only — no rubrics), then browse
 questions hardest-first by mean success rate.
 
-Inference uses **vLLM** (and **vLLM-Omni** for Step / MiMo) with continuous
+Inference uses **vLLM** (and **vLLM-Omni** for MiMo) with continuous
 batching for higher GPU throughput.
 
 ## Models
@@ -12,15 +12,16 @@ batching for higher GPU throughput.
 | Label | Checkpoint | Backend |
 |-------|------------|---------|
 | `af-next-think` | `nvidia/audio-flamingo-next-think-hf` | vLLM 0.24 MusicFlamingo (HF fallback) |
-| `step-audio-2-mini` | `stepfun-ai/Step-Audio-2-mini` | vLLM-Omni ASR stage (A100-80GB) |
 | `mimo-audio-7b` | `XiaomiMiMo/MiMo-Audio-7B-Instruct` (+ tokenizer) | vLLM-Omni |
 | `interactive-omni-8b` | `sensenova/InteractiveOmni-8B` | HF `.chat` (vLLM transformers backend incompatible) |
+
+`step-audio-2-mini` is temporarily excluded from difficulty aggregation.
 
 ## Seed
 
 ```bash
 uv run modal run seed_volume.py --datasets mmar \
-  --models af-next-think,step-audio-2-mini,mimo-audio-7b,interactive-omni-8b
+  --models af-next-think,mimo-audio-7b,interactive-omni-8b
 ```
 
 `mimo-audio-7b` also seeds `XiaomiMiMo/MiMo-Audio-Tokenizer` automatically.
