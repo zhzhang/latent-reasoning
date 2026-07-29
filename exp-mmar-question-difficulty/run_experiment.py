@@ -780,7 +780,7 @@ def prepare_run(
 
     Re-running with the same ``run_id`` reuses ``question_ids.json``, merges
     models into the existing manifest, and reports per-model progress so the
-    local entrypoint can skip already-complete workers.
+    pipeline orchestrator can skip already-complete workers.
     """
     _ensure_exp_path()
     volume.reload()
@@ -977,6 +977,208 @@ _MODEL_FNS = {
 }
 
 
+@app.function(
+    image=cpu_image,
+    timeout=24 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+)
+def run_pipeline(
+    models: str = "all",
+    num_samples: int = DEFAULT_NUM_SAMPLES,
+    n_shots: int = DEFAULT_N_SHOTS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_p: float = 1.0,
+    max_new_tokens: int = 512,
+    seed: int = DEFAULT_SEED,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_num_seqs: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    meta: str = str(DEFAULT_MMAR_META),
+    data_root: str = str(DEFAULT_MMAR_DATA_ROOT),
+    output_dir: str = str(DEFAULT_OUTPUT_DIR),
+    run_id: str | None = None,
+    print_every: int = 5,
+    aggregate_only: bool = False,
+    skip_aggregate: bool = False,
+    parallel_models: bool = True,
+    mode: str = DEFAULT_MODE,
+    source_run_id: str | None = None,
+    grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    grade_only: bool = False,
+    force_grade: bool = False,
+    grader_batch_size: int = 64,
+    skip_grade: bool = False,
+) -> dict:
+    """Remote orchestrator for prepare → models → grade → aggregate.
+
+    Runs on Modal so ``modal run --detach`` keeps the app alive across
+    phases. Orchestrating from ``@app.local_entrypoint`` fails after the
+    last model returns: with detach there are briefly no live inputs, the
+    ephemeral app stops, and the next ``.spawn()`` raises ConflictError.
+    """
+    resolved_run_id = run_id or make_run_id()
+    model_labels = parse_model_list(models)
+    prompt_mode = _normalize_mode(mode)
+    effective_source = _normalize_source_run_id(
+        source_run_id, mode=prompt_mode, num_samples=num_samples
+    )
+
+    if aggregate_only:
+        result = run_aggregate.remote(run_id=resolved_run_id, output_dir=output_dir)
+        print("Done (aggregate-only):", result)
+        return {
+            "run_id": resolved_run_id,
+            "mode": prompt_mode,
+            "aggregate_only": True,
+            "aggregate": result,
+        }
+
+    if grade_only:
+        grade = run_freeform_grade.remote(
+            run_id=resolved_run_id,
+            output_dir=output_dir,
+            model_labels=model_labels,
+            grader_model_id=grader_model_id,
+            batch_size=grader_batch_size,
+            force=force_grade,
+        )
+        print("Graded:", grade)
+        agg = None
+        if not skip_aggregate:
+            agg = run_aggregate.remote(
+                run_id=resolved_run_id, output_dir=output_dir
+            )
+            print("Aggregated:", agg)
+        return {
+            "run_id": resolved_run_id,
+            "mode": prompt_mode,
+            "grade_only": True,
+            "grade": grade,
+            "aggregate": agg,
+        }
+
+    common = dict(
+        run_id=resolved_run_id,
+        output_dir=output_dir,
+        meta=meta,
+        data_root=data_root,
+        num_samples=num_samples,
+        n_shots=n_shots,
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        seed=seed,
+        print_every=print_every,
+        batch_size=batch_size,
+        max_num_seqs=max_num_seqs,
+        gpu_memory_utilization=gpu_memory_utilization,
+        mode=prompt_mode,
+        source_run_id=effective_source,
+    )
+
+    print(
+        f"Experiment run_id={resolved_run_id} mode={prompt_mode} "
+        f"models={model_labels} num_samples={num_samples} n_shots={n_shots} "
+        f"temperature={temperature} batch_size={batch_size} "
+        f"parallel_models={parallel_models} inference=vllm "
+        f"source_run_id={effective_source}"
+    )
+
+    prep = prepare_run.remote(
+        run_id=resolved_run_id,
+        output_dir=output_dir,
+        model_labels=model_labels,
+        num_samples=num_samples,
+        n_shots=n_shots,
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        seed=seed,
+        meta=meta,
+        data_root=data_root,
+        batch_size=batch_size,
+        mode=prompt_mode,
+        source_run_id=effective_source,
+        grader_model_id=grader_model_id,
+    )
+
+    progress = prep.get("progress") or {}
+    pending_labels = [
+        label
+        for label in model_labels
+        if not (progress.get(label) or {}).get("complete")
+    ]
+    skipped_labels = [label for label in model_labels if label not in pending_labels]
+
+    if prep.get("resumed") or skipped_labels:
+        print(f"Resume check for run_id={resolved_run_id}:")
+        for label in model_labels:
+            info = progress.get(label) or {}
+            print(
+                f"  {label}: {info.get('n_done', 0)}/{info.get('n_total', '?')} "
+                f"{'complete — skip spawn' if label in skipped_labels else 'pending'}"
+            )
+
+    results: list[dict] = [
+        {
+            "status": "already_complete",
+            "model_label": label,
+            "n_predictions": (progress.get(label) or {}).get("n_done"),
+            "predictions_path": (progress.get(label) or {}).get("predictions_path"),
+        }
+        for label in skipped_labels
+    ]
+
+    if pending_labels:
+        if parallel_models and len(pending_labels) > 1:
+            calls = []
+            for label in pending_labels:
+                call = _MODEL_FNS[label].spawn(**common)
+                print(f"Spawned {label} call_id={call.object_id}")
+                calls.append((label, call))
+            for label, call in calls:
+                result = call.get()
+                print(f"Finished {label}:", result)
+                results.append(result)
+        else:
+            for label in pending_labels:
+                call = _MODEL_FNS[label].spawn(**common)
+                print(f"Spawned {label} call_id={call.object_id}")
+                result = call.get()
+                print(f"Finished {label}:", result)
+                results.append(result)
+    else:
+        print("All requested models already complete; skipping inference.")
+
+    grade = None
+    if prompt_mode == "freeform" and not skip_grade:
+        grade = run_freeform_grade.remote(
+            run_id=resolved_run_id,
+            output_dir=output_dir,
+            model_labels=model_labels,
+            grader_model_id=grader_model_id,
+            batch_size=grader_batch_size,
+            force=force_grade,
+        )
+        print("Graded:", grade)
+
+    if not skip_aggregate:
+        agg = run_aggregate.remote(run_id=resolved_run_id, output_dir=output_dir)
+        print("Aggregated:", agg)
+    else:
+        agg = None
+
+    return {
+        "run_id": resolved_run_id,
+        "mode": prompt_mode,
+        "models": results,
+        "grade": grade,
+        "aggregate": agg,
+        "pending_labels": pending_labels,
+        "skipped_labels": skipped_labels,
+    }
+
+
 @app.local_entrypoint()
 def main(
     models: str = "all",
@@ -1039,169 +1241,49 @@ def main(
         grader_batch_size: Shots per grader generate() call.
         skip_grade: Freeform generation without the Qwen grading pass.
     """
+    # One remote spawn owns the full prepare→infer→grade→aggregate chain so
+    # ``--detach`` does not stop the ephemeral app between phases.
     resolved_run_id = run_id or make_run_id()
-    model_labels = parse_model_list(models)
-    prompt_mode = _normalize_mode(mode)
-    effective_source = _normalize_source_run_id(
-        source_run_id, mode=prompt_mode, num_samples=num_samples
-    )
-
-    if aggregate_only:
-        result = run_aggregate.spawn(
-            run_id=resolved_run_id, output_dir=output_dir
-        ).get()
-        print("Done (aggregate-only):", result)
-        return
-
-    if grade_only:
-        grade = run_freeform_grade.spawn(
-            run_id=resolved_run_id,
-            output_dir=output_dir,
-            model_labels=model_labels,
-            grader_model_id=grader_model_id,
-            batch_size=grader_batch_size,
-            force=force_grade,
-        ).get()
-        print("Graded:", grade)
-        if not skip_aggregate:
-            agg = run_aggregate.spawn(
-                run_id=resolved_run_id, output_dir=output_dir
-            ).get()
-            print("Aggregated:", agg)
-        return
-
-    common = dict(
-        run_id=resolved_run_id,
-        output_dir=output_dir,
-        meta=meta,
-        data_root=data_root,
+    out = run_pipeline.spawn(
+        models=models,
         num_samples=num_samples,
         n_shots=n_shots,
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
         seed=seed,
-        print_every=print_every,
         batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
-        mode=prompt_mode,
-        source_run_id=effective_source,
-    )
-
-    print(
-        f"Experiment run_id={resolved_run_id} mode={prompt_mode} "
-        f"models={model_labels} num_samples={num_samples} n_shots={n_shots} "
-        f"temperature={temperature} batch_size={batch_size} "
-        f"parallel_models={parallel_models} inference=vllm "
-        f"source_run_id={effective_source}"
-    )
-
-    prep = prepare_run.spawn(
-        run_id=resolved_run_id,
-        output_dir=output_dir,
-        model_labels=model_labels,
-        num_samples=num_samples,
-        n_shots=n_shots,
-        temperature=temperature,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
-        seed=seed,
         meta=meta,
         data_root=data_root,
-        batch_size=batch_size,
-        mode=prompt_mode,
-        source_run_id=effective_source,
+        output_dir=output_dir,
+        run_id=resolved_run_id,
+        print_every=print_every,
+        aggregate_only=aggregate_only,
+        skip_aggregate=skip_aggregate,
+        parallel_models=parallel_models,
+        mode=mode,
+        source_run_id=source_run_id,
         grader_model_id=grader_model_id,
+        grade_only=grade_only,
+        force_grade=force_grade,
+        grader_batch_size=grader_batch_size,
+        skip_grade=skip_grade,
     ).get()
 
-    progress = prep.get("progress") or {}
-    pending_labels = [
-        label
-        for label in model_labels
-        if not (progress.get(label) or {}).get("complete")
-    ]
-    skipped_labels = [label for label in model_labels if label not in pending_labels]
-
-    if prep.get("resumed") or skipped_labels:
-        print(f"Resume check for run_id={resolved_run_id}:")
-        for label in model_labels:
-            info = progress.get(label) or {}
-            print(
-                f"  {label}: {info.get('n_done', 0)}/{info.get('n_total', '?')} "
-                f"{'complete — skip spawn' if label in skipped_labels else 'pending'}"
-            )
-
-    results: list[dict] = [
-        {
-            "status": "already_complete",
-            "model_label": label,
-            "n_predictions": (progress.get(label) or {}).get("n_done"),
-            "predictions_path": (progress.get(label) or {}).get("predictions_path"),
-        }
-        for label in skipped_labels
-    ]
-
-    if pending_labels:
-        if parallel_models and len(pending_labels) > 1:
-            calls = []
-            for label in pending_labels:
-                call = _MODEL_FNS[label].spawn(**common)
-                print(f"Spawned {label} call_id={call.object_id}")
-                calls.append((label, call))
-            for label, call in calls:
-                result = call.get()
-                print(f"Finished {label}:", result)
-                results.append(result)
-        else:
-            for label in pending_labels:
-                call = _MODEL_FNS[label].spawn(**common)
-                print(f"Spawned {label} call_id={call.object_id}")
-                result = call.get()
-                print(f"Finished {label}:", result)
-                results.append(result)
-    else:
-        print("All requested models already complete; skipping inference.")
-
-    grade = None
-    if prompt_mode == "freeform" and not skip_grade:
-        grade = run_freeform_grade.spawn(
-            run_id=resolved_run_id,
-            output_dir=output_dir,
-            model_labels=model_labels,
-            grader_model_id=grader_model_id,
-            batch_size=grader_batch_size,
-            force=force_grade,
-        ).get()
-        print("Graded:", grade)
-
-    if not skip_aggregate:
-        agg = run_aggregate.spawn(
-            run_id=resolved_run_id, output_dir=output_dir
-        ).get()
-        print("Aggregated:", agg)
-    else:
-        agg = None
-
-    print(
-        "Done:",
-        {
-            "run_id": resolved_run_id,
-            "mode": prompt_mode,
-            "models": results,
-            "grade": grade,
-            "aggregate": agg,
-        },
-    )
+    print("Done:", out)
+    rid = out.get("run_id") or resolved_run_id
+    prompt_mode = out.get("mode") or _normalize_mode(mode)
     print(
         "Download with:\n"
         f"  uv run modal run download_results.py "
-        f"--remote-path exp-mmar-question-difficulty/{resolved_run_id}"
+        f"--remote-path exp-mmar-question-difficulty/{rid}"
     )
-    if pending_labels or skipped_labels:
+    if out.get("pending_labels") or out.get("skipped_labels"):
         print(
             "To resume this run later:\n"
             f"  uv run modal run --detach "
             f"exp-mmar-question-difficulty/run_experiment.py "
-            f"--run-id {resolved_run_id} --mode {prompt_mode}"
+            f"--run-id {rid} --mode {prompt_mode}"
         )
