@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import sys
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +32,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 EXP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXP_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mmar_common import (  # noqa: E402
+    AF_NEXT_THINK_SUFFIX,
+    build_mmar_freeform_prompt,
+    build_mmar_prompt,
+)
+
 DEFAULT_RESULTS_DIR = REPO_ROOT / "outputs" / "exp-mmar-question-difficulty"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
 DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
@@ -39,9 +49,94 @@ MODEL_LABELS = (
     "af-next-think",
     "mimo-audio-7b",
     "interactive-omni-8b",
+    "qwen3-omni",
+    "voxtral-small-24b",
 )
 
 CONFIG: dict[str, Any] = {}
+
+
+def infer_run_mode(manifest: dict | None = None, scores: dict | None = None) -> str:
+    """Return ``freeform`` or ``mc`` from manifest / scores stamps."""
+    manifest = manifest or {}
+    scores = scores or {}
+    mode = str(manifest.get("mode") or scores.get("mode") or "").strip().lower()
+    if mode in {"freeform", "free_form", "free-form", "open"}:
+        return "freeform"
+    if mode in {"mc", "multiple_choice", "multiple-choice", "mcq", "choice"}:
+        return "mc"
+    scoring = str(
+        manifest.get("scoring") or scores.get("scoring") or ""
+    ).lower()
+    if "freeform" in scoring or "qwen_freeform" in scoring:
+        return "freeform"
+    return "mc"
+
+
+def mode_label(mode: str) -> str:
+    return "Freeform" if mode == "freeform" else "MCQ"
+
+
+def build_base_prompt(item: dict, mode: str, *, think_suffix: str | None = None) -> str:
+    if mode == "freeform":
+        return build_mmar_freeform_prompt(item, think_suffix=think_suffix)
+    return build_mmar_prompt(item, think_suffix=think_suffix)
+
+
+def build_model_prompts(item: dict, mode: str) -> dict[str, str]:
+    """Reconstruct the text prompts sent to each model for this question."""
+    base = build_base_prompt(item, mode)
+    af_base = build_base_prompt(item, mode, think_suffix=AF_NEXT_THINK_SUFFIX)
+    if mode == "freeform":
+        step_system = (
+            "You are an expert in audio analysis. "
+            "Listen carefully and answer the question accurately.\n"
+            f"{base}"
+        )
+    else:
+        step_system = (
+            "You are an expert in audio analysis. "
+            "Listen carefully and answer the multiple-choice question accurately.\n"
+            f"{base}"
+        )
+    return {
+        "shared": base,
+        "af-next-think": (
+            "<|im_start|>system\n"
+            "You are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"<sound>{af_base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "mimo-audio-7b": (
+            "<|im_start|>user\n"
+            f"<|sosp|><|empty|><|eosp|>{base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<think>\n\n</think>\n"
+        ),
+        "interactive-omni-8b": (
+            "[audio attached]\n"
+            f"{base}"
+        ),
+        "qwen3-omni": (
+            "<|im_start|>system\n"
+            "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
+            "Group, capable of perceiving auditory and visual inputs, as well as "
+            "generating text and speech.<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "voxtral-small-24b": (
+            "[audio attached]\n"
+            f"{base}"
+        ),
+        "step-audio-2-mini": (
+            f"<|im_start|>system\n{step_system}<|im_end|>\n"
+            "<|im_start|>user\n<audio_patch><|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+    }
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -73,6 +168,7 @@ def discover_runs(results_dir: Path) -> list[dict]:
         manifest = load_json(path / "manifest.json") or {}
         scores = load_json(path / "scores.json") or {}
         difficulty = path / "difficulty.jsonl"
+        mode = infer_run_mode(manifest, scores)
         runs.append(
             {
                 "id": path.name,
@@ -84,6 +180,13 @@ def discover_runs(results_dir: Path) -> list[dict]:
                 "seed": manifest.get("seed"),
                 "n_shots": manifest.get("n_shots"),
                 "temperature": manifest.get("temperature"),
+                "mode": mode,
+                "mode_label": mode_label(mode),
+                "scoring": manifest.get("scoring") or scores.get("scoring"),
+                "grader_model_id": manifest.get("grader_model_id")
+                or scores.get("grader_model_id"),
+                "source_run_id": manifest.get("source_run_id")
+                or scores.get("source_run_id"),
             }
         )
     return runs
@@ -103,12 +206,17 @@ def load_run_bundle(run_id: str) -> dict[str, Any]:
     for label in MODEL_LABELS:
         preds = load_jsonl(run_dir / "models" / label / "predictions.jsonl")
         predictions[label] = {str(p["id"]): p for p in preds if p.get("id")}
+    manifest = load_json(run_dir / "manifest.json") or {}
+    scores = load_json(run_dir / "scores.json") or {}
+    mode = infer_run_mode(manifest, scores)
     return {
         "difficulty": difficulty,
         "by_id": by_id,
         "predictions": predictions,
-        "scores": load_json(run_dir / "scores.json") or {},
-        "manifest": load_json(run_dir / "manifest.json") or {},
+        "scores": scores,
+        "manifest": manifest,
+        "mode": mode,
+        "mode_label": mode_label(mode),
     }
 
 
@@ -275,14 +383,93 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #f2f6f9; padding: 0.55rem 0.65rem; border-radius: 8px;
   }
   audio { width: 100%; margin-top: 0.5rem; }
+  .mode-badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem; font-weight: 500;
+    letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 0.2rem 0.55rem; border-radius: 999px;
+    border: 1px solid var(--line);
+    vertical-align: middle;
+  }
+  .mode-badge.mc {
+    color: #1a4a6e; background: #d9e8f3; border-color: #a9c4d8;
+  }
+  .mode-badge.freeform {
+    color: #5a3a12; background: #f3e6cf; border-color: #d4b88a;
+  }
+  .brand-row {
+    display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center;
+  }
+  .run-meta {
+    margin-top: 0.35rem; font-size: 0.82rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center;
+  }
+  .stats .mode-badge { margin-right: 0.15rem; }
+  details.accordion {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; margin: 0.75rem 0; overflow: hidden;
+  }
+  details.accordion > summary {
+    cursor: pointer; list-style: none;
+    padding: 0.75rem 0.9rem;
+    font-weight: 600; font-size: 0.92rem;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 0.75rem; user-select: none;
+  }
+  details.accordion > summary::-webkit-details-marker { display: none; }
+  details.accordion > summary::after {
+    content: "+";
+    font-family: "IBM Plex Mono", monospace;
+    color: var(--muted); font-weight: 500;
+  }
+  details.accordion[open] > summary {
+    border-bottom: 1px solid var(--line);
+    background: #f2f6f9;
+  }
+  details.accordion[open] > summary::after { content: "−"; }
+  .accordion-body { padding: 0.75rem 0.9rem; }
+  details.prompt-model {
+    border: 1px solid var(--line); border-radius: 8px;
+    margin: 0.5rem 0; background: #fbfcfd;
+  }
+  details.prompt-model > summary {
+    cursor: pointer; padding: 0.55rem 0.7rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.8rem; font-weight: 500;
+    list-style: none; display: flex; justify-content: space-between;
+  }
+  details.prompt-model > summary::-webkit-details-marker { display: none; }
+  details.prompt-model > summary::after {
+    content: "▸"; color: var(--muted);
+  }
+  details.prompt-model[open] > summary::after { content: "▾"; }
+  details.prompt-model pre {
+    margin: 0; border-radius: 0 0 8px 8px;
+    border-top: 1px solid var(--line);
+  }
+  .choice-box.hidden-from-model {
+    border-style: dashed; background: #faf7f2;
+  }
+  .choice-box .note {
+    font-size: 0.78rem; color: var(--muted); margin: 0.25rem 0 0.45rem;
+  }
+  .grader-note {
+    font-size: 0.78rem; color: var(--muted);
+    font-family: "IBM Plex Mono", monospace;
+  }
 </style>
 </head>
 <body>
 <header>
   <div class="header-inner">
     <div class="brand">
-      <h1>MMAR Question Difficulty</h1>
-      <p>Hardest-first by mean shot success rate across models</p>
+      <div class="brand-row">
+        <h1>MMAR Question Difficulty</h1>
+        <span id="mode-badge" class="mode-badge mc">MCQ</span>
+      </div>
+      <p id="brand-sub">Hardest-first by mean shot success rate across models</p>
+      <div class="run-meta" id="run-meta"></div>
     </div>
     <div class="controls">
       <label>Run
@@ -310,8 +497,19 @@ const MODEL_LABELS = [
   "af-next-think",
   "mimo-audio-7b",
   "interactive-omni-8b",
+  "qwen3-omni",
+  "voxtral-small-24b",
 ];
-const state = { runs: [], runId: "", questions: [], selectedId: null };
+const state = {
+  runs: [],
+  runId: "",
+  mode: "mc",
+  modeLabel: "MCQ",
+  manifest: {},
+  scores: {},
+  questions: [],
+  selectedId: null,
+};
 
 async function api(path) {
   const res = await fetch(path);
@@ -324,9 +522,40 @@ function fmtRate(v) {
   return (100 * Number(v)).toFixed(0) + "%";
 }
 
-function renderStats(scores) {
+function modeBadgeHtml(mode, label) {
+  const cls = mode === "freeform" ? "freeform" : "mc";
+  return `<span class="mode-badge ${cls}">${escapeHtml(label || (mode === "freeform" ? "Freeform" : "MCQ"))}</span>`;
+}
+
+function setHeaderMode(mode, modeLabel, manifest, scores) {
+  const badge = document.getElementById("mode-badge");
+  badge.className = `mode-badge ${mode === "freeform" ? "freeform" : "mc"}`;
+  badge.textContent = modeLabel || (mode === "freeform" ? "Freeform" : "MCQ");
+  const sub = document.getElementById("brand-sub");
+  if (mode === "freeform") {
+    sub.textContent = "Freeform answers · graded by Qwen judge · hardest-first";
+  } else {
+    sub.textContent = "Multiple-choice · string-match scoring · hardest-first";
+  }
+  const metaBits = [];
+  const scoring = manifest.scoring || scores.scoring;
+  if (scoring) metaBits.push(`scoring: ${scoring}`);
+  if (manifest.grader_model_id || scores.grader_model_id) {
+    metaBits.push(`grader: ${manifest.grader_model_id || scores.grader_model_id}`);
+  }
+  if (manifest.source_run_id || scores.source_run_id) {
+    metaBits.push(`source: ${manifest.source_run_id || scores.source_run_id}`);
+  }
+  if (manifest.n_shots || scores.n_shots) {
+    metaBits.push(`${manifest.n_shots || "—"} shots`);
+  }
+  document.getElementById("run-meta").textContent = metaBits.join(" · ");
+}
+
+function renderStats(scores, mode, modeLabel) {
   const by = scores.by_model || {};
   const parts = [
+    modeBadgeHtml(mode, modeLabel),
     `<span><strong>${scores.n_questions ?? "—"}</strong> questions</span>`,
     `<span>avg <strong>${fmtRate(scores.avg_success_rate)}</strong></span>`,
   ];
@@ -371,6 +600,39 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
+function renderPromptAccordion(prompts, mode) {
+  if (!prompts) return "";
+  const shared = prompts.shared || "";
+  const modelOrder = [
+    "af-next-think",
+    "mimo-audio-7b",
+    "interactive-omni-8b",
+    "qwen3-omni",
+    "voxtral-small-24b",
+    "step-audio-2-mini",
+  ];
+  const modelBlocks = modelOrder
+    .filter(label => prompts[label])
+    .map(label => `<details class="prompt-model">
+      <summary>${escapeHtml(label)}</summary>
+      <pre>${escapeHtml(prompts[label])}</pre>
+    </details>`)
+    .join("");
+  const modeNote = mode === "freeform"
+    ? "Question only — multiple-choice options were not shown to the model."
+    : "Multiple-choice prompt including the four options.";
+  return `<details class="accordion" open>
+    <summary><span>Full prompt</span></summary>
+    <div class="accordion-body">
+      <p class="muted" style="margin:0 0 0.55rem">${escapeHtml(modeNote)}</p>
+      <strong style="font-size:0.82rem;color:var(--muted)">Shared question text</strong>
+      <pre>${escapeHtml(shared)}</pre>
+      <strong style="display:block;margin-top:0.75rem;font-size:0.82rem;color:var(--muted)">Per-model chat wrappers</strong>
+      ${modelBlocks}
+    </div>
+  </details>`;
+}
+
 async function selectQuestion(id) {
   state.selectedId = id;
   renderList();
@@ -378,6 +640,8 @@ async function selectQuestion(id) {
   detail.innerHTML = `<p class="muted">Loading…</p>`;
   const data = await api(`/api/question?run=${encodeURIComponent(state.runId)}&id=${encodeURIComponent(id)}`);
   const row = data.difficulty;
+  const mode = data.mode || state.mode;
+  const modeLabel = data.mode_label || state.modeLabel;
   const choices = (row.choices || []).map((c, i) =>
     `<div>(${String.fromCharCode(65+i)}) ${escapeHtml(c)}</div>`
   ).join("");
@@ -392,11 +656,15 @@ async function selectQuestion(id) {
     const shots = pred.shots || [];
     const shotsHtml = shots.map(shot => {
       const ok = shot.correct;
+      const grader = shot.grader_output
+        ? `<span class="grader-note">judge: ${escapeHtml(shot.grader_output)}</span>`
+        : "";
       return `<div class="shot">
         <div class="shot-head">
           <span>shot ${shot.shot_index}</span>
           <span class="${ok ? "pass" : "fail"}">${ok ? "pass" : "fail"}</span>
           <span class="muted">parsed: ${escapeHtml(shot.answer_prediction || "")}</span>
+          ${grader}
         </div>
         <pre>${escapeHtml(shot.model_output || "")}</pre>
       </div>`;
@@ -411,12 +679,20 @@ async function selectQuestion(id) {
   const audio = data.audio_url
     ? `<audio controls preload="none" src="${data.audio_url}"></audio>`
     : `<p class="muted">Audio not found locally.</p>`;
+  const choicesClass = mode === "freeform" ? "choice-box hidden-from-model" : "choice-box";
+  const choicesTitle = mode === "freeform"
+    ? `<strong>Choices</strong><div class="note">Not shown to the model in freeform mode (gold answer reference only).</div>`
+    : `<strong>Choices</strong>`;
   detail.innerHTML = `
-    <div class="qid">${escapeHtml(row.id)}</div>
+    <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+      <div class="qid">${escapeHtml(row.id)}</div>
+      ${modeBadgeHtml(mode, modeLabel)}
+    </div>
     <h3 style="margin:0.4rem 0 0.2rem">${escapeHtml(row.question || "")}</h3>
     <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")} · avg ${fmtRate(row.avg_success_rate)}</p>
     ${audio}
-    <div class="choice-box"><strong>Choices</strong>${choices}</div>
+    ${renderPromptAccordion(data.prompts, mode)}
+    <div class="${choicesClass}">${choicesTitle}${choices}</div>
     <div class="answer-box"><strong>Gold</strong><div>${escapeHtml(row.answer || "")}</div></div>
     ${modelsHtml}
   `;
@@ -426,7 +702,12 @@ async function loadRun(runId) {
   state.runId = runId;
   const data = await api(`/api/questions?run=${encodeURIComponent(runId)}`);
   state.questions = data.questions || [];
-  renderStats(data.scores || {});
+  state.mode = data.mode || "mc";
+  state.modeLabel = data.mode_label || (state.mode === "freeform" ? "Freeform" : "MCQ");
+  state.manifest = data.manifest || {};
+  state.scores = data.scores || {};
+  setHeaderMode(state.mode, state.modeLabel, state.manifest, state.scores);
+  renderStats(state.scores, state.mode, state.modeLabel);
   state.selectedId = state.questions[0]?.id || null;
   renderList();
   if (state.selectedId) await selectQuestion(state.selectedId);
@@ -441,9 +722,11 @@ async function init() {
     document.getElementById("stats").textContent = "No runs under results dir.";
     return;
   }
-  sel.innerHTML = state.runs.map(r =>
-    `<option value="${r.id}">${r.id}${r.has_difficulty ? "" : " (no difficulty yet)"}</option>`
-  ).join("");
+  sel.innerHTML = state.runs.map(r => {
+    const tag = r.mode_label || (r.mode === "freeform" ? "Freeform" : "MCQ");
+    const avail = r.has_difficulty ? "" : " (no difficulty yet)";
+    return `<option value="${r.id}">[${tag}] ${r.id}${avail}</option>`;
+  }).join("");
   sel.addEventListener("change", () => loadRun(sel.value));
   document.getElementById("search").addEventListener("input", renderList);
   await loadRun(state.runs[0].id);
@@ -501,6 +784,8 @@ class Handler(BaseHTTPRequestHandler):
                     "questions": bundle["difficulty"],
                     "scores": bundle["scores"],
                     "manifest": bundle["manifest"],
+                    "mode": bundle["mode"],
+                    "mode_label": bundle["mode_label"],
                 }
             )
             return
@@ -524,11 +809,20 @@ class Handler(BaseHTTPRequestHandler):
             audio_url = None
             if audio is not None:
                 audio_url = f"/audio/{audio.name}"
+            # Prefer a prediction record (has full item fields) when building prompts.
+            sample = next(
+                (preds[label] for label in MODEL_LABELS if preds.get(label)),
+                row,
+            )
+            prompts = build_model_prompts(sample, bundle["mode"])
             self._send_json(
                 {
                     "difficulty": row,
                     "predictions": preds,
                     "audio_url": audio_url,
+                    "mode": bundle["mode"],
+                    "mode_label": bundle["mode_label"],
+                    "prompts": prompts,
                 }
             )
             return

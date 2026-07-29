@@ -111,6 +111,19 @@ def build_mmar_prompt(item, think_suffix: str | None = None):
     return prompt
 
 
+def build_mmar_freeform_prompt(item, think_suffix: str | None = None):
+    """Prompt the model with the question only (no multiple-choice options)."""
+    question = str(item["question"]).strip()
+    prompt = (
+        f"{question}\n"
+        "Listen to the audio and answer the question. "
+        "Give a concise final answer."
+    )
+    if think_suffix:
+        prompt += f"\n{think_suffix}"
+    return prompt
+
+
 def _match_choice_in_text(text, choices):
     matched = []
     for index, choice in enumerate(choices):
@@ -200,6 +213,39 @@ def parse_think_tagged_output(raw_text, choices):
     return parse_choice_output(text, choices)
 
 
+def parse_freeform_output(raw_text, choices=None):
+    """Split free-form model text into (thinking, answer) without choice matching.
+
+    ``choices`` is accepted for API compatibility with choice parsers but ignored.
+    """
+    del choices  # unused — free-form answers are not constrained to options
+    text = (raw_text or "").strip()
+    if not text:
+        return "", ""
+
+    match = THINK_BLOCK_RE.search(text)
+    if match:
+        thinking_prediction = match.group(1).strip()
+        remainder = (text[: match.start()] + text[match.end() :]).strip()
+        if remainder:
+            return thinking_prediction, remainder
+        return thinking_prediction, thinking_prediction
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for marker in ANSWER_MARKERS:
+        match = re.search(marker + r"(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        answer_prediction = match.group(1).strip().splitlines()[0].strip()
+        answer_index = text.lower().rfind(answer_prediction.lower())
+        thinking = text[:answer_index].strip() if answer_index > 0 else ""
+        return thinking, answer_prediction
+
+    if len(lines) > 1:
+        return "\n".join(lines[:-1]).strip(), lines[-1]
+    return "", text
+
+
 def string_match(answer, prediction, choices):
     """MMAR answer match: GT tokens present, no exclusive tokens from wrong choices."""
 
@@ -230,26 +276,56 @@ def score_answer_prediction(item: dict, answer_prediction: str) -> bool:
     )
 
 
-def aggregate_n_shot_record(item: dict, shot_outputs: list[dict]) -> dict:
-    """Build one prediction record from ``n`` independent generation outputs."""
+def aggregate_n_shot_record(
+    item: dict,
+    shot_outputs: list[dict],
+    *,
+    score_fn: Callable[[dict, str], bool | None] | None = None,
+    pending_grade: bool = False,
+) -> dict:
+    """Build one prediction record from ``n`` independent generation outputs.
+
+    Args:
+        score_fn: Optional ``(item, answer_prediction) -> bool | None``. Defaults
+            to string-match scoring. Pass a no-op / ``None``-returning fn together
+            with ``pending_grade=True`` when an external judge will score later.
+        pending_grade: When True, leave correctness fields for a later grading pass
+            (``correct`` / rates stay ``None`` until graded).
+    """
+    if score_fn is None and not pending_grade:
+        score_fn = score_answer_prediction
+
     shots = []
     for shot_index, output in enumerate(shot_outputs):
-        correct = score_answer_prediction(item, output.get("answer_prediction", ""))
-        shots.append(
-            {
-                "shot_index": shot_index,
-                "model_output": output.get("model_output"),
-                "raw_tokens": output.get("raw_tokens"),
-                "thinking_prediction": output.get("thinking_prediction"),
-                "answer_prediction": output.get("answer_prediction"),
-                "correct": correct,
-            }
-        )
+        answer_prediction = output.get("answer_prediction", "")
+        if pending_grade:
+            correct = None
+        else:
+            correct = score_fn(item, answer_prediction)
+        shot = {
+            "shot_index": shot_index,
+            "model_output": output.get("model_output"),
+            "raw_tokens": output.get("raw_tokens"),
+            "thinking_prediction": output.get("thinking_prediction"),
+            "answer_prediction": answer_prediction,
+            "correct": correct,
+        }
+        if pending_grade:
+            shot["pending_grade"] = True
+        shots.append(shot)
 
     n_shots = len(shots)
-    n_shot_correct = sum(1 for shot in shots if shot["correct"])
-    primary = next((shot for shot in shots if shot["correct"]), shots[0])
-    return {
+    if pending_grade:
+        n_shot_correct = None
+        shot_success_rate = None
+        any_correct = None
+        primary = shots[0] if shots else {}
+    else:
+        n_shot_correct = sum(1 for shot in shots if shot["correct"])
+        shot_success_rate = (n_shot_correct / n_shots) if n_shots else 0.0
+        any_correct = n_shot_correct > 0
+        primary = next((shot for shot in shots if shot["correct"]), shots[0])
+    record = {
         **item,
         "model_output": primary.get("model_output"),
         "raw_tokens": primary.get("raw_tokens"),
@@ -257,10 +333,32 @@ def aggregate_n_shot_record(item: dict, shot_outputs: list[dict]) -> dict:
         "answer_prediction": primary.get("answer_prediction"),
         "n_shots": n_shots,
         "shots": shots,
-        "correct": n_shot_correct > 0,
+        "correct": any_correct,
         "n_shot_correct": n_shot_correct,
-        "shot_success_rate": (n_shot_correct / n_shots) if n_shots else 0.0,
+        "shot_success_rate": shot_success_rate,
     }
+    if pending_grade:
+        record["pending_grade"] = True
+    return record
+
+
+def recompute_n_shot_scores(record: dict) -> dict:
+    """Recompute aggregate correctness fields from per-shot ``correct`` flags."""
+    shots = list(record.get("shots") or [])
+    n_shots = len(shots)
+    n_shot_correct = sum(1 for shot in shots if shot.get("correct"))
+    primary = next((shot for shot in shots if shot.get("correct")), shots[0] if shots else {})
+    record["n_shots"] = n_shots
+    record["n_shot_correct"] = n_shot_correct
+    record["shot_success_rate"] = (n_shot_correct / n_shots) if n_shots else 0.0
+    record["correct"] = n_shot_correct > 0
+    if primary:
+        record["model_output"] = primary.get("model_output")
+        record["raw_tokens"] = primary.get("raw_tokens")
+        record["thinking_prediction"] = primary.get("thinking_prediction")
+        record["answer_prediction"] = primary.get("answer_prediction")
+    record.pop("pending_grade", None)
+    return record
 
 
 # ---------------------------------------------------------------------------

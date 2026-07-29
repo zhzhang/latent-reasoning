@@ -1,12 +1,19 @@
 """MMAR question-difficulty experiment on Modal (vLLM / vLLM-Omni).
 
 Samples a fixed 200 MMAR questions, runs 10 temperature=1.0 responses per
-model (no rubric grading), then aggregates mean string-match success rates.
+model, then aggregates mean success rates.
+
+Modes:
+  - ``mc`` (default): multiple-choice prompts + string-match scoring
+  - ``freeform``: question-only prompts; Qwen2.5-3B-Instruct grades each shot
+    against the gold answer
 
 Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
   - mimo-audio-7b: vLLM-Omni 0.24
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
+  - qwen3-omni: vLLM 0.26 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
+  - voxtral-small-24b: vLLM 0.26 Mistral-format audio
 
 Results layout on ``latent-reasoning-results``:
 
@@ -20,11 +27,16 @@ Results layout on ``latent-reasoning-results``:
 Prereqs:
 
     uv run modal run seed_volume.py --datasets mmar \\
-      --models af-next-think,mimo-audio-7b,interactive-omni-8b
+      --models af-next-think,mimo-audio-7b,interactive-omni-8b,qwen3-omni,voxtral-small-24b
+    # Freeform grading also needs:
+    uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
 
 Usage:
 
     uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py
+    # Free-form + Qwen judge on the same 200 ids as a prior MC run:
+    uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py \\
+      --mode freeform --source-run-id 20260727T154400Z
     uv run modal run exp-mmar-question-difficulty/run_experiment.py \\
       --models af-next-think --num-samples 8 --batch-size 8
     # Resume after a crash (reuse question set; skip finished models /
@@ -101,6 +113,9 @@ DEFAULT_N_SHOTS = 10
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_SEED = 42
 DEFAULT_BATCH_SIZE = 16
+DEFAULT_MODE = "mc"
+DEFAULT_SOURCE_RUN_ID = "20260727T154400Z"
+DEFAULT_GRADER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 
 # ---------------------------------------------------------------------------
 # Images
@@ -225,6 +240,29 @@ interactive_omni_image = (
     .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
 )
 
+# Qwen3-Omni thinker + Voxtral Small (A100-80GB); needs mistral-common[audio] + PyAV.
+large_mm_image = (
+    _cuda_base_image()
+    .uv_pip_install(
+        "vllm[audio]==0.26.0",
+        "transformers>=5.5.3",
+        "mistral-common[audio]",
+        "huggingface-hub>=0.30.0",
+        "librosa>=0.11.0",
+        "soundfile",
+        "soxr",
+        "av",
+        "numpy",
+        "tqdm>=4.67.0",
+        "accelerate>=1.14.0",
+        "torch",
+        "torchaudio",
+    )
+    .env(_VLLM_CACHE_ENV)
+    .add_local_python_source(*_SHARED_SOURCES)
+    .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
+)
+
 # Lightweight CPU image for manifest / question-id helpers.
 cpu_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -233,6 +271,9 @@ cpu_image = (
     .add_local_python_source(*_SHARED_SOURCES)
     .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
 )
+
+# Text-only freeform grader (Qwen2.5-3B-Instruct via vLLM).
+grader_image = _vllm_image(vllm_version="0.24.0")
 
 app = modal.App("exp-mmar-question-difficulty")
 
@@ -310,6 +351,43 @@ def _model_progress(
     }
 
 
+def _normalize_mode(mode: str | None) -> str:
+    value = str(mode or DEFAULT_MODE).strip().lower()
+    if value in {"freeform", "free_form", "free-form", "open"}:
+        return "freeform"
+    if value in {"mc", "multiple_choice", "multiple-choice", "choice"}:
+        return "mc"
+    raise ValueError(f"Unknown mode {mode!r}; expected 'mc' or 'freeform'")
+
+
+def _scoring_label(mode: str) -> str:
+    return (
+        "qwen_freeform_judge"
+        if mode == "freeform"
+        else "string_match_no_rubric"
+    )
+
+
+def _normalize_source_run_id(
+    source_run_id: str | None,
+    *,
+    mode: str,
+    num_samples: int | None = None,
+) -> str | None:
+    """Resolve source-run-id; freeform defaults to the fixed MC difficulty set."""
+    if source_run_id is not None:
+        value = str(source_run_id).strip()
+        if not value or value.lower() in {"none", "null", "-"}:
+            return None
+        return value
+    # Only auto-pin the prior 200-id set for full freeform runs.
+    if mode == "freeform" and (
+        num_samples is None or int(num_samples) == DEFAULT_NUM_SAMPLES
+    ):
+        return DEFAULT_SOURCE_RUN_ID
+    return None
+
+
 def _ensure_question_ids(
     run_dir: Path,
     *,
@@ -318,6 +396,8 @@ def _ensure_question_ids(
     num_samples: int,
     seed: int,
     start: int = 0,
+    source_run_id: str | None = None,
+    output_dir: str | None = None,
 ) -> list[str]:
     ids_path = run_dir / "question_ids.json"
     if ids_path.exists():
@@ -326,6 +406,40 @@ def _ensure_question_ids(
         if ids:
             print(f"Reusing {len(ids)} question ids from {ids_path}")
             return ids
+
+    # Copy the fixed question set from a prior run when requested.
+    if source_run_id:
+        source_root = (
+            Path(output_dir).expanduser().resolve()
+            if output_dir
+            else run_dir.parent
+        )
+        source_ids_path = source_root / source_run_id / "question_ids.json"
+        if not source_ids_path.exists():
+            raise SystemExit(
+                f"source-run-id={source_run_id} question_ids not found at "
+                f"{source_ids_path}"
+            )
+        payload = json.loads(source_ids_path.read_text(encoding="utf-8"))
+        ids = [str(x) for x in payload.get("ids", [])]
+        if not ids:
+            raise SystemExit(f"No ids in source question set: {source_ids_path}")
+        copied = {
+            "seed": payload.get("seed", seed),
+            "start": payload.get("start", start),
+            "num_samples": payload.get("num_samples", num_samples),
+            "n": len(ids),
+            "ids": ids,
+            "source_run_id": source_run_id,
+            "source_path": str(source_ids_path),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_json(ids_path, copied)
+        results_volume.commit()
+        print(
+            f"Copied {len(ids)} question ids from {source_run_id} -> {ids_path}"
+        )
+        return ids
 
     meta_items = load_jsonl(meta_path)
     pool = meta_items[start:]
@@ -403,12 +517,17 @@ def _run_model_eval(
     gpu_memory_utilization: float | None = None,
     model_id: str | None = None,
     tokenizer_id: str | None = None,
+    mode: str = DEFAULT_MODE,
+    source_run_id: str | None = None,
 ) -> dict:
     """Load one model and write n-shot predictions for the fixed question set."""
     _ensure_exp_path()
 
     volume.reload()
     results_volume.reload()
+
+    prompt_mode = _normalize_mode(mode)
+    pending_grade = prompt_mode == "freeform"
 
     spec = MODEL_SPECS[model_label]
     args = SimpleNamespace(
@@ -438,6 +557,7 @@ def _run_model_eval(
         batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
+        prompt_mode=prompt_mode,
     )
 
     run_dir = _run_dir(output_dir, run_id)
@@ -464,6 +584,8 @@ def _run_model_eval(
         data_root=data_root_path,
         num_samples=num_samples,
         seed=seed,
+        source_run_id=source_run_id,
+        output_dir=output_dir,
     )
     items = _load_selected_items(meta_path, data_root_path, question_ids)
     selected_ids = {str(item["id"]) for item in items}
@@ -473,7 +595,7 @@ def _run_model_eval(
     n_done = len(completed & selected_ids)
     pending = [item for item in items if str(item["id"]) not in completed]
     print(
-        f"[{model_label}] backend={spec.get('backend')} "
+        f"[{model_label}] backend={spec.get('backend')} mode={prompt_mode} "
         f"{len(items)} selected, {n_done} done, {len(pending)} pending "
         f"(n_shots={n_shots}, temperature={temperature}, batch_size={batch_size})"
     )
@@ -484,6 +606,7 @@ def _run_model_eval(
             "model_label": model_label,
             "n_predictions": n_done,
             "predictions_path": str(predictions_path),
+            "mode": prompt_mode,
         }
 
     handle = load_model(model_label, args)
@@ -522,7 +645,11 @@ def _run_model_eval(
             shot_outputs_by_index[item_index].append(output)
 
         records = [
-            aggregate_n_shot_record(item, shot_outputs)
+            aggregate_n_shot_record(
+                item,
+                shot_outputs,
+                pending_grade=pending_grade,
+            )
             for item, shot_outputs in zip(batch, shot_outputs_by_index)
         ]
         write_jsonl(predictions_path, records, mode="a")
@@ -537,11 +664,15 @@ def _run_model_eval(
             for offset, record in enumerate(records, start=1):
                 idx = prev_written + offset
                 if idx % print_every == 0 or idx == len(pending):
+                    if pending_grade:
+                        score_msg = "pending_grade"
+                    else:
+                        score_msg = (
+                            f"shots={record['n_shot_correct']}/{record['n_shots']}"
+                        )
                     print(
                         f"[{model_label}] {idx}/{len(pending)} "
-                        f"id={record['id']} "
-                        f"shots={record['n_shot_correct']}/{record['n_shots']} "
-                        f"({elapsed:.0f}s)"
+                        f"id={record['id']} {score_msg} ({elapsed:.0f}s)"
                     )
         results_volume.commit()
 
@@ -554,6 +685,7 @@ def _run_model_eval(
         "n_predictions": total,
         "predictions_path": str(predictions_path),
         "backend": active_backend,
+        "mode": prompt_mode,
     }
 
 
@@ -599,6 +731,30 @@ def run_interactive_omni(**kwargs) -> dict:
 
 
 @app.function(
+    image=large_mm_image,
+    gpu="A100-80GB",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_qwen3_omni(**kwargs) -> dict:
+    return _run_model_eval(model_label="qwen3-omni", **kwargs)
+
+
+@app.function(
+    image=large_mm_image,
+    gpu="A100-80GB",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_voxtral(**kwargs) -> dict:
+    return _run_model_eval(model_label="voxtral-small-24b", **kwargs)
+
+
+@app.function(
     image=cpu_image,
     timeout=30 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
@@ -616,6 +772,9 @@ def prepare_run(
     meta: str,
     data_root: str,
     batch_size: int,
+    mode: str = DEFAULT_MODE,
+    source_run_id: str | None = None,
+    grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
 ) -> dict:
     """Create question_ids + manifest before parallel model workers start.
 
@@ -627,6 +786,12 @@ def prepare_run(
     volume.reload()
     results_volume.reload()
 
+    prompt_mode = _normalize_mode(mode)
+    # Freeform defaults to the fixed MC difficulty question set unless overridden.
+    effective_source = _normalize_source_run_id(
+        source_run_id, mode=prompt_mode, num_samples=num_samples
+    )
+
     run_dir = _run_dir(output_dir, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     meta_path = Path(meta).expanduser().resolve()
@@ -637,6 +802,8 @@ def prepare_run(
         data_root=data_root_path,
         num_samples=num_samples,
         seed=seed,
+        source_run_id=effective_source,
+        output_dir=output_dir,
     )
 
     now = datetime.now(timezone.utc).isoformat()
@@ -663,6 +830,7 @@ def prepare_run(
     manifest = {
         "run_id": run_id,
         "experiment": "exp-mmar-question-difficulty",
+        "mode": existing.get("mode") or prompt_mode,
         "models": merged_models,
         "num_samples": existing.get("num_samples", num_samples),
         "n_shots": existing.get("n_shots", n_shots),
@@ -671,7 +839,12 @@ def prepare_run(
         "max_new_tokens": existing.get("max_new_tokens", max_new_tokens),
         "seed": existing.get("seed", seed),
         "batch_size": batch_size,
-        "scoring": "string_match_no_rubric",
+        "scoring": existing.get("scoring") or _scoring_label(prompt_mode),
+        "grader_model_id": (
+            existing.get("grader_model_id")
+            or (grader_model_id if prompt_mode == "freeform" else None)
+        ),
+        "source_run_id": existing.get("source_run_id") or effective_source,
         "inference": "vllm",
         "n_questions": len(question_ids),
         "created_at": existing.get("created_at") or now,
@@ -694,6 +867,8 @@ def prepare_run(
         "progress": progress,
         "question_ids": question_ids,
         "resumed": is_resume,
+        "mode": prompt_mode,
+        "source_run_id": effective_source,
     }
 
 
@@ -708,15 +883,97 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
     if not run_dir.exists():
         raise SystemExit(f"Run dir not found: {run_dir}")
     result = aggregate_difficulty(run_dir, model_labels=DEFAULT_MODEL_LABELS)
+    # Stamp scoring mode from manifest when present.
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            scores = result.get("scores") or {}
+            if manifest.get("scoring"):
+                scores["scoring"] = manifest["scoring"]
+            if manifest.get("mode"):
+                scores["mode"] = manifest["mode"]
+            if manifest.get("grader_model_id"):
+                scores["grader_model_id"] = manifest["grader_model_id"]
+            if manifest.get("source_run_id"):
+                scores["source_run_id"] = manifest["source_run_id"]
+            write_json(run_dir / "scores.json", scores)
+            result["scores"] = scores
+        except json.JSONDecodeError:
+            pass
     results_volume.commit()
     print("Aggregated:", result.get("scores"))
     return result
+
+
+@app.function(
+    image=grader_image,
+    gpu="L40S",
+    timeout=6 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=32768,
+)
+def run_freeform_grade(
+    run_id: str,
+    output_dir: str = str(DEFAULT_OUTPUT_DIR),
+    model_labels: list[str] | None = None,
+    grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    batch_size: int = 64,
+    force: bool = False,
+) -> dict:
+    """Grade free-form predictions with Qwen2.5-3B-Instruct."""
+    _ensure_exp_path()
+    from grader import grade_predictions_file, load_grader
+
+    volume.reload()
+    results_volume.reload()
+
+    run_dir = _run_dir(output_dir, run_id)
+    if not run_dir.exists():
+        raise SystemExit(f"Run dir not found: {run_dir}")
+
+    labels = list(model_labels or DEFAULT_MODEL_LABELS)
+    handle = load_grader(grader_model_id)
+    per_model: dict[str, dict] = {}
+    for label in labels:
+        predictions_path = run_dir / "models" / label / "predictions.jsonl"
+        print(f"[grader] grading {label} -> {predictions_path}")
+        per_model[label] = grade_predictions_file(
+            predictions_path,
+            handle,
+            batch_size=batch_size,
+            force=force,
+        )
+        results_volume.commit()
+        print(f"[grader] {label}:", per_model[label])
+
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            manifest = {}
+        manifest["scoring"] = "qwen_freeform_judge"
+        manifest["grader_model_id"] = grader_model_id
+        manifest["graded_at"] = datetime.now(timezone.utc).isoformat()
+        write_json(manifest_path, manifest)
+
+    results_volume.commit()
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "grader_model_id": grader_model_id,
+        "by_model": per_model,
+    }
 
 
 _MODEL_FNS = {
     "af-next-think": run_af_next,
     "mimo-audio-7b": run_mimo_audio,
     "interactive-omni-8b": run_interactive_omni,
+    "qwen3-omni": run_qwen3_omni,
+    "voxtral-small-24b": run_voxtral,
 }
 
 
@@ -740,6 +997,13 @@ def main(
     aggregate_only: bool = False,
     skip_aggregate: bool = False,
     parallel_models: bool = True,
+    mode: str = DEFAULT_MODE,
+    source_run_id: str | None = None,
+    grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    grade_only: bool = False,
+    force_grade: bool = False,
+    grader_batch_size: int = 64,
+    skip_grade: bool = False,
 ):
     """Launch the MMAR question-difficulty experiment.
 
@@ -765,15 +1029,45 @@ def main(
         aggregate_only: Skip inference; only build difficulty.jsonl.
         skip_aggregate: Run models but skip final aggregation.
         parallel_models: Spawn all model workers concurrently (default True).
+        mode: ``mc`` (choices + string match) or ``freeform`` (no choices;
+            Qwen2.5-3B grades each shot).
+        source_run_id: Copy ``question_ids.json`` from this prior run.
+            Freeform defaults to ``20260727T154400Z``.
+        grader_model_id: Hugging Face id for the freeform judge.
+        grade_only: Skip generation; only run the freeform grader.
+        force_grade: Re-grade shots even if already graded.
+        grader_batch_size: Shots per grader generate() call.
+        skip_grade: Freeform generation without the Qwen grading pass.
     """
     resolved_run_id = run_id or make_run_id()
     model_labels = parse_model_list(models)
+    prompt_mode = _normalize_mode(mode)
+    effective_source = _normalize_source_run_id(
+        source_run_id, mode=prompt_mode, num_samples=num_samples
+    )
 
     if aggregate_only:
         result = run_aggregate.spawn(
             run_id=resolved_run_id, output_dir=output_dir
         ).get()
         print("Done (aggregate-only):", result)
+        return
+
+    if grade_only:
+        grade = run_freeform_grade.spawn(
+            run_id=resolved_run_id,
+            output_dir=output_dir,
+            model_labels=model_labels,
+            grader_model_id=grader_model_id,
+            batch_size=grader_batch_size,
+            force=force_grade,
+        ).get()
+        print("Graded:", grade)
+        if not skip_aggregate:
+            agg = run_aggregate.spawn(
+                run_id=resolved_run_id, output_dir=output_dir
+            ).get()
+            print("Aggregated:", agg)
         return
 
     common = dict(
@@ -791,12 +1085,16 @@ def main(
         batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
+        mode=prompt_mode,
+        source_run_id=effective_source,
     )
 
     print(
-        f"Experiment run_id={resolved_run_id} models={model_labels} "
-        f"num_samples={num_samples} n_shots={n_shots} temperature={temperature} "
-        f"batch_size={batch_size} parallel_models={parallel_models} inference=vllm"
+        f"Experiment run_id={resolved_run_id} mode={prompt_mode} "
+        f"models={model_labels} num_samples={num_samples} n_shots={n_shots} "
+        f"temperature={temperature} batch_size={batch_size} "
+        f"parallel_models={parallel_models} inference=vllm "
+        f"source_run_id={effective_source}"
     )
 
     prep = prepare_run.spawn(
@@ -812,6 +1110,9 @@ def main(
         meta=meta,
         data_root=data_root,
         batch_size=batch_size,
+        mode=prompt_mode,
+        source_run_id=effective_source,
+        grader_model_id=grader_model_id,
     ).get()
 
     progress = prep.get("progress") or {}
@@ -862,6 +1163,18 @@ def main(
     else:
         print("All requested models already complete; skipping inference.")
 
+    grade = None
+    if prompt_mode == "freeform" and not skip_grade:
+        grade = run_freeform_grade.spawn(
+            run_id=resolved_run_id,
+            output_dir=output_dir,
+            model_labels=model_labels,
+            grader_model_id=grader_model_id,
+            batch_size=grader_batch_size,
+            force=force_grade,
+        ).get()
+        print("Graded:", grade)
+
     if not skip_aggregate:
         agg = run_aggregate.spawn(
             run_id=resolved_run_id, output_dir=output_dir
@@ -870,7 +1183,16 @@ def main(
     else:
         agg = None
 
-    print("Done:", {"run_id": resolved_run_id, "models": results, "aggregate": agg})
+    print(
+        "Done:",
+        {
+            "run_id": resolved_run_id,
+            "mode": prompt_mode,
+            "models": results,
+            "grade": grade,
+            "aggregate": agg,
+        },
+    )
     print(
         "Download with:\n"
         f"  uv run modal run download_results.py "
@@ -881,5 +1203,5 @@ def main(
             "To resume this run later:\n"
             f"  uv run modal run --detach "
             f"exp-mmar-question-difficulty/run_experiment.py "
-            f"--run-id {resolved_run_id}"
+            f"--run-id {resolved_run_id} --mode {prompt_mode}"
         )

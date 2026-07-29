@@ -10,6 +10,8 @@ MODEL_LABELS = (
     "af-next-think",
     "mimo-audio-7b",
     "interactive-omni-8b",
+    "qwen3-omni",
+    "voxtral-small-24b",
 )
 
 
@@ -160,11 +162,21 @@ def aggregate_difficulty(
         }
 
     overall_rates = [r["avg_success_rate"] for r in difficulty_rows if r["n_models_scored"]]
+    # Prefer per-record scoring stamp (freeform judge) when present.
+    scoring = "mean_shot_success_rate_string_match"
+    for label in model_labels:
+        for record in by_model.get(label, {}).values():
+            if record.get("scoring"):
+                scoring = f"mean_shot_success_rate_{record['scoring']}"
+                break
+        else:
+            continue
+        break
     scores = {
         "n_questions": len(difficulty_rows),
         "n_models": len(model_labels),
         "model_labels": list(model_labels),
-        "scoring": "mean_shot_success_rate_string_match",
+        "scoring": scoring,
         "sort": "avg_success_rate_asc_hardest_first",
         "avg_success_rate": (
             sum(overall_rates) / len(overall_rates) if overall_rates else None

@@ -14,6 +14,7 @@ Layout on the ``latent-reasoning`` Volume:
       latent_w_remap.safetensors   # ridge latent-CoT remapping (AF-Next)
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
+    /models/mistralai/Voxtral-Small-24B-2507/
     ...
 
 Consumers can mount the whole Volume, or use subpaths::
@@ -77,6 +78,9 @@ MODEL_ALIASES: dict[str, str] = {
     "qwen3-omni-thinking": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-4b-thinking": "Qwen/Qwen3-4B-Thinking-2507",
+    "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen-3b": "Qwen/Qwen2.5-3B-Instruct",
     "step-audio-2-mini": "stepfun-ai/Step-Audio-2-mini",
     "step-audio-2": "stepfun-ai/Step-Audio-2-mini",
     "mimo-audio-7b": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
@@ -84,6 +88,9 @@ MODEL_ALIASES: dict[str, str] = {
     "mimo-audio-tokenizer": "XiaomiMiMo/MiMo-Audio-Tokenizer",
     "interactive-omni-8b": "sensenova/InteractiveOmni-8B",
     "interactive-omni": "sensenova/InteractiveOmni-8B",
+    "voxtral-small-24b": "mistralai/Voxtral-Small-24B-2507",
+    "voxtral-small": "mistralai/Voxtral-Small-24B-2507",
+    "voxtral": "mistralai/Voxtral-Small-24B-2507",
 }
 
 # Aliases that should also seed companion repos (e.g. MiMo tokenizer).
@@ -102,9 +109,11 @@ ALL_MODELS = (
     "qwen3-omni",
     "qwen3-4b",
     "qwen3-4b-thinking",
+    "qwen2.5-3b",
     "step-audio-2-mini",
     "mimo-audio-7b",
     "interactive-omni-8b",
+    "voxtral-small-24b",
 )
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)

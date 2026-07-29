@@ -10,8 +10,10 @@ from typing import Any, Callable
 from audio_flamingo_runtime import resolve_model_dir
 from mmar_common import (
     AF_NEXT_THINK_SUFFIX,
+    build_mmar_freeform_prompt,
     build_mmar_prompt,
     parse_choice_output,
+    parse_freeform_output,
     parse_think_tagged_output,
 )
 
@@ -64,6 +66,51 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "trust_remote_code": True,
             "model_impl": "transformers",
             "enable_prefix_caching": True,
+        },
+    },
+    # MoE thinker-only (~3B active); fits one A100-80GB via plain vLLM.
+    "qwen3-omni": {
+        "model_id": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
+        "gpu": "A100-80GB",
+        "backend": "vllm",
+        "engine": {
+            "dtype": "bfloat16",
+            # Prompt audio + long Thinking CoT (max_tokens=16384).
+            "max_model_len": 32768,
+            "max_num_seqs": 4,
+            "gpu_memory_utilization": 0.9,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "enable_prefix_caching": True,
+        },
+        "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "max_tokens": 16384,
+        },
+    },
+    # Dense 24B; ~55GB bf16 — needs A100-80GB. Mistral tokenizer/format.
+    "voxtral-small-24b": {
+        "model_id": "mistralai/Voxtral-Small-24B-2507",
+        "gpu": "A100-80GB",
+        "backend": "vllm_voxtral",
+        "engine": {
+            "dtype": "bfloat16",
+            "max_model_len": 8192,
+            "max_num_seqs": 4,
+            "gpu_memory_utilization": 0.9,
+            "limit_mm_per_prompt": {"audio": 1},
+            "config_format": "mistral",
+            "load_format": "mistral",
+            "tokenizer_mode": "mistral",
+            "enforce_eager": True,
+            "enable_chunked_prefill": False,
+        },
+        "sampling": {
+            "temperature": 0.2,
+            "top_p": 0.95,
         },
     },
 }
@@ -131,6 +178,7 @@ def _sampling_params_for_request(
     *,
     stop_token_ids: list[int] | None = None,
     repetition_penalty: float | None = None,
+    overrides: dict[str, Any] | None = None,
 ):
     from vllm import SamplingParams
 
@@ -148,6 +196,8 @@ def _sampling_params_for_request(
     }
     if stop_token_ids:
         kwargs["stop_token_ids"] = list(stop_token_ids)
+    if overrides:
+        kwargs.update(overrides)
     return SamplingParams(**kwargs)
 
 
@@ -176,13 +226,37 @@ def _extract_text(output: Any) -> str:
     return str(output)
 
 
+def _prompt_mode(args: SimpleNamespace) -> str:
+    mode = str(getattr(args, "prompt_mode", "mc") or "mc").lower()
+    return "freeform" if mode in {"freeform", "free_form", "open"} else "mc"
+
+
+def _build_prompt(sample: dict, args: SimpleNamespace, *, think_suffix: str | None = None) -> str:
+    if _prompt_mode(args) == "freeform":
+        return build_mmar_freeform_prompt(sample, think_suffix=think_suffix)
+    return build_mmar_prompt(sample, think_suffix=think_suffix)
+
+
+def _parse_fn_for(args: SimpleNamespace, default: Callable = parse_choice_output) -> Callable:
+    if _prompt_mode(args) == "freeform":
+        if default is parse_think_tagged_output:
+            # Free-form still strips <think> blocks; choice matching is skipped.
+            return parse_freeform_output
+        return parse_freeform_output
+    return default
+
+
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
 
 
-def _af_next_prompt(sample: dict) -> str:
-    question = build_mmar_prompt(sample, think_suffix=AF_NEXT_THINK_SUFFIX)
+def _af_next_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    question = _build_prompt(
+        sample,
+        args or SimpleNamespace(prompt_mode="mc"),
+        think_suffix=AF_NEXT_THINK_SUFFIX,
+    )
     # MusicFlamingo / AF-Next chat format (same placeholder family as AF3).
     return (
         "<|im_start|>system\n"
@@ -193,13 +267,21 @@ def _af_next_prompt(sample: dict) -> str:
     )
 
 
-def _step_audio_prompt(sample: dict) -> str:
-    question = build_mmar_prompt(sample)
-    system = (
-        "You are an expert in audio analysis. "
-        "Listen carefully and answer the multiple-choice question accurately.\n"
-        f"{question}"
-    )
+def _step_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    ns = args or SimpleNamespace(prompt_mode="mc")
+    question = _build_prompt(sample, ns)
+    if _prompt_mode(ns) == "freeform":
+        system = (
+            "You are an expert in audio analysis. "
+            "Listen carefully and answer the question accurately.\n"
+            f"{question}"
+        )
+    else:
+        system = (
+            "You are an expert in audio analysis. "
+            "Listen carefully and answer the multiple-choice question accurately.\n"
+            f"{question}"
+        )
     return (
         f"<|im_start|>system\n{system}<|im_end|>\n"
         "<|im_start|>user\n<audio_patch><|im_end|>\n"
@@ -207,8 +289,8 @@ def _step_audio_prompt(sample: dict) -> str:
     )
 
 
-def _mimo_audio_prompt(sample: dict) -> str:
-    question = build_mmar_prompt(sample)
+def _mimo_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     # Placeholder audio span; waveform is supplied via multi_modal_data.
     return (
         "<|im_start|>user\n"
@@ -218,8 +300,8 @@ def _mimo_audio_prompt(sample: dict) -> str:
     )
 
 
-def _interactive_omni_messages(sample: dict) -> list[dict]:
-    prompt = build_mmar_prompt(sample)
+def _interactive_omni_messages(sample: dict, args: SimpleNamespace | None = None) -> list[dict]:
+    prompt = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     return [
         {
             "role": "user",
@@ -229,6 +311,23 @@ def _interactive_omni_messages(sample: dict) -> list[dict]:
             ],
         }
     ]
+
+
+QWEN3_OMNI_SYSTEM = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
+    "Group, capable of perceiving auditory and visual inputs, as well as "
+    "generating text and speech."
+)
+
+
+def _qwen3_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
+    return (
+        f"<|im_start|>system\n{QWEN3_OMNI_SYSTEM}<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"<|audio_start|><|audio_pad|><|audio_end|>{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +618,66 @@ def _load_interactive_omni_hf(local_id: str):
     }
 
 
+def _apply_engine_overrides(engine: dict, args: SimpleNamespace) -> dict:
+    out = dict(engine)
+    if getattr(args, "max_num_seqs", None):
+        out["max_num_seqs"] = int(args.max_num_seqs)
+    if getattr(args, "gpu_memory_utilization", None):
+        out["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
+    return out
+
+
+def load_qwen3_omni(args: SimpleNamespace):
+    """Qwen3-Omni Thinking via plain vLLM thinker-only path."""
+    from vllm import LLM
+
+    spec = MODEL_SPECS["qwen3-omni"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+    llm = LLM(model=local_id, **engine)
+    print(f"Qwen3-Omni vLLM thinker ready from {local_id} engine={engine}")
+    return {
+        "backend": "vllm",
+        "llm": llm,
+        "parse_fn": parse_think_tagged_output,
+    }
+
+
+def _load_voxtral_tokenizer(local_id: str):
+    """Load Mistral tokenizer from a seeded local dir, else Hub."""
+    try:
+        from vllm.tokenizers.mistral import MistralTokenizer
+    except ImportError:
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+
+    for name in ("tekken.json", "tokenizer.model.v3", "tokenizer.model"):
+        candidate = Path(local_id) / name
+        if candidate.is_file() and hasattr(MistralTokenizer, "from_file"):
+            return MistralTokenizer.from_file(str(candidate))
+    if hasattr(MistralTokenizer, "from_pretrained"):
+        return MistralTokenizer.from_pretrained(local_id)
+    return MistralTokenizer.from_hf_hub(local_id)
+
+
+def load_voxtral(args: SimpleNamespace):
+    """Voxtral Small 24B via vLLM with Mistral audio tokenization."""
+    from vllm import LLM
+
+    spec = MODEL_SPECS["voxtral-small-24b"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+    llm = LLM(model=local_id, **engine)
+    tokenizer = _load_voxtral_tokenizer(local_id)
+    print(f"Voxtral vLLM ready from {local_id} engine={engine}")
+    return {
+        "backend": "vllm_voxtral",
+        "llm": llm,
+        "tokenizer": tokenizer,
+        "model_id": local_id,
+        "parse_fn": parse_choice_output,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Batch generators
 # ---------------------------------------------------------------------------
@@ -534,6 +693,7 @@ def _build_vllm_audio_inputs(
     stop_token_ids: list[int] | None = None,
     repetition_penalty: float | None = None,
     max_audio_samples: int | None = None,
+    sampling_overrides: dict[str, Any] | None = None,
 ) -> tuple[list[dict], list[Any]]:
     prompts: list[dict] = []
     sampling: list[Any] = []
@@ -555,6 +715,7 @@ def _build_vllm_audio_inputs(
                 seed,
                 stop_token_ids=stop_token_ids,
                 repetition_penalty=repetition_penalty,
+                overrides=sampling_overrides,
             )
         )
     return prompts, sampling
@@ -577,18 +738,23 @@ def generate_batch(
         raise ValueError("seeds length must match samples length")
 
     backend = handle["backend"]
-    parse_fn = handle.get("parse_fn", parse_choice_output)
+    parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output))
 
     if backend == "vllm":
-        prompt_fn = _af_next_prompt if label == "af-next-think" else (
-            lambda s: build_mmar_prompt(s)
-        )
+        if label == "af-next-think":
+            prompt_fn = lambda s: _af_next_prompt(s, args)  # noqa: E731
+        elif label == "qwen3-omni":
+            prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
+        else:
+            prompt_fn = lambda s: _build_prompt(s, args)  # noqa: E731
+        sampling_overrides = MODEL_SPECS.get(label, {}).get("sampling")
         prompts, sampling = _build_vllm_audio_inputs(
             samples,
             prompt_fn=prompt_fn,
             sampling_rate=16000,
             args=args,
             seeds=seeds,
+            sampling_overrides=sampling_overrides,
         )
         outputs = handle["llm"].generate(prompts, sampling_params=sampling)
         return [
@@ -611,10 +777,10 @@ def generate_batch(
                     handle["processor"],
                     [sample],
                     args,
-                    build_prompt=lambda item: build_mmar_prompt(
-                        item, think_suffix=AF_NEXT_THINK_SUFFIX
+                    build_prompt=lambda item: _build_prompt(
+                        item, args, think_suffix=AF_NEXT_THINK_SUFFIX
                     ),
-                    parse_output=parse_think_tagged_output,
+                    parse_output=parse_fn,
                     generation_extra={
                         "repetition_penalty": float(
                             getattr(args, "repetition_penalty", 1.2)
@@ -626,14 +792,14 @@ def generate_batch(
 
     if backend == "vllm_omni":
         if label == "step-audio-2-mini":
-            prompt_fn = _step_audio_prompt
+            prompt_fn = lambda s: _step_audio_prompt(s, args)  # noqa: E731
             # Step-Audio2 Thinker can emit audio tokens (ids >= 151696). Without
             # stopping at Qwen <|im_end|>, ASR-style text answers detokenize to
             # empty after the thinker filters to text-only tokens (< 151688).
             stop_token_ids = [151645]
             repetition_penalty = 1.05
         elif label == "mimo-audio-7b":
-            prompt_fn = _mimo_audio_prompt
+            prompt_fn = lambda s: _mimo_audio_prompt(s, args)  # noqa: E731
             stop_token_ids = None
             repetition_penalty = None
         else:
@@ -669,13 +835,16 @@ def generate_batch(
         ]
 
     if backend == "vllm_chat":
-        messages = [_interactive_omni_messages(sample) for sample in samples]
+        messages = [_interactive_omni_messages(sample, args) for sample in samples]
         sampling = [_sampling_params_for_request(args, seed) for seed in seeds]
         outputs = handle["llm"].chat(messages, sampling_params=sampling)
         return [
             _output_dict(_extract_text(out), sample.get("choices") or [], parse_fn=parse_fn)
             for sample, out in zip(samples, outputs)
         ]
+
+    if backend == "vllm_voxtral":
+        return _generate_voxtral_batch(handle, samples, args, seeds, parse_fn=parse_fn)
 
     if backend == "hf_chat":
         return [
@@ -684,6 +853,51 @@ def generate_batch(
         ]
 
     raise ValueError(f"Unknown backend {backend!r} for {label}")
+
+
+def _build_voxtral_request(
+    tokenizer: Any,
+    sample: dict,
+    args: SimpleNamespace,
+) -> dict:
+    """Build a Voxtral offline prompt (token ids + audio arrays)."""
+    from mistral_common.protocol.instruct.chunk import AudioChunk, TextChunk
+    from mistral_common.protocol.instruct.messages import UserMessage
+    from mistral_common.tokens.tokenizers.audio import Audio
+
+    question = _build_prompt(sample, args)
+    audio = Audio.from_file(sample["audio_path"], strict=False)
+    messages = [
+        UserMessage(
+            content=[AudioChunk.from_audio(audio), TextChunk(text=question)]
+        ).to_openai()
+    ]
+    prompt_token_ids = tokenizer.apply_chat_template(messages=messages)
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
+    }
+
+
+def _generate_voxtral_batch(
+    handle: dict,
+    samples: list[dict],
+    args: SimpleNamespace,
+    seeds: list[int],
+    *,
+    parse_fn: Callable,
+) -> list[dict]:
+    tokenizer = handle["tokenizer"]
+    prompts = [_build_voxtral_request(tokenizer, sample, args) for sample in samples]
+    overrides = MODEL_SPECS["voxtral-small-24b"].get("sampling")
+    sampling = [
+        _sampling_params_for_request(args, seed, overrides=overrides) for seed in seeds
+    ]
+    outputs = handle["llm"].generate(prompts, sampling_params=sampling)
+    return [
+        _output_dict(_extract_text(out), sample.get("choices") or [], parse_fn=parse_fn)
+        for sample, out in zip(samples, outputs)
+    ]
 
 
 def _omni_stage_params(stage0, *, stages: int):
@@ -833,7 +1047,7 @@ def _generate_interactive_omni_hf(
     from audio_flamingo_runtime import seed_everything
 
     seed_everything(seed)
-    prompt = build_mmar_prompt(sample)
+    prompt = _build_prompt(sample, args)
     messages = [
         {
             "role": "user",
@@ -861,7 +1075,11 @@ def _generate_interactive_omni_hf(
         )
     if isinstance(response, tuple):
         response = response[0]
-    return _output_dict(str(response or ""), sample.get("choices") or [])
+    return _output_dict(
+        str(response or ""),
+        sample.get("choices") or [],
+        parse_fn=_parse_fn_for(args, parse_choice_output),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +1090,8 @@ _LOADERS = {
     "af-next-think": load_af_next,
     "mimo-audio-7b": load_mimo_audio,
     "interactive-omni-8b": load_interactive_omni,
+    "qwen3-omni": load_qwen3_omni,
+    "voxtral-small-24b": load_voxtral,
 }
 
 
