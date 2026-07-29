@@ -1,7 +1,7 @@
 """MMAR question-difficulty experiment on Modal (vLLM / vLLM-Omni).
 
-Samples a fixed 200 MMAR questions, runs 10 temperature=1.0 responses per
-model, then aggregates mean success rates.
+Samples a fixed 200 MMAR questions, runs 10 temperature samples per
+model (per-model SamplingParams), then aggregates mean success rates.
 
 Modes:
   - ``mc`` (default): multiple-choice prompts + string-match scoring
@@ -38,7 +38,7 @@ Usage:
     uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py \\
       --mode freeform --source-run-id 20260727T154400Z
     uv run modal run exp-mmar-question-difficulty/run_experiment.py \\
-      --models af-next-think --num-samples 8 --batch-size 8
+      --models af-next-think --num-samples 8 --n-shots 2
     # Resume after a crash (reuse question set; skip finished models /
     # already-written questions):
     uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py \\
@@ -84,9 +84,11 @@ from aggregate import aggregate_difficulty  # noqa: E402
 from models import (  # noqa: E402
     ALL_MODEL_LABELS,
     MODEL_SPECS,
+    backend_duplicates_shots,
     generate_batch,
     load_model,
     parse_model_list,
+    resolve_sampling,
 )
 from mmar_common import (  # noqa: E402
     aggregate_n_shot_record,
@@ -110,9 +112,7 @@ from modal_cache import (  # noqa: E402
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 DEFAULT_NUM_SAMPLES = 200
 DEFAULT_N_SHOTS = 10
-DEFAULT_TEMPERATURE = 1.0
 DEFAULT_SEED = 42
-DEFAULT_BATCH_SIZE = 16
 DEFAULT_MODE = "mc"
 DEFAULT_SOURCE_RUN_ID = "20260727T154400Z"
 DEFAULT_GRADER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
@@ -507,12 +507,11 @@ def _run_model_eval(
     data_root: str,
     num_samples: int,
     n_shots: int,
-    temperature: float,
-    top_p: float,
-    max_new_tokens: int,
     seed: int,
     print_every: int,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_new_tokens: int | None = None,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
     model_id: str | None = None,
@@ -540,25 +539,25 @@ def _run_model_eval(
         output_dir=output_dir,
         num_samples=num_samples,
         n_shots=n_shots,
+        # Optional CLI overrides (None → use MODEL_SPECS[label].sampling).
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
         seed=seed,
         torch_dtype="bfloat16",
-        repetition_penalty=(
-            1.2
-            if model_label == "af-next-think"
-            else 1.05
-            if model_label.startswith("step")
-            else 1.1
-        ),
         print_every=print_every,
         run_id=run_id,
-        batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
         prompt_mode=prompt_mode,
     )
+    sampling = resolve_sampling(model_label, args)
+    # Materialize effective sampling for HF fallbacks / logging.
+    args.temperature = float(sampling["temperature"])
+    args.top_p = float(sampling.get("top_p", 1.0))
+    args.max_new_tokens = int(sampling["max_tokens"])
+    args.repetition_penalty = float(sampling.get("repetition_penalty", 1.0))
+    args.sampling = sampling
 
     run_dir = _run_dir(output_dir, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -597,7 +596,7 @@ def _run_model_eval(
     print(
         f"[{model_label}] backend={spec.get('backend')} mode={prompt_mode} "
         f"{len(items)} selected, {n_done} done, {len(pending)} pending "
-        f"(n_shots={n_shots}, temperature={temperature}, batch_size={batch_size})"
+        f"(n_shots={n_shots}, sampling={sampling})"
     )
 
     if not pending:
@@ -611,73 +610,98 @@ def _run_model_eval(
 
     handle = load_model(model_label, args)
     active_backend = handle.get("backend", spec.get("backend"))
+    # Omni / HF cannot fork SamplingParams(n>1); expand question×shot rows.
+    # Plain vLLM uses n=n_shots on one prompt per question (shared prefill).
+    # Submit all pending in one generate() so vLLM continuous-batches.
+    duplicate_shots = backend_duplicates_shots(str(active_backend))
 
     start_time = time.time()
-    written = 0
-    for batch_start in range(0, len(pending), batch_size):
-        batch = pending[batch_start : batch_start + batch_size]
-        shot_outputs_by_index: list[list[dict]] = [[] for _ in batch]
+    shot_outputs_by_index: list[list[dict]] = [[] for _ in pending]
 
-        # Flatten question×shot into one generate queue so vLLM can continuous-
-        # batch and reuse prefixes across shots. Omni regroups by shot inside
-        # generate_batch (stage SamplingParams are shared per call).
-        expanded: list[dict] = []
+    if duplicate_shots:
+        gen_samples: list[dict] = []
         seeds: list[int] = []
         owners: list[tuple[int, int]] = []
-        for item_index, item in enumerate(batch):
+        for item_index, item in enumerate(pending):
             for shot_index in range(n_shots):
-                expanded.append(item)
+                gen_samples.append(item)
                 seeds.append(_shot_seed(seed, str(item["id"]), shot_index))
                 owners.append((item_index, shot_index))
-        try:
-            outputs = generate_batch(
-                model_label, handle, expanded, args, seeds=seeds
-            )
-        except Exception as exc:
-            # Do not swallow OOMs / engine deaths into empty predictions — abort
-            # so resume can retry from the last committed batch.
-            raise RuntimeError(
-                f"[{model_label}] batch failed "
-                f"ids={[item['id'] for item in batch]} "
-                f"n_requests={len(expanded)}: {exc}"
-            ) from exc
-        for (item_index, _shot_index), output in zip(owners, outputs):
-            shot_outputs_by_index[item_index].append(output)
-
-        records = [
-            aggregate_n_shot_record(
-                item,
-                shot_outputs,
-                pending_grade=pending_grade,
-            )
-            for item, shot_outputs in zip(batch, shot_outputs_by_index)
+        n_completions = 1
+        n_requests = len(gen_samples)
+    else:
+        gen_samples = list(pending)
+        seeds = [_shot_seed(seed, str(item["id"]), 0) for item in pending]
+        owners = [
+            (item_index, shot_index)
+            for item_index in range(len(pending))
+            for shot_index in range(n_shots)
         ]
-        write_jsonl(predictions_path, records, mode="a")
-        # Durability before volume commit so a crash mid-batch does not lose
-        # already-finished questions (resume skips committed ids).
-        with open(predictions_path, "rb") as pred_file:
-            os.fsync(pred_file.fileno())
-        prev_written = written
-        written += len(records)
-        if print_every > 0:
-            elapsed = time.time() - start_time
-            for offset, record in enumerate(records, start=1):
-                idx = prev_written + offset
-                if idx % print_every == 0 or idx == len(pending):
-                    if pending_grade:
-                        score_msg = "pending_grade"
-                    else:
-                        score_msg = (
-                            f"shots={record['n_shot_correct']}/{record['n_shots']}"
-                        )
-                    print(
-                        f"[{model_label}] {idx}/{len(pending)} "
-                        f"id={record['id']} {score_msg} ({elapsed:.0f}s)"
+        n_completions = n_shots
+        n_requests = len(gen_samples)
+
+    print(
+        f"[{model_label}] generate n_questions={len(pending)} "
+        f"n_requests={n_requests} n_completions={n_completions}"
+    )
+    try:
+        outputs = generate_batch(
+            model_label,
+            handle,
+            gen_samples,
+            args,
+            seeds=seeds,
+            n_completions=n_completions,
+        )
+    except Exception as exc:
+        # Offline generate is all-or-nothing; resume retries the same pending set.
+        raise RuntimeError(
+            f"[{model_label}] generate failed "
+            f"n_questions={len(pending)} "
+            f"n_requests={n_requests} n_completions={n_completions}: {exc}"
+        ) from exc
+    if len(outputs) != len(owners):
+        raise RuntimeError(
+            f"[{model_label}] expected {len(owners)} shot outputs, "
+            f"got {len(outputs)}"
+        )
+    for (item_index, _shot_index), output in zip(owners, outputs):
+        shot_outputs_by_index[item_index].append(output)
+
+    records = [
+        aggregate_n_shot_record(
+            item,
+            shot_outputs,
+            pending_grade=pending_grade,
+        )
+        for item, shot_outputs in zip(pending, shot_outputs_by_index)
+    ]
+    write_jsonl(predictions_path, records, mode="a")
+    with open(predictions_path, "rb") as pred_file:
+        os.fsync(pred_file.fileno())
+    results_volume.commit()
+
+    written = len(records)
+    elapsed = time.time() - start_time
+    if print_every > 0:
+        for idx, record in enumerate(records, start=1):
+            if idx % print_every == 0 or idx == written:
+                if pending_grade:
+                    score_msg = "pending_grade"
+                else:
+                    score_msg = (
+                        f"shots={record['n_shot_correct']}/{record['n_shots']}"
                     )
-        results_volume.commit()
+                print(
+                    f"[{model_label}] {idx}/{written} "
+                    f"id={record['id']} {score_msg} ({elapsed:.0f}s)"
+                )
 
     total = len(_load_completed_prediction_ids(predictions_path) & selected_ids)
-    print(f"[{model_label}] done: wrote {written} new, total={total}")
+    print(
+        f"[{model_label}] done: wrote {written} new, total={total} "
+        f"({elapsed:.0f}s)"
+    )
     return {
         "status": "ok",
         "model_label": model_label,
@@ -765,13 +789,12 @@ def prepare_run(
     model_labels: list[str],
     num_samples: int,
     n_shots: int,
-    temperature: float,
-    top_p: float,
-    max_new_tokens: int,
     seed: int,
     meta: str,
     data_root: str,
-    batch_size: int,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_new_tokens: int | None = None,
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
@@ -827,6 +850,15 @@ def prepare_run(
         for label in merged_models
     }
 
+    override_ns = SimpleNamespace(
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+    )
+    model_sampling = {
+        label: resolve_sampling(label, override_ns) for label in merged_models
+    }
+
     manifest = {
         "run_id": run_id,
         "experiment": "exp-mmar-question-difficulty",
@@ -834,11 +866,14 @@ def prepare_run(
         "models": merged_models,
         "num_samples": existing.get("num_samples", num_samples),
         "n_shots": existing.get("n_shots", n_shots),
-        "temperature": existing.get("temperature", temperature),
-        "top_p": existing.get("top_p", top_p),
-        "max_new_tokens": existing.get("max_new_tokens", max_new_tokens),
         "seed": existing.get("seed", seed),
-        "batch_size": batch_size,
+        # Per-model SamplingParams (no global temperature / top_p / max_tokens).
+        "model_sampling": model_sampling,
+        "sampling_overrides": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_new_tokens": max_new_tokens,
+        },
         "scoring": existing.get("scoring") or _scoring_label(prompt_mode),
         "grader_model_id": (
             existing.get("grader_model_id")
@@ -856,6 +891,7 @@ def prepare_run(
                 "model_id": MODEL_SPECS[label]["model_id"],
                 "backend": MODEL_SPECS[label].get("backend"),
                 "gpu": MODEL_SPECS[label].get("gpu"),
+                "sampling": MODEL_SPECS[label].get("sampling"),
             }
             for label in ALL_MODEL_LABELS
         },
@@ -986,11 +1022,10 @@ def run_pipeline(
     models: str = "all",
     num_samples: int = DEFAULT_NUM_SAMPLES,
     n_shots: int = DEFAULT_N_SHOTS,
-    temperature: float = DEFAULT_TEMPERATURE,
-    top_p: float = 1.0,
-    max_new_tokens: int = 512,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_new_tokens: int | None = None,
     seed: int = DEFAULT_SEED,
-    batch_size: int = DEFAULT_BATCH_SIZE,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
     meta: str = str(DEFAULT_MMAR_META),
@@ -1069,7 +1104,6 @@ def run_pipeline(
         max_new_tokens=max_new_tokens,
         seed=seed,
         print_every=print_every,
-        batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
         mode=prompt_mode,
@@ -1079,9 +1113,10 @@ def run_pipeline(
     print(
         f"Experiment run_id={resolved_run_id} mode={prompt_mode} "
         f"models={model_labels} num_samples={num_samples} n_shots={n_shots} "
-        f"temperature={temperature} batch_size={batch_size} "
         f"parallel_models={parallel_models} inference=vllm "
-        f"source_run_id={effective_source}"
+        f"source_run_id={effective_source} "
+        f"sampling_overrides={{temperature={temperature}, top_p={top_p}, "
+        f"max_new_tokens={max_new_tokens}}}"
     )
 
     prep = prepare_run.remote(
@@ -1090,13 +1125,12 @@ def run_pipeline(
         model_labels=model_labels,
         num_samples=num_samples,
         n_shots=n_shots,
-        temperature=temperature,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
         seed=seed,
         meta=meta,
         data_root=data_root,
-        batch_size=batch_size,
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
         mode=prompt_mode,
         source_run_id=effective_source,
         grader_model_id=grader_model_id,
@@ -1184,11 +1218,10 @@ def main(
     models: str = "all",
     num_samples: int = DEFAULT_NUM_SAMPLES,
     n_shots: int = DEFAULT_N_SHOTS,
-    temperature: float = DEFAULT_TEMPERATURE,
-    top_p: float = 1.0,
-    max_new_tokens: int = 512,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_new_tokens: int | None = None,
     seed: int = DEFAULT_SEED,
-    batch_size: int = DEFAULT_BATCH_SIZE,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
     meta: str = str(DEFAULT_MMAR_META),
@@ -1212,15 +1245,16 @@ def main(
     Args:
         models: Comma-separated labels or ``all``.
         num_samples: Fixed question sample size (default 200).
-        n_shots: Independent generations per question (default 10).
-        temperature: Sampling temperature (default 1.0).
-        top_p: Nucleus sampling parameter.
-        max_new_tokens: Generation length cap.
-        seed: RNG seed for question sampling and per-shot reseeding.
-        batch_size: Questions per checkpoint wave; all n_shots for those
-            questions go in one generate() queue (Omni regroups by shot).
-        max_num_seqs: Optional override for vLLM continuous-batch width.
-        gpu_memory_utilization: Optional override for vLLM GPU memory fraction.
+        n_shots: Independent temperature samples per question (default 10).
+            Plain vLLM uses SamplingParams(n=...) shared prefill; Omni/HF
+            duplicate prompts per shot. All pending questions go in one
+            offline generate() so vLLM continuous-batches.
+        temperature: Optional override of each model's sampling temperature.
+        top_p: Optional override of each model's top_p.
+        max_new_tokens: Optional override of each model's max_tokens.
+        seed: RNG seed for question sampling and per-question sample seeds.
+        max_num_seqs: Optional vLLM override (escape hatch; prefer defaults).
+        gpu_memory_utilization: Optional vLLM GPU memory fraction override.
         meta: Path to MMAR-meta.jsonl on the data volume.
         data_root: MMAR root used to resolve audio paths.
         output_dir: Results volume directory for run folders.
@@ -1252,7 +1286,6 @@ def main(
         top_p=top_p,
         max_new_tokens=max_new_tokens,
         seed=seed,
-        batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
         meta=meta,

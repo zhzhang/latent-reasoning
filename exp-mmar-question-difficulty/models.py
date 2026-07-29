@@ -24,6 +24,17 @@ DEPLOY_DIR = EXP_DIR / "deploy"
 # Registry
 # ---------------------------------------------------------------------------
 
+# Backends that cannot use SamplingParams(n>1) shared prefill (Omni shares one
+# stage SamplingParams list per generate call; HF has no n= fork). Callers must
+# duplicate question×shot prompt rows for these.
+_DUPLICATE_SHOT_BACKENDS = frozenset({"vllm_omni", "hf_af_next", "hf_chat"})
+
+
+def backend_duplicates_shots(backend: str) -> bool:
+    """True when n_shots must be expanded into duplicate prompts."""
+    return backend in _DUPLICATE_SHOT_BACKENDS
+
+
 MODEL_SPECS: dict[str, dict[str, Any]] = {
     "af-next-think": {
         "model_id": "nvidia/audio-flamingo-next-think-hf",
@@ -34,12 +45,23 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         # at load time (see load_af_next).
         "engine": {
             "dtype": "bfloat16",
+            # Cap context for long audio+text prompts (not a KV/throughput lever;
+            # PagedAttention allocates on demand).
             "max_model_len": 8192,
-            "max_num_seqs": 32,
-            "gpu_memory_utilization": 0.92,
+            # Prefill-heavy: prefer batched tokens over decode-side max_num_seqs.
+            "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
             "enforce_eager": True,
             "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "attention_backend": "flashinfer",  # best for throughput
+            "async_scheduling": True,  # usually faster, but not all features supported
+        },
+        "sampling": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_tokens": 512,
+            "repetition_penalty": 1.2,
         },
     },
     "mimo-audio-7b": {
@@ -49,6 +71,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm_omni",
         "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
         "sampling_rate": 24000,
+        "sampling": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_tokens": 512,
+            "repetition_penalty": 1.1,
+        },
     },
     "interactive-omni-8b": {
         "model_id": "sensenova/InteractiveOmni-8B",
@@ -59,13 +87,21 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "engine": {
             "dtype": "bfloat16",
             "max_model_len": 8192,
-            "max_num_seqs": 16,
-            "gpu_memory_utilization": 0.9,
+            "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
             "enforce_eager": True,
             "trust_remote_code": True,
             "model_impl": "transformers",
             "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "attention_backend": "flashinfer",  # best for throughput
+            "async_scheduling": True,  # usually faster, but not all features supported
+        },
+        "sampling": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_tokens": 512,
+            "repetition_penalty": 1.1,
         },
     },
     # MoE thinker-only (~3B active); fits one A100-80GB via plain vLLM.
@@ -75,20 +111,25 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm",
         "engine": {
             "dtype": "bfloat16",
-            # Prompt audio + long Thinking CoT (max_tokens=16384).
+            # Audio prompt + long Thinking CoT (sampling max_tokens=16384).
             "max_model_len": 32768,
+            # OOM guard on one A100 — not a throughput knob.
             "max_num_seqs": 4,
-            "gpu_memory_utilization": 0.9,
+            "max_num_batched_tokens": 16384,
             "limit_mm_per_prompt": {"audio": 1},
             "enforce_eager": True,
             "trust_remote_code": True,
             "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "attention_backend": "flashinfer",  # best for throughput
+            "async_scheduling": True,  # usually faster, but not all features supported
         },
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
             "top_k": 20,
             "max_tokens": 16384,
+            "repetition_penalty": 1.0,
         },
     },
     # Dense 24B; ~55GB bf16 — needs A100-80GB. Mistral tokenizer/format.
@@ -99,18 +140,26 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "engine": {
             "dtype": "bfloat16",
             "max_model_len": 8192,
+            # OOM guard on one A100 — not a throughput knob.
             "max_num_seqs": 4,
-            "gpu_memory_utilization": 0.9,
+            # chunked_prefill disabled ⇒ batched tokens must be >= max_model_len.
+            "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
             "config_format": "mistral",
             "load_format": "mistral",
             "tokenizer_mode": "mistral",
             "enforce_eager": True,
             "enable_chunked_prefill": False,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "attention_backend": "flashinfer",  # best for throughput
+            "async_scheduling": True,  # usually faster, but not all features supported
         },
         "sampling": {
             "temperature": 0.2,
             "top_p": 0.95,
+            "max_tokens": 512,
+            "repetition_penalty": 1.0,
         },
     },
 }
@@ -172,58 +221,85 @@ def _load_audio_tuple(
 STEP_AUDIO_MAX_SAMPLES = 479_680
 
 
+def resolve_sampling(
+    label: str,
+    args: SimpleNamespace | None = None,
+) -> dict[str, Any]:
+    """Return SamplingParams kwargs for ``label`` (per-model; no global defaults).
+
+    Optional CLI overrides on ``args`` (``temperature``, ``top_p``,
+    ``max_new_tokens``) replace the model values when not ``None``.
+    """
+    spec = MODEL_SPECS.get(label)
+    if not spec or "sampling" not in spec:
+        raise ValueError(f"Model {label!r} has no per-model sampling config")
+    out = dict(spec["sampling"])
+    if args is None:
+        return out
+    if getattr(args, "temperature", None) is not None:
+        out["temperature"] = float(args.temperature)
+    if getattr(args, "top_p", None) is not None:
+        out["top_p"] = float(args.top_p)
+    if getattr(args, "max_new_tokens", None) is not None:
+        out["max_tokens"] = int(args.max_new_tokens)
+    return out
+
+
 def _sampling_params_for_request(
+    label: str,
     args: SimpleNamespace,
     seed: int,
     *,
+    n: int = 1,
     stop_token_ids: list[int] | None = None,
     repetition_penalty: float | None = None,
-    overrides: dict[str, Any] | None = None,
 ):
     from vllm import SamplingParams
 
-    temperature = float(args.temperature)
-    kwargs: dict[str, Any] = {
-        "temperature": temperature if temperature > 0 else 0.0,
-        "top_p": float(getattr(args, "top_p", 1.0)),
-        "max_tokens": int(getattr(args, "max_new_tokens", 512)),
-        "seed": int(seed),
-        "repetition_penalty": float(
-            repetition_penalty
-            if repetition_penalty is not None
-            else getattr(args, "repetition_penalty", 1.0)
-        ),
-    }
+    kwargs = resolve_sampling(label, args)
+    temperature = float(kwargs.get("temperature", 0.0))
+    kwargs["temperature"] = temperature if temperature > 0 else 0.0
+    kwargs["seed"] = int(seed)
+    kwargs["n"] = int(n)
+    if repetition_penalty is not None:
+        kwargs["repetition_penalty"] = float(repetition_penalty)
     if stop_token_ids:
         kwargs["stop_token_ids"] = list(stop_token_ids)
-    if overrides:
-        kwargs.update(overrides)
     return SamplingParams(**kwargs)
 
 
-def _extract_text(output: Any) -> str:
-    """Normalize vLLM / Omni generate outputs to a decoded string."""
+def _completion_texts(output: Any) -> list[str]:
+    """Extract all completion strings from a vLLM / Omni generate output."""
     if output is None:
-        return ""
+        return [""]
     if isinstance(output, str):
-        return output
+        return [output]
     # Omni stage wrapper: request_output may be one RequestOutput or a list.
     request_output = getattr(output, "request_output", None)
     if request_output is not None:
         if isinstance(request_output, (list, tuple)):
             parts = [_extract_text(item) for item in request_output]
-            return "\n".join(part for part in parts if part)
+            joined = "\n".join(part for part in parts if part)
+            return [joined]
         output = request_output
     outputs = getattr(output, "outputs", None)
     if outputs:
-        first = outputs[0]
-        text = getattr(first, "text", None)
-        if text is not None:
-            return str(text)
+        texts: list[str] = []
+        for item in outputs:
+            text = getattr(item, "text", None)
+            texts.append(str(text) if text is not None else "")
+        if texts:
+            return texts
     text = getattr(output, "text", None)
     if text is not None:
-        return str(text)
-    return str(output)
+        return [str(text)]
+    return [str(output)]
+
+
+def _extract_text(output: Any) -> str:
+    """Normalize vLLM / Omni generate outputs to a decoded string."""
+    texts = _completion_texts(output)
+    return texts[0] if texts else ""
 
 
 def _prompt_mode(args: SimpleNamespace) -> str:
@@ -684,16 +760,17 @@ def load_voxtral(args: SimpleNamespace):
 
 
 def _build_vllm_audio_inputs(
+    label: str,
     samples: list[dict],
     *,
     prompt_fn: Callable[[dict], str],
     sampling_rate: int,
     args: SimpleNamespace,
     seeds: list[int],
+    n_completions: int = 1,
     stop_token_ids: list[int] | None = None,
     repetition_penalty: float | None = None,
     max_audio_samples: int | None = None,
-    sampling_overrides: dict[str, Any] | None = None,
 ) -> tuple[list[dict], list[Any]]:
     prompts: list[dict] = []
     sampling: list[Any] = []
@@ -711,14 +788,34 @@ def _build_vllm_audio_inputs(
         )
         sampling.append(
             _sampling_params_for_request(
+                label,
                 args,
                 seed,
+                n=n_completions,
                 stop_token_ids=stop_token_ids,
                 repetition_penalty=repetition_penalty,
-                overrides=sampling_overrides,
             )
         )
     return prompts, sampling
+
+
+def _expand_n_outputs(
+    samples: list[dict],
+    outputs: list[Any],
+    *,
+    n_completions: int,
+    parse_fn: Callable,
+) -> list[dict]:
+    """Unpack SamplingParams(n=...) completions into question-major shot rows."""
+    results: list[dict] = []
+    for sample, out in zip(samples, outputs):
+        texts = _completion_texts(out)
+        if len(texts) < n_completions:
+            texts = texts + [""] * (n_completions - len(texts))
+        choices = sample.get("choices") or []
+        for text in texts[:n_completions]:
+            results.append(_output_dict(text, choices, parse_fn=parse_fn))
+    return results
 
 
 def generate_batch(
@@ -728,14 +825,24 @@ def generate_batch(
     args: SimpleNamespace,
     *,
     seeds: list[int] | None = None,
+    n_completions: int = 1,
 ) -> list[dict]:
-    """Generate one completion per sample (already expanded to shot rows)."""
+    """Generate completions for ``samples``.
+
+    Plain vLLM backends may pass unique questions with ``n_completions=n_shots``
+    so SamplingParams(n=...) shares prefill. Omni / HF callers should pass
+    already-expanded question×shot rows with ``n_completions=1``.
+
+    Returns a flat list in question-major order (length
+    ``len(samples) * n_completions``).
+    """
     if not samples:
         return []
     if seeds is None:
         seeds = [int(args.seed) + i for i in range(len(samples))]
     if len(seeds) != len(samples):
         raise ValueError("seeds length must match samples length")
+    n_completions = max(1, int(n_completions))
 
     backend = handle["backend"]
     parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output))
@@ -747,25 +854,27 @@ def generate_batch(
             prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
         else:
             prompt_fn = lambda s: _build_prompt(s, args)  # noqa: E731
-        sampling_overrides = MODEL_SPECS.get(label, {}).get("sampling")
         prompts, sampling = _build_vllm_audio_inputs(
+            label,
             samples,
             prompt_fn=prompt_fn,
             sampling_rate=16000,
             args=args,
             seeds=seeds,
-            sampling_overrides=sampling_overrides,
+            n_completions=n_completions,
         )
         outputs = handle["llm"].generate(prompts, sampling_params=sampling)
-        return [
-            _output_dict(_extract_text(out), sample.get("choices") or [], parse_fn=parse_fn)
-            for sample, out in zip(samples, outputs)
-        ]
+        return _expand_n_outputs(
+            samples, outputs, n_completions=n_completions, parse_fn=parse_fn
+        )
 
     if backend == "hf_af_next":
         from audio_flamingo_runtime import generate_batch as af_generate_batch
         from audio_flamingo_runtime import seed_everything
 
+        if n_completions != 1:
+            raise ValueError("hf_af_next requires expanded shot rows (n_completions=1)")
+        sampling = resolve_sampling(label, args)
         # HF path has no per-row seeds in one generate call; run one sample at a
         # time so flattened question×shot rows keep distinct seeds.
         results: list[dict] = []
@@ -783,14 +892,20 @@ def generate_batch(
                     parse_output=parse_fn,
                     generation_extra={
                         "repetition_penalty": float(
-                            getattr(args, "repetition_penalty", 1.2)
-                        )
+                            sampling.get("repetition_penalty", 1.0)
+                        ),
+                        "max_new_tokens": int(sampling["max_tokens"]),
+                        "temperature": float(sampling["temperature"]),
+                        "top_p": float(sampling.get("top_p", 1.0)),
+                        "do_sample": float(sampling["temperature"]) > 0,
                     },
                 )
             )
         return results
 
     if backend == "vllm_omni":
+        if n_completions != 1:
+            raise ValueError("vllm_omni requires expanded shot rows (n_completions=1)")
         if label == "step-audio-2-mini":
             prompt_fn = lambda s: _step_audio_prompt(s, args)  # noqa: E731
             # Step-Audio2 Thinker can emit audio tokens (ids >= 151696). Without
@@ -805,11 +920,13 @@ def generate_batch(
         else:
             raise ValueError(f"No Omni prompt builder for {label}")
         prompts, sampling = _build_vllm_audio_inputs(
+            label,
             samples,
             prompt_fn=prompt_fn,
             sampling_rate=int(handle["sampling_rate"]),
             args=args,
             seeds=seeds,
+            n_completions=1,
             stop_token_ids=stop_token_ids,
             repetition_penalty=repetition_penalty,
             max_audio_samples=(
@@ -836,19 +953,31 @@ def generate_batch(
 
     if backend == "vllm_chat":
         messages = [_interactive_omni_messages(sample, args) for sample in samples]
-        sampling = [_sampling_params_for_request(args, seed) for seed in seeds]
-        outputs = handle["llm"].chat(messages, sampling_params=sampling)
-        return [
-            _output_dict(_extract_text(out), sample.get("choices") or [], parse_fn=parse_fn)
-            for sample, out in zip(samples, outputs)
+        sampling = [
+            _sampling_params_for_request(label, args, seed, n=n_completions)
+            for seed in seeds
         ]
+        outputs = handle["llm"].chat(messages, sampling_params=sampling)
+        return _expand_n_outputs(
+            samples, outputs, n_completions=n_completions, parse_fn=parse_fn
+        )
 
     if backend == "vllm_voxtral":
-        return _generate_voxtral_batch(handle, samples, args, seeds, parse_fn=parse_fn)
+        return _generate_voxtral_batch(
+            handle,
+            samples,
+            args,
+            seeds,
+            parse_fn=parse_fn,
+            n_completions=n_completions,
+            label=label,
+        )
 
     if backend == "hf_chat":
+        if n_completions != 1:
+            raise ValueError("hf_chat requires expanded shot rows (n_completions=1)")
         return [
-            _generate_interactive_omni_hf(handle, sample, args, seed)
+            _generate_interactive_omni_hf(handle, sample, args, seed, label=label)
             for sample, seed in zip(samples, seeds)
         ]
 
@@ -886,18 +1015,19 @@ def _generate_voxtral_batch(
     seeds: list[int],
     *,
     parse_fn: Callable,
+    n_completions: int = 1,
+    label: str = "voxtral-small-24b",
 ) -> list[dict]:
     tokenizer = handle["tokenizer"]
     prompts = [_build_voxtral_request(tokenizer, sample, args) for sample in samples]
-    overrides = MODEL_SPECS["voxtral-small-24b"].get("sampling")
     sampling = [
-        _sampling_params_for_request(args, seed, overrides=overrides) for seed in seeds
+        _sampling_params_for_request(label, args, seed, n=n_completions)
+        for seed in seeds
     ]
     outputs = handle["llm"].generate(prompts, sampling_params=sampling)
-    return [
-        _output_dict(_extract_text(out), sample.get("choices") or [], parse_fn=parse_fn)
-        for sample, out in zip(samples, outputs)
-    ]
+    return _expand_n_outputs(
+        samples, outputs, n_completions=n_completions, parse_fn=parse_fn
+    )
 
 
 def _omni_stage_params(stage0, *, stages: int):
@@ -1040,7 +1170,12 @@ def _collect_omni_texts(omni_outputs: Any, *, n: int) -> list[str]:
 
 
 def _generate_interactive_omni_hf(
-    handle: dict, sample: dict, args: SimpleNamespace, seed: int
+    handle: dict,
+    sample: dict,
+    args: SimpleNamespace,
+    seed: int,
+    *,
+    label: str = "interactive-omni-8b",
 ) -> dict:
     import torch
 
@@ -1057,12 +1192,14 @@ def _generate_interactive_omni_hf(
             ],
         }
     ]
-    temperature = float(args.temperature)
+    sampling = resolve_sampling(label, args)
+    temperature = float(sampling["temperature"])
     generation_config = {
-        "max_new_tokens": int(getattr(args, "max_new_tokens", 512)),
+        "max_new_tokens": int(sampling["max_tokens"]),
         "do_sample": temperature > 0,
         "temperature": temperature if temperature > 0 else None,
-        "top_p": float(getattr(args, "top_p", 1.0)),
+        "top_p": float(sampling.get("top_p", 1.0)),
+        "repetition_penalty": float(sampling.get("repetition_penalty", 1.0)),
     }
     generation_config = {
         key: value for key, value in generation_config.items() if value is not None

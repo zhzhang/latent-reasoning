@@ -83,9 +83,9 @@ def load_grader(model_id: str = DEFAULT_GRADER_MODEL_ID) -> dict[str, Any]:
     llm = LLM(
         model=local_id,
         dtype="bfloat16",
+        # Cap judge context (not a KV/throughput lever).
         max_model_len=4096,
-        max_num_seqs=64,
-        gpu_memory_utilization=0.9,
+        max_num_batched_tokens=8192,
         enforce_eager=True,
         enable_prefix_caching=True,
         trust_remote_code=True,
