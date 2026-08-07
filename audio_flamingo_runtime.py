@@ -518,13 +518,6 @@ def resolve_model_dir(model_id: str, local_model_dir: str | None) -> str:
     )
     marker = seeded / ".seed_complete"
     marker.write_text("ok\n", encoding="utf-8")
-    if "audio-flamingo-next" in model_id.lower():
-        from latent_cot import compute_and_cache_latent_w_remap
-
-        import torch
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        compute_and_cache_latent_w_remap(seeded, force=True, device=device)
     volume.commit()
     return str(seeded)
 
@@ -567,40 +560,28 @@ def build_raw_tokens(tokenizer, token_ids, role: str) -> list[dict]:
     return tokens
 
 
-def build_generated_raw_tokens(
-    tokenizer,
-    token_ids: list[int],
-    *,
-    is_latent: list[bool] | None = None,
-) -> list[dict]:
-    """Build generated-role raw tokens, marking latent-CoT steps with ``latent``."""
+def build_generated_raw_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
+    """Build generated-role raw tokens."""
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     tokens = []
-    for index, token_id in enumerate(token_ids):
+    for token_id in token_ids:
         tid = int(token_id)
-        entry = {
-            "id": tid,
-            "token": format_raw_token(tokenizer, tid),
-            "role": "generated",
-            "special": tid in special_ids,
-        }
-        if is_latent and index < len(is_latent) and is_latent[index]:
-            entry["latent"] = True
-            entry["special"] = True
-        tokens.append(entry)
+        tokens.append(
+            {
+                "id": tid,
+                "token": format_raw_token(tokenizer, tid),
+                "role": "generated",
+                "special": tid in special_ids,
+            }
+        )
     return tokens
 
 
-def _unpack_generate_output(outputs, prompt_len: int):
-    """Normalize ``model.generate`` return value to sequences + optional latent mask."""
-    is_latent = None
+def _unpack_generate_output(outputs):
+    """Normalize ``model.generate`` return value to token sequences."""
     if hasattr(outputs, "sequences"):
-        sequences = outputs.sequences
-        if hasattr(outputs, "is_latent") and outputs.is_latent is not None:
-            is_latent = outputs.is_latent[:, prompt_len:]
-    else:
-        sequences = outputs
-    return sequences, is_latent
+        return outputs.sequences
+    return outputs
 
 
 def _build_conversations(samples, build_prompt):
@@ -647,24 +628,10 @@ def generate_batch(
 
     gen_kwargs = generation_kwargs(args, extra=generation_extra)
     with torch.inference_mode():
-        if gen_kwargs.pop("latent_cot", False):
-            from latent_cot import latent_generate
-
-            # Custom kwargs belong to latent_generate, not HF generate.
-            think_start_ids = gen_kwargs.pop("think_start_ids", None)
-            think_end_ids = gen_kwargs.pop("think_end_ids", None)
-            gen_out = latent_generate(
-                model,
-                **inputs,
-                **gen_kwargs,
-                think_start_ids=think_start_ids,
-                think_end_ids=think_end_ids,
-            )
-        else:
-            gen_out = model.generate(**inputs, **gen_kwargs)
+        gen_out = model.generate(**inputs, **gen_kwargs)
 
     prompt_len = inputs["input_ids"].shape[1]
-    sequences, gen_is_latent = _unpack_generate_output(gen_out, prompt_len)
+    sequences = _unpack_generate_output(gen_out)
     generated_ids = sequences[:, prompt_len:]
 
     tokenizer = processor_tokenizer(processor)
@@ -677,21 +644,12 @@ def generate_batch(
         else:
             input_ids = inputs["input_ids"][index].tolist()
         gen_ids = generated_ids[index].tolist()
-        latent_flags = None
-        if gen_is_latent is not None:
-            latent_flags = gen_is_latent[index].tolist()
-        decode_ids = [
-            token_id
-            for token_id, latent in zip(gen_ids, latent_flags or [False] * len(gen_ids))
-            if not latent
-        ]
-        clean_output = processor.decode(decode_ids, skip_special_tokens=True)
+        clean_output = processor.decode(gen_ids, skip_special_tokens=True)
         raw_tokens = build_raw_tokens(tokenizer, input_ids, "input") + build_generated_raw_tokens(
             tokenizer,
             gen_ids,
-            is_latent=latent_flags,
         )
-        full_ids = input_ids + decode_ids
+        full_ids = input_ids + gen_ids
         raw_text = tokenizer.decode(full_ids, skip_special_tokens=False)
 
         thinking_prediction, answer_prediction = parse_output(
@@ -759,7 +717,7 @@ def generate_one_with_attentions(
     with torch.inference_mode():
         outputs = model.generate(**inputs, **gen_kwargs)
 
-    generated = outputs[:, prompt_len:]
+    generated = _unpack_generate_output(outputs)[:, prompt_len:]
     gen_ids = generated[0].tolist()
     gen_len = len(gen_ids)
     actual_bytes = estimate_attention_bytes(prompt_len, gen_len)

@@ -1,4 +1,4 @@
-"""Seed a shared Modal Volume with eval datasets and model weights.
+"""Seed a shared Modal Volume with MMAR data and model weights.
 
 Layout on the ``latent-reasoning`` Volume:
 
@@ -6,12 +6,8 @@ Layout on the ``latent-reasoning`` Volume:
       audio/*.wav
       MMAR-meta.jsonl
       data/mmar-audio.tar.gz
-    /data/aha/                  # Hugging Face snapshot of ahabench/AHa-Bench
-    /data/mcr/                  # optional local MCR-Bench upload
-      AQA/ SER/ VSC/
     /models/nvidia/audio-flamingo-3-hf/
     /models/nvidia/audio-flamingo-next-think-hf/
-      latent_w_remap.safetensors   # ridge latent-CoT remapping (AF-Next)
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
     /models/mistralai/Voxtral-Small-24B-2507/
@@ -25,11 +21,10 @@ Consumers can mount the whole Volume, or use subpaths::
 Usage:
 
     uv run modal run seed_volume.py
-    uv run modal run seed_volume.py --datasets mmar,aha --models af3
+    uv run modal run seed_volume.py --datasets mmar --models af3
     uv run modal run seed_volume.py --datasets mmar --models af-next-think
     uv run modal run seed_volume.py --datasets mmar --models none
     uv run modal run seed_volume.py --datasets none --models af3,af2 --force
-    uv run modal run seed_volume.py --datasets mcr --mcr-local-dir ./MCR-Bench --models none
     uv run modal run seed_volume.py --repo-id nvidia/audio-flamingo-3-hf --datasets none
     uv run modal run seed_volume.py --list-only
     uv run modal run --detach seed_volume.py --datasets none --models af-next-think
@@ -59,11 +54,10 @@ MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
 # Use the GitHub release that includes instance rubrics + GT CoT.
 MMAR_META_URL = "https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl"
 MMAR_RUBRIC_KEYS = ("thinking", "rubric", "cue")
-AHA_REPO = "ahabench/AHa-Bench"
 MIN_MMAR_WAVS = 1000
 MIN_DISK_SIZE = 524288
 
-# Short aliases used by this repo's eval scripts.
+# Short aliases used by this repo's MMAR eval scripts.
 MODEL_ALIASES: dict[str, str] = {
     "af3": "nvidia/audio-flamingo-3-hf",
     "audio-flamingo-3": "nvidia/audio-flamingo-3-hf",
@@ -76,8 +70,6 @@ MODEL_ALIASES: dict[str, str] = {
     "audio-flamingo-2": "nvidia/audio-flamingo-2",
     "qwen3-omni": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
     "qwen3-omni-thinking": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
-    "qwen3-4b": "Qwen/Qwen3-4B",
-    "qwen3-4b-thinking": "Qwen/Qwen3-4B-Thinking-2507",
     "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
     "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
     "qwen-3b": "Qwen/Qwen2.5-3B-Instruct",
@@ -100,15 +92,13 @@ MODEL_SEED_EXTRAS: dict[str, tuple[str, ...]] = {
     "XiaomiMiMo/MiMo-Audio-7B-Instruct": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
 }
 
-DEFAULT_DATASETS = ("mmar", "aha")
+DEFAULT_DATASETS = ("mmar",)
 DEFAULT_MODELS = ("af3",)
 ALL_MODELS = (
     "af3",
     "af-next-think",
     "af2",
     "qwen3-omni",
-    "qwen3-4b",
-    "qwen3-4b-thinking",
     "qwen2.5-3b",
     "step-audio-2-mini",
     "mimo-audio-7b",
@@ -123,13 +113,8 @@ image = (
     .uv_pip_install(
         "huggingface-hub>=0.30.0",
         "tqdm>=4.67.0",
-        # Used to precompute / cache latent-CoT remapping matrices for AF-Next.
-        "torch",
-        "numpy",
-        "safetensors>=0.8.0",
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
-    .add_local_python_source("latent_cot")
 )
 
 app = modal.App("seed-volume", image=image)
@@ -210,22 +195,6 @@ def _looks_seeded(path: Path) -> bool:
     has_config = (path / "config.json").exists() or any(path.glob("*/config.json"))
     has_weights = any(path.rglob("*.safetensors")) or any(path.rglob("*.bin"))
     return bool(has_config and has_weights)
-
-
-def _is_af_next_repo(repo_id: str) -> bool:
-    return "audio-flamingo-next" in repo_id.lower()
-
-
-def _cache_af_next_latent_w_remap(dest: Path, *, force: bool = False) -> dict | None:
-    """Precompute ridge remapping matrices for AF-Next and write them beside weights."""
-    from latent_cot import compute_and_cache_latent_w_remap
-
-    import torch
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    summary = compute_and_cache_latent_w_remap(dest, force=force, device=device)
-    print(f"latent w_remap cache: {summary}")
-    return summary
 
 
 def _parse_noneable(value: str) -> str | None:
@@ -342,49 +311,6 @@ def seed_mmar(force: bool = False) -> dict:
 @app.function(
     volumes={VOLUME_MOUNT: volume},
     secrets=[hf_secret],
-    timeout=60 * 60,
-    ephemeral_disk=MIN_DISK_SIZE,
-)
-def seed_aha(force: bool = False) -> dict:
-    """Snapshot ``ahabench/AHa-Bench`` into ``/cache/data/aha``."""
-    from huggingface_hub import snapshot_download
-
-    dest_root = DATA_ROOT / "aha"
-    marker = dest_root / ".seed_complete"
-
-    if marker.exists() and _dir_nonempty(dest_root) and not force:
-        summary = {"dataset": "aha", "status": "skipped", "path": str(dest_root)}
-        print(summary)
-        return summary
-
-    tmp_dir = Path("/tmp/aha")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
-
-    print(f"Downloading dataset snapshot {AHA_REPO} ...")
-    snapshot_download(
-        repo_id=AHA_REPO,
-        repo_type="dataset",
-        local_dir=str(tmp_dir),
-        token=os.environ.get("HF_TOKEN"),
-        force_download=force,
-    )
-
-    if dest_root.exists():
-        shutil.rmtree(dest_root)
-    shutil.copytree(tmp_dir, dest_root)
-    marker.write_text("ok\n", encoding="utf-8")
-
-    volume.commit()
-    summary = {"dataset": "aha", "status": "ok", "path": str(dest_root)}
-    print(summary)
-    return summary
-
-
-@app.function(
-    volumes={VOLUME_MOUNT: volume},
-    secrets=[hf_secret],
     timeout=4 * 60 * 60,
     # Scratch for hub temp files; weights are written onto the Volume itself.
     ephemeral_disk=MIN_DISK_SIZE,
@@ -401,9 +327,6 @@ def seed_model(
     Default layout: ``/cache/models/<repo_id>`` (explicit local snapshot).
     With ``hub_cache_layout=True``: standard HF hub cache under ``/cache/models``
     (consumers should set ``HF_HUB_CACHE=/models`` when mounting the models subpath).
-
-    For Audio Flamingo Next repos, also precomputes and caches the latent-CoT
-    remapping matrix (``latent_w_remap.safetensors``) beside the weights.
     """
     from huggingface_hub import snapshot_download
 
@@ -426,29 +349,18 @@ def seed_model(
         marker = MODELS_ROOT / ".seeded" / repo_id.replace("/", "__")
         already = marker.exists() and not force
         dest_label = str(MODELS_ROOT)
-        local_snapshot = (
-            Path(marker.read_text(encoding="utf-8").strip())
-            if marker.exists()
-            else None
-        )
     else:
         dest = model_dir_for(repo_id)
         marker = dest / ".seed_complete"
         already = _looks_seeded(dest) and not force
         dest_label = str(dest)
-        local_snapshot = dest
 
-    remapping: dict | None = None
     if already:
-        if local_snapshot is not None and _is_af_next_repo(repo_id):
-            remapping = _cache_af_next_latent_w_remap(local_snapshot, force=force)
-            volume.commit()
         summary = {
             "repo_id": repo_id,
             "status": "skipped",
             "path": dest_label,
             "layout": "hub-cache" if hub_cache_layout else "local-dir",
-            "latent_w_remap": remapping,
         }
         print(summary)
         return summary
@@ -466,7 +378,6 @@ def seed_model(
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(f"{snapshot_path}\n", encoding="utf-8")
         path_out = snapshot_path
-        local_snapshot = Path(snapshot_path)
     else:
         dest = model_dir_for(repo_id)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -480,10 +391,6 @@ def seed_model(
         )
         marker.write_text("ok\n", encoding="utf-8")
         path_out = str(dest)
-        local_snapshot = dest
-
-    if local_snapshot is not None and _is_af_next_repo(repo_id):
-        remapping = _cache_af_next_latent_w_remap(local_snapshot, force=True)
 
     volume.commit()
     summary = {
@@ -491,7 +398,6 @@ def seed_model(
         "status": "ok",
         "path": path_out,
         "layout": "hub-cache" if hub_cache_layout else "local-dir",
-        "latent_w_remap": remapping,
     }
     print(summary)
     return summary
@@ -509,17 +415,18 @@ def list_volume() -> dict:
     }
 
     datasets: dict[str, object] = {}
-    for name in ("mmar", "aha", "mcr"):
-        path = DATA_ROOT / name
-        if not path.exists():
-            datasets[name] = {"present": False}
-            continue
-        info: dict[str, object] = {"present": True, "path": str(path)}
-        if name == "mmar":
-            info["wav_files"] = _count_wavs(path / "audio")
-            info["meta"] = (path / "MMAR-meta.jsonl").exists()
-        datasets[name] = info
-        print(f"dataset {name}: {info}")
+    path = DATA_ROOT / "mmar"
+    if not path.exists():
+        datasets["mmar"] = {"present": False}
+    else:
+        info: dict[str, object] = {
+            "present": True,
+            "path": str(path),
+            "wav_files": _count_wavs(path / "audio"),
+            "meta": (path / "MMAR-meta.jsonl").exists(),
+        }
+        datasets["mmar"] = info
+        print(f"dataset mmar: {info}")
     summary["datasets"] = datasets
 
     entries: list[dict] = []
@@ -580,27 +487,6 @@ def list_volume() -> dict:
     return summary
 
 
-def _upload_mcr_local(mcr_local_dir: str, force: bool = False) -> dict:
-    local_path = Path(mcr_local_dir).expanduser().resolve()
-    if not local_path.is_dir():
-        raise SystemExit(
-            f"MCR local directory not found: {local_path}\n"
-            "Download MCR-BENCH from Google Drive and pass --mcr-local-dir."
-        )
-    for task in ("AQA", "SER", "VSC"):
-        if not (local_path / task).is_dir():
-            raise SystemExit(
-                f"Expected {local_path / task} to exist (MCR-BENCH layout)."
-            )
-
-    print(f"Uploading {local_path} -> volume:{VOLUME_NAME}/data/mcr ...")
-    with volume.batch_upload(force=force) as batch:
-        batch.put_directory(str(local_path), "/data/mcr")
-    summary = {"dataset": "mcr", "status": "ok", "local_path": str(local_path)}
-    print(summary)
-    return summary
-
-
 @app.local_entrypoint()
 def main(
     datasets: str = ",".join(DEFAULT_DATASETS),
@@ -609,14 +495,12 @@ def main(
     force: bool = False,
     revision: str | None = None,
     hub_cache_layout: bool = False,
-    mcr_local_dir: str = "MCR-Bench",
     list_only: bool = False,
 ):
-    """Commit eval datasets and/or model weights into the shared Modal Volume.
+    """Commit MMAR datasets and/or model weights into the shared Modal Volume.
 
     Args:
-        datasets: Comma-separated subset of ``mmar``, ``aha``, ``mcr``, or ``all``.
-            Pass ``none`` to skip datasets.
+        datasets: ``mmar`` or ``all``. Pass ``none`` to skip datasets.
         models: Comma-separated aliases (af3, af-next-think, af2, qwen3-omni, ...)
             or Hub repo ids.
             Pass ``none`` to skip models. Ignored when ``repo_id`` is set.
@@ -625,7 +509,6 @@ def main(
         revision: Optional git revision / commit pin for snapshot_download.
         hub_cache_layout: Store models in HF hub cache format under /cache/models
             instead of /cache/models/<repo_id>.
-        mcr_local_dir: Local extracted MCR-Bench directory for upload.
         list_only: Only print what is already on the Volume.
     """
     if list_only:
@@ -638,9 +521,9 @@ def main(
     if datasets_arg is not None:
         wanted = {item.strip().lower() for item in datasets_arg.split(",") if item.strip()}
         if "all" in wanted:
-            wanted = {"mmar", "aha", "mcr"}
+            wanted = {"mmar"}
 
-        unknown = wanted - {"mmar", "aha", "mcr"}
+        unknown = wanted - {"mmar"}
         if unknown:
             raise SystemExit(f"Unknown datasets: {sorted(unknown)}")
         if not wanted:
@@ -650,10 +533,6 @@ def main(
         # long downloads alive after the local client disconnects.
         if "mmar" in wanted:
             results.append(seed_mmar.spawn(force=force).get())
-        if "aha" in wanted:
-            results.append(seed_aha.spawn(force=force).get())
-        if "mcr" in wanted:
-            results.append(_upload_mcr_local(mcr_local_dir, force=force))
 
     if repo_id:
         targets = expand_seed_targets([repo_id])

@@ -24,13 +24,13 @@ Override with ``--min-bytes`` if you want a stricter keep set
 Usage::
 
     # Dry-run (default): print keep / delete table
-    uv run modal run exp-mmar-question-difficulty/cleanup_runs.py
+    uv run modal run cleanup_runs.py
 
     # Actually delete
-    uv run modal run exp-mmar-question-difficulty/cleanup_runs.py --execute
+    uv run modal run cleanup_runs.py --execute
 
     # Stricter cutoff
-    uv run modal run exp-mmar-question-difficulty/cleanup_runs.py \\
+    uv run modal run cleanup_runs.py \\
       --min-bytes 6000000 --execute
 """
 

@@ -17,8 +17,9 @@ from mmar_common import (
     parse_think_tagged_output,
 )
 
-EXP_DIR = Path(__file__).resolve().parent
-DEPLOY_DIR = EXP_DIR / "deploy"
+REPO_ROOT = Path(__file__).resolve().parent
+DEPLOY_DIR = REPO_ROOT / "deploy"
+_DEPLOY_MOUNT = Path("/root/deploy")
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -51,9 +52,10 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             # Prefill-heavy: prefer batched tokens over decode-side max_num_seqs.
             "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
-            "enforce_eager": True,
+            "enforce_eager": False,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
@@ -89,11 +91,14 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "max_model_len": 8192,
             "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
-            "enforce_eager": True,
+            # Transformers modeling backend may not support CUDA graphs; if load
+            # fails, load_interactive_omni falls back to HF .chat().
+            "enforce_eager": False,
             "trust_remote_code": True,
             "model_impl": "transformers",
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
@@ -111,16 +116,21 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm",
         "engine": {
             "dtype": "bfloat16",
-            # Audio prompt + long Thinking CoT (sampling max_tokens=16384).
-            "max_model_len": 32768,
-            # OOM guard on one A100 — not a throughput knob.
-            "max_num_seqs": 4,
-            "max_num_batched_tokens": 16384,
+            # Sized for measured MMAR Thinking outputs (~850 tok avg, p99 ~780,
+            # max ~870). Oversized max_model_len deflates reported concurrency.
+            "max_model_len": 4096,
+            # Cap concurrent seqs from measured avg seq length vs KV cache size
+            # (~155k tokens on A100-80GB ⇒ room for ~180 seqs of ~850).
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
+            # torch.compile fails on Qwen3-Omni MoE (Dynamo meta/cuda mismatch
+            # during profile_run). Keep eager; throughput comes from max_num_seqs.
             "enforce_eager": True,
             "trust_remote_code": True,
             "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
+            "gpu_memory_utilization": 0.97,
+            "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
@@ -128,7 +138,9 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "temperature": 0.6,
             "top_p": 0.95,
             "top_k": 20,
-            "max_tokens": 16384,
+            # Measured max output ~870 tokens; 2048 stops runaway CoT from
+            # monopolizing KV without truncating real answers.
+            "max_tokens": 2048,
             "repetition_penalty": 1.0,
         },
     },
@@ -140,18 +152,17 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "engine": {
             "dtype": "bfloat16",
             "max_model_len": 8192,
-            # OOM guard on one A100 — not a throughput knob.
-            "max_num_seqs": 4,
-            # chunked_prefill disabled ⇒ batched tokens must be >= max_model_len.
+            # Dense 24B leaves ~26 GiB KV; max_tokens=512 ⇒ plenty of room.
+            "max_num_seqs": 64,
             "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
             "config_format": "mistral",
             "load_format": "mistral",
             "tokenizer_mode": "mistral",
-            "enforce_eager": True,
-            "enable_chunked_prefill": False,
+            "enforce_eager": False,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
@@ -483,8 +494,6 @@ def _load_af_next_hf(local_id: str, args: SimpleNamespace):
         model_param_dtype,
         torch_dtype_value,
     )
-    from latent_cot import ensure_latent_w_remap
-
     target_dtype = torch_dtype_value(torch, getattr(args, "torch_dtype", "bfloat16"))
     if target_dtype == "auto":
         target_dtype = torch.bfloat16
@@ -494,7 +503,6 @@ def _load_af_next_hf(local_id: str, args: SimpleNamespace):
     )
     cast_model_floating_tensors(model, target_dtype)
     model.eval()
-    ensure_latent_w_remap(model, local_id, persist=True)
     print(
         f"AF-Next HF ready: class={type(model).__name__} "
         f"param_dtype={model_param_dtype(model)} "
@@ -513,7 +521,7 @@ def _resolve_deploy_path(path: str) -> str:
     candidate = Path(path)
     if candidate.is_file():
         return str(candidate)
-    alt = Path("/root/exp-mmar-question-difficulty/deploy") / candidate.name
+    alt = _DEPLOY_MOUNT / candidate.name
     if alt.is_file():
         return str(alt)
     return str(candidate)

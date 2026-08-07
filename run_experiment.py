@@ -33,17 +33,17 @@ Prereqs:
 
 Usage:
 
-    uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py
+    uv run modal run --detach run_experiment.py
     # Free-form + Qwen judge on the same 200 ids as a prior MC run:
-    uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py \\
+    uv run modal run --detach run_experiment.py \\
       --mode freeform --source-run-id 20260727T154400Z
-    uv run modal run exp-mmar-question-difficulty/run_experiment.py \\
+    uv run modal run run_experiment.py \\
       --models af-next-think --num-samples 8 --n-shots 2
     # Resume after a crash (reuse question set; skip finished models /
     # already-written questions):
-    uv run modal run --detach exp-mmar-question-difficulty/run_experiment.py \\
+    uv run modal run --detach run_experiment.py \\
       --run-id <run_id>
-    uv run modal run exp-mmar-question-difficulty/run_experiment.py \\
+    uv run modal run run_experiment.py \\
       --aggregate-only --run-id <run_id>
 """
 
@@ -53,7 +53,6 @@ import hashlib
 import json
 import os
 import random
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,27 +60,9 @@ from types import SimpleNamespace
 
 import modal
 
-# Local sibling imports (experiment folder on PYTHONPATH in the image).
-EXP_DIR = Path(__file__).resolve().parent
-REPO_ROOT = EXP_DIR.parent
-_EXP_MOUNT = "/root/exp-mmar-question-difficulty"
-
-
-def _ensure_exp_path() -> None:
-    """Make experiment sibling modules importable inside Modal containers."""
-    for path in (_EXP_MOUNT, str(EXP_DIR)):
-        if path and path not in sys.path:
-            if path == _EXP_MOUNT or Path(path).is_dir():
-                sys.path.insert(0, path)
-
-
-_ensure_exp_path()
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from aggregate import MODEL_LABELS as DEFAULT_MODEL_LABELS  # noqa: E402
-from aggregate import aggregate_difficulty  # noqa: E402
-from models import (  # noqa: E402
+from aggregate import MODEL_LABELS as DEFAULT_MODEL_LABELS
+from aggregate import aggregate_difficulty
+from mmar_models import (
     ALL_MODEL_LABELS,
     MODEL_SPECS,
     backend_duplicates_shots,
@@ -90,7 +71,7 @@ from models import (  # noqa: E402
     parse_model_list,
     resolve_sampling,
 )
-from mmar_common import (  # noqa: E402
+from mmar_common import (
     aggregate_n_shot_record,
     count_wavs,
     load_jsonl,
@@ -99,7 +80,7 @@ from mmar_common import (  # noqa: E402
     write_json,
     write_jsonl,
 )
-from modal_cache import (  # noqa: E402
+from modal_cache import (
     DEFAULT_MMAR_DATA_ROOT,
     DEFAULT_MMAR_META,
     RESULTS_MOUNT,
@@ -108,6 +89,9 @@ from modal_cache import (  # noqa: E402
     results_volume,
     volume,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent
+_DEPLOY_MOUNT = "/root/deploy"
 
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 DEFAULT_NUM_SAMPLES = 200
@@ -127,15 +111,33 @@ _SHARED_SOURCES = (
     "modal_cache",
     "mmar_common",
     "audio_flamingo_runtime",
-    "latent_cot",
+    "aggregate",
+    "mmar_models",
+    "grader",
 )
+
+
+def _mount_local_sources(image: modal.Image) -> modal.Image:
+    """Attach Python modules + Omni deploy YAML (must be last image steps)."""
+    return (
+        image.add_local_python_source(*_SHARED_SOURCES).add_local_dir(
+            str(REPO_ROOT / "deploy"), remote_path=_DEPLOY_MOUNT
+        )
+    )
+
 
 _VLLM_CACHE_ENV = {
     "HF_XET_HIGH_PERFORMANCE": "1",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-    # Keep EngineCore in-process so AF-Next weight-loader patches apply.
+}
+
+# AF-Next / large multimodal: keep EngineCore in-process. Qwen3-Omni's
+# profile_run hits a meta/cuda device mismatch under multiprocess EngineCore
+# (Tensor on device meta is not on the expected device cuda:0). AF-Next also
+# needs in-process for its symlink model-view load path.
+_INPROC_VLLM_ENV = {
+    **_VLLM_CACHE_ENV,
     "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-    "PYTHONPATH": _EXP_MOUNT,
 }
 
 
@@ -166,29 +168,34 @@ def _vllm_image(
         "accelerate>=1.14.0",
         *(extra_packages or []),
     ]
-    return (
-        _cuda_base_image()
-        .uv_pip_install(*packages)
-        .env(_VLLM_CACHE_ENV)
-        .add_local_python_source(*_SHARED_SOURCES)
-        .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
+    return _mount_local_sources(
+        _cuda_base_image().uv_pip_install(*packages).env(_VLLM_CACHE_ENV)
     )
 
 
 # AF-Next: vLLM 0.24 MusicFlamingo (+ HF fallback deps if weight load fails).
-af_next_image = _vllm_image(
-    vllm_version="0.24.0",
-    extra_packages=[
+af_next_image = _mount_local_sources(
+    _cuda_base_image()
+    .uv_pip_install(
+        "vllm==0.24.0",
+        "transformers>=5.5.3",
+        "huggingface-hub>=0.30.0",
+        "librosa>=0.11.0",
+        "soundfile",
+        "numpy",
+        "tqdm>=4.67.0",
+        "accelerate>=1.14.0",
         "soxr",
         "torch",
         "torchaudio",
         "peft>=0.15.2",
         "safetensors>=0.8.0",
-    ],
+    )
+    .env(_INPROC_VLLM_ENV)
 )
 
 # Step / MiMo: vLLM-Omni on the same 0.24 line.
-omni_image = (
+omni_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
         "vllm==0.24.0",
@@ -206,12 +213,10 @@ omni_image = (
         "onnxruntime",
     )
     .env(_VLLM_CACHE_ENV)
-    .add_local_python_source(*_SHARED_SOURCES)
-    .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
 )
 
 # InteractiveOmni: newer vLLM transformers-audio backend + HF chat fallback.
-interactive_omni_image = (
+interactive_omni_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
         "vllm==0.26.0",
@@ -236,12 +241,24 @@ interactive_omni_image = (
         "accelerate>=1.14.0",
     )
     .env(_VLLM_CACHE_ENV)
-    .add_local_python_source(*_SHARED_SOURCES)
-    .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
 )
 
 # Qwen3-Omni thinker + Voxtral Small (A100-80GB); needs mistral-common[audio] + PyAV.
-large_mm_image = (
+# Install E=128,N=768 fused-MoE Triton config under both A100 device names
+# Modal may assign (PCIe or SXM4). vLLM 0.26 ships no A100 variant for this
+# shape — use H200 bf16 as the best available stand-in vs untuned defaults.
+_FUSED_MOE_CONFIG_CMD = (
+    "D=/usr/local/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs && "
+    "SRC=\"$D/E=128,N=768,device_name=NVIDIA_H200.json\" && "
+    "if [ ! -f \"$SRC\" ]; then echo \"fused_moe: no H200 config, skipping\"; "
+    "else "
+    "for name in NVIDIA_A100_80GB_PCIe NVIDIA_A100-SXM4-80GB; do "
+    "DST=\"$D/E=128,N=768,device_name=$name.json\"; "
+    "cp -n \"$SRC\" \"$DST\" 2>/dev/null || cp \"$SRC\" \"$DST\"; "
+    "echo \"fused_moe: installed $name from H200\"; "
+    "done; fi"
+)
+large_mm_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
         "vllm[audio]==0.26.0",
@@ -258,18 +275,15 @@ large_mm_image = (
         "torch",
         "torchaudio",
     )
-    .env(_VLLM_CACHE_ENV)
-    .add_local_python_source(*_SHARED_SOURCES)
-    .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
+    .run_commands(_FUSED_MOE_CONFIG_CMD)
+    .env(_INPROC_VLLM_ENV)
 )
 
 # Lightweight CPU image for manifest / question-id helpers.
-cpu_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install("numpy", "tqdm>=4.67.0")
-    .env({"PYTHONPATH": _EXP_MOUNT})
-    .add_local_python_source(*_SHARED_SOURCES)
-    .add_local_dir(str(EXP_DIR), remote_path=_EXP_MOUNT)
+cpu_image = _mount_local_sources(
+    modal.Image.debian_slim(python_version="3.12").uv_pip_install(
+        "numpy", "tqdm>=4.67.0"
+    )
 )
 
 # Text-only freeform grader (Qwen2.5-3B-Instruct via vLLM).
@@ -520,8 +534,6 @@ def _run_model_eval(
     source_run_id: str | None = None,
 ) -> dict:
     """Load one model and write n-shot predictions for the fixed question set."""
-    _ensure_exp_path()
-
     volume.reload()
     results_volume.reload()
 
@@ -608,7 +620,19 @@ def _run_model_eval(
             "mode": prompt_mode,
         }
 
+    # Persist torch.compile / Triton JIT caches across cold starts. Per-model
+    # subdirs avoid concurrent writers under --parallel-models.
+    compile_cache = VOLUME_MOUNT / "vllm" / model_label
+    compile_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["VLLM_CACHE_ROOT"] = str(compile_cache)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(compile_cache / "torchinductor")
+    print(f"[{model_label}] compile cache -> {compile_cache}")
+
     handle = load_model(model_label, args)
+    try:
+        volume.commit()
+    except Exception as exc:  # noqa: BLE001 — cache commit is best-effort
+        print(f"[{model_label}] volume.commit after load failed: {exc}")
     active_backend = handle.get("backend", spec.get("backend"))
     # Omni / HF cannot fork SamplingParams(n>1); expand question×shot rows.
     # Plain vLLM uses n=n_shots on one prompt per question (shared prefill).
@@ -683,6 +707,11 @@ def _run_model_eval(
 
     written = len(records)
     elapsed = time.time() - start_time
+    try:
+        # Persist any Triton JIT / inductor caches written during generate.
+        volume.commit()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{model_label}] volume.commit after generate failed: {exc}")
     if print_every > 0:
         for idx, record in enumerate(records, start=1):
             if idx % print_every == 0 or idx == written:
@@ -805,7 +834,6 @@ def prepare_run(
     models into the existing manifest, and reports per-model progress so the
     pipeline orchestrator can skip already-complete workers.
     """
-    _ensure_exp_path()
     volume.reload()
     results_volume.reload()
 
@@ -959,7 +987,6 @@ def run_freeform_grade(
     force: bool = False,
 ) -> dict:
     """Grade free-form predictions with Qwen2.5-3B-Instruct."""
-    _ensure_exp_path()
     from grader import grade_predictions_file, load_grader
 
     volume.reload()
@@ -1316,7 +1343,6 @@ def main(
     if out.get("pending_labels") or out.get("skipped_labels"):
         print(
             "To resume this run later:\n"
-            f"  uv run modal run --detach "
-            f"exp-mmar-question-difficulty/run_experiment.py "
+            f"  uv run modal run --detach run_experiment.py "
             f"--run-id {rid} --mode {prompt_mode}"
         )

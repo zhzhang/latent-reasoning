@@ -12,9 +12,9 @@ Reads from ``outputs/exp-mmar-question-difficulty/<run_id>/``:
 
 Usage:
 
-    uv run python exp-mmar-question-difficulty/view_difficulty.py
-    uv run python exp-mmar-question-difficulty/view_difficulty.py --port 7861
-    uv run python exp-mmar-question-difficulty/view_difficulty.py \\
+    uv run python view_difficulty.py
+    uv run python view_difficulty.py --port 7861
+    uv run python view_difficulty.py \\
       --results-dir ./outputs/exp-mmar-question-difficulty
 """
 
@@ -23,24 +23,19 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
-import sys
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-EXP_DIR = Path(__file__).resolve().parent
-REPO_ROOT = EXP_DIR.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from mmar_common import (  # noqa: E402
+from mmar_common import (
     AF_NEXT_THINK_SUFFIX,
     build_mmar_freeform_prompt,
     build_mmar_prompt,
 )
 
+REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS_DIR = REPO_ROOT / "outputs" / "exp-mmar-question-difficulty"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
 DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
