@@ -1,4 +1,4 @@
-"""Qwen 3B free-form answer grader for MMAR difficulty experiments."""
+"""Free-form answer grader for MMAR difficulty experiments (multi-judge)."""
 
 from __future__ import annotations
 
@@ -8,10 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from audio_flamingo_runtime import resolve_model_dir
-from mmar_common import recompute_n_shot_scores, write_jsonl
+from mmar_common import (
+    ensure_judge_schema,
+    judge_label,
+    recompute_multi_judge_scores,
+    write_jsonl,
+)
 
-DEFAULT_GRADER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-GRADER_LABEL = "qwen2.5-3b-instruct"
+DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen2.5-3B-Instruct",)
+# Back-compat aliases.
+DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
+GRADER_LABEL = judge_label(DEFAULT_GRADER_MODEL_ID)
 
 YES_RE = re.compile(r"\b(yes|true|correct|match(?:es)?)\b", re.IGNORECASE)
 NO_RE = re.compile(r"\b(no|false|incorrect|wrong|mismatch(?:es)?)\b", re.IGNORECASE)
@@ -61,19 +68,25 @@ def parse_grade_verdict(text: str) -> bool | None:
     return None
 
 
-def _shot_needs_grade(shot: dict) -> bool:
-    if shot.get("pending_grade"):
-        return True
-    if shot.get("grader") is None and shot.get("correct") is None:
-        return True
-    return False
+def _shot_needs_grade(shot: dict, judge_key: str) -> bool:
+    """True when this judge has no verdict yet for the shot."""
+    judges = shot.get("judges")
+    if isinstance(judges, dict) and judge_key in judges:
+        entry = judges[judge_key]
+        if entry is not None and entry.get("correct") is not None:
+            return False
+    # Legacy flat fields only count for the same judge label/id.
+    legacy_id = shot.get("grader")
+    if legacy_id and judge_label(legacy_id) == judge_key and shot.get("correct") is not None:
+        return False
+    return True
 
 
-def _record_needs_grade(record: dict) -> bool:
-    if record.get("pending_grade"):
-        return True
+def _record_needs_grade(record: dict, judge_key: str) -> bool:
     shots = record.get("shots") or []
-    return any(_shot_needs_grade(shot) for shot in shots)
+    if not shots:
+        return False
+    return any(_shot_needs_grade(shot, judge_key) for shot in shots)
 
 
 def load_grader(model_id: str = DEFAULT_GRADER_MODEL_ID) -> dict[str, Any]:
@@ -144,6 +157,7 @@ def grade_shot_batch(
     )
     outputs = handle["llm"].generate(prompts, sampling_params=sampling)
     results: list[dict] = []
+    model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
     for job, out in zip(jobs, outputs):
         text = ""
         outs = getattr(out, "outputs", None) or []
@@ -156,7 +170,7 @@ def grade_shot_batch(
             {
                 "correct": correct,
                 "grader_output": text,
-                "grader": handle.get("model_id") or DEFAULT_GRADER_MODEL_ID,
+                "grader": model_id,
                 "grader_verdict_raw": verdict,
                 "question": job.get("question"),
                 "answer": job.get("answer"),
@@ -170,10 +184,12 @@ def grade_predictions_file(
     predictions_path: Path,
     handle: dict[str, Any],
     *,
+    judge_key: str | None = None,
+    primary_judge: str | None = None,
     batch_size: int = 64,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Grade (or re-grade) all shots in a predictions.jsonl file in place."""
+    """Grade (or re-grade) one judge for all shots in a predictions.jsonl file."""
     if not predictions_path.exists():
         return {
             "status": "missing",
@@ -182,6 +198,10 @@ def grade_predictions_file(
             "n_shots_graded": 0,
         }
 
+    model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
+    key = judge_key or judge_label(model_id) or GRADER_LABEL
+    primary = primary_judge or key
+
     records: list[dict] = []
     with open(predictions_path, encoding="utf-8") as handle_in:
         for line in handle_in:
@@ -189,16 +209,23 @@ def grade_predictions_file(
             if stripped:
                 records.append(json.loads(stripped))
 
+    for record in records:
+        ensure_judge_schema(
+            record,
+            fallback_label=key,
+            fallback_model_id=model_id,
+        )
+
     jobs: list[dict] = []
     owners: list[tuple[int, int]] = []  # (record_index, shot_index)
     for record_index, record in enumerate(records):
-        if not force and not _record_needs_grade(record):
+        if not force and not _record_needs_grade(record, key):
             continue
         question = str(record.get("question") or "")
         answer = str(record.get("answer") or "")
         for shot in record.get("shots") or []:
             shot_index = int(shot.get("shot_index", 0))
-            if not force and not _shot_needs_grade(shot):
+            if not force and not _shot_needs_grade(shot, key):
                 continue
             prediction = (
                 shot.get("answer_prediction")
@@ -224,20 +251,30 @@ def grade_predictions_file(
             for shot in record.get("shots") or []:
                 if int(shot.get("shot_index", -1)) != shot_index:
                     continue
-                shot["correct"] = bool(result["correct"])
-                shot["grader"] = result["grader"]
-                shot["grader_output"] = result["grader_output"]
-                shot.pop("pending_grade", None)
+                judges = shot.setdefault("judges", {})
+                judges[key] = {
+                    "correct": bool(result["correct"]),
+                    "output": result["grader_output"],
+                    "model_id": model_id,
+                }
                 graded += 1
                 break
 
     for record in records:
-        if force or record.get("pending_grade") or any(
-            shot.get("grader") for shot in (record.get("shots") or [])
-        ):
-            recompute_n_shot_scores(record)
-            record["grader"] = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
-            record["scoring"] = "qwen_freeform_judge"
+        # Keep judge order: primary first, then any previously seen, then this key.
+        existing = [str(x) for x in (record.get("judges") or []) if x]
+        ordered: list[str] = []
+        if primary:
+            ordered.append(primary)
+        for label in existing:
+            if label not in ordered:
+                ordered.append(label)
+        if key not in ordered:
+            ordered.append(key)
+        record["judges"] = ordered
+        record["primary_judge"] = primary
+        record["scoring"] = "qwen_freeform_judge"
+        recompute_multi_judge_scores(record, primary)
 
     write_jsonl(predictions_path, records, mode="w")
     return {
@@ -245,5 +282,7 @@ def grade_predictions_file(
         "predictions_path": str(predictions_path),
         "n_records": len(records),
         "n_shots_graded": graded,
-        "grader": handle.get("model_id") or DEFAULT_GRADER_MODEL_ID,
+        "grader": model_id,
+        "judge_label": key,
+        "primary_judge": primary,
     }

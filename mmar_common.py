@@ -361,6 +361,213 @@ def recompute_n_shot_scores(record: dict) -> dict:
     return record
 
 
+STRING_MATCH_JUDGE_LABEL = "string-match"
+
+
+def judge_label(model_id: str | None) -> str:
+    """Slug for a judge HF id: last path segment, lowercased."""
+    text = str(model_id or "").strip()
+    if not text:
+        return ""
+    return text.rstrip("/").split("/")[-1].lower()
+
+
+def _shot_has_legacy_judge(shot: dict) -> bool:
+    return bool(shot.get("grader") or shot.get("grader_output")) or (
+        shot.get("correct") is not None and not shot.get("pending_grade")
+    )
+
+
+def ensure_judge_schema(
+    record: dict,
+    *,
+    fallback_label: str | None = None,
+    fallback_model_id: str | None = None,
+) -> dict:
+    """Idempotent in-place migration to the multi-judge shot schema.
+
+    Freeform: lift flat ``grader`` / ``grader_output`` / ``correct`` into
+    ``shot["judges"][label]``. MC: synthesize a ``string-match`` judge from
+    each shot's ``correct`` flag when no judges map exists yet.
+    """
+    shots = list(record.get("shots") or [])
+    scoring = str(record.get("scoring") or "").lower()
+    is_freeform = (
+        "freeform" in scoring
+        or "qwen_freeform" in scoring
+        or bool(record.get("grader"))
+        or any(
+            shot.get("grader") or shot.get("grader_output") or shot.get("pending_grade")
+            for shot in shots
+        )
+    )
+
+    for shot in shots:
+        judges = shot.get("judges")
+        if not isinstance(judges, dict):
+            judges = {}
+            shot["judges"] = judges
+
+        if judges:
+            continue
+
+        if is_freeform and _shot_has_legacy_judge(shot):
+            model_id = (
+                shot.get("grader")
+                or record.get("grader")
+                or fallback_model_id
+                or ""
+            )
+            label = (
+                judge_label(model_id)
+                or fallback_label
+                or "qwen2.5-3b-instruct"
+            )
+            if shot.get("correct") is not None or shot.get("grader_output") is not None:
+                judges[label] = {
+                    "correct": shot.get("correct"),
+                    "output": shot.get("grader_output"),
+                    "model_id": model_id or None,
+                }
+        elif not is_freeform and shot.get("correct") is not None:
+            judges[STRING_MATCH_JUDGE_LABEL] = {
+                "correct": bool(shot.get("correct")),
+                "output": "MATCH" if shot.get("correct") else "NO_MATCH",
+                "model_id": None,
+            }
+
+    # Preserve ordered judge list when already present.
+    if not record.get("judges"):
+        ordered: list[str] = []
+        for shot in shots:
+            for label in (shot.get("judges") or {}):
+                if label not in ordered:
+                    ordered.append(label)
+        if ordered:
+            record["judges"] = ordered
+
+    if not record.get("primary_judge") and record.get("judges"):
+        record["primary_judge"] = record["judges"][0]
+
+    return record
+
+
+def recompute_multi_judge_scores(
+    record: dict,
+    primary_label: str | None = None,
+) -> dict:
+    """Fill ``per_judge`` aggregates and mirror the primary judge onto canonical fields."""
+    ensure_judge_schema(record)
+    shots = list(record.get("shots") or [])
+    n_shots = len(shots)
+
+    ordered: list[str] = []
+    for label in record.get("judges") or []:
+        if label and label not in ordered:
+            ordered.append(str(label))
+    for shot in shots:
+        for label in (shot.get("judges") or {}):
+            if label not in ordered:
+                ordered.append(str(label))
+
+    primary = (
+        primary_label
+        or record.get("primary_judge")
+        or (ordered[0] if ordered else None)
+    )
+    if primary and primary not in ordered:
+        ordered.insert(0, primary)
+
+    per_judge: dict[str, dict] = {}
+    for label in ordered:
+        n_correct = 0
+        n_scored = 0
+        for shot in shots:
+            entry = (shot.get("judges") or {}).get(label)
+            if not entry or entry.get("correct") is None:
+                continue
+            n_scored += 1
+            n_correct += int(bool(entry.get("correct")))
+        if n_scored == 0:
+            per_judge[label] = {
+                "n_shots": n_shots,
+                "n_shot_correct": None,
+                "shot_success_rate": None,
+                "correct": None,
+            }
+        else:
+            per_judge[label] = {
+                "n_shots": n_shots,
+                "n_shot_correct": n_correct,
+                "shot_success_rate": (n_correct / n_shots) if n_shots else 0.0,
+                "correct": n_correct > 0,
+            }
+
+    record["judges"] = ordered
+    record["primary_judge"] = primary
+    record["per_judge"] = per_judge
+    record["n_shots"] = n_shots
+
+    if primary and primary in per_judge and per_judge[primary]["n_shot_correct"] is not None:
+        stats = per_judge[primary]
+        record["n_shot_correct"] = stats["n_shot_correct"]
+        record["shot_success_rate"] = stats["shot_success_rate"]
+        record["correct"] = stats["correct"]
+        # Mirror primary onto legacy flat shot fields (LLM judges only).
+        primary_model_id = None
+        for shot in shots:
+            entry = (shot.get("judges") or {}).get(primary) or {}
+            if "correct" in entry:
+                shot["correct"] = entry.get("correct")
+            if primary == STRING_MATCH_JUDGE_LABEL:
+                # Keep MC string-match clean — no legacy grader_* stamps.
+                shot.pop("grader", None)
+                shot.pop("grader_output", None)
+            else:
+                if entry.get("output") is not None:
+                    shot["grader_output"] = entry.get("output")
+                if entry.get("model_id"):
+                    shot["grader"] = entry.get("model_id")
+                    primary_model_id = entry.get("model_id")
+                else:
+                    shot["grader"] = primary
+                    primary_model_id = primary_model_id or primary
+            shot.pop("pending_grade", None)
+        if primary == STRING_MATCH_JUDGE_LABEL:
+            record.pop("grader", None)
+        elif primary_model_id:
+            record["grader"] = primary_model_id
+        else:
+            record["grader"] = primary
+        record.pop("pending_grade", None)
+    elif any(shot.get("pending_grade") for shot in shots) or record.get("pending_grade"):
+        # Still awaiting at least the primary judge.
+        record["n_shot_correct"] = None
+        record["shot_success_rate"] = None
+        record["correct"] = None
+    else:
+        # Fall back to legacy flat correct flags.
+        recompute_n_shot_scores(record)
+
+    # Prefer a correct primary shot for the record-level answer preview.
+    primary_shot = None
+    if primary:
+        for shot in shots:
+            entry = (shot.get("judges") or {}).get(primary) or {}
+            if entry.get("correct"):
+                primary_shot = shot
+                break
+    if primary_shot is None and shots:
+        primary_shot = next((s for s in shots if s.get("correct")), shots[0])
+    if primary_shot:
+        record["model_output"] = primary_shot.get("model_output")
+        record["raw_tokens"] = primary_shot.get("raw_tokens")
+        record["thinking_prediction"] = primary_shot.get("thinking_prediction")
+        record["answer_prediction"] = primary_shot.get("answer_prediction")
+
+    return record
+
+
 # ---------------------------------------------------------------------------
 # Rubric metadata / scoring
 # ---------------------------------------------------------------------------

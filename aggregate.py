@@ -113,6 +113,79 @@ def _record_rate(record: dict) -> float | None:
     return None
 
 
+def _collect_judge_meta(
+    manifest: dict,
+    by_model: dict[str, dict[str, dict]],
+) -> tuple[list[dict], str | None]:
+    """Return ``(judges entries, primary_judge label)`` for scores.json."""
+    entries: list[dict] = []
+    seen: set[str] = set()
+    primary = manifest.get("primary_judge")
+
+    for raw in manifest.get("judges") or []:
+        if isinstance(raw, dict):
+            label = str(raw.get("label") or "")
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            entries.append(
+                {
+                    "label": label,
+                    "model_id": raw.get("model_id"),
+                    "primary": bool(raw.get("primary")) or label == primary,
+                }
+            )
+        elif raw:
+            label = str(raw)
+            if label in seen:
+                continue
+            seen.add(label)
+            entries.append(
+                {
+                    "label": label,
+                    "model_id": None,
+                    "primary": label == primary,
+                }
+            )
+
+    # Fall back to scanning prediction records.
+    if not entries:
+        for preds in by_model.values():
+            for record in preds.values():
+                for label in record.get("judges") or []:
+                    if label and label not in seen:
+                        seen.add(str(label))
+                        entries.append(
+                            {
+                                "label": str(label),
+                                "model_id": None,
+                                "primary": False,
+                            }
+                        )
+                for shot in record.get("shots") or []:
+                    for label in (shot.get("judges") or {}):
+                        if label and label not in seen:
+                            seen.add(str(label))
+                            entries.append(
+                                {
+                                    "label": str(label),
+                                    "model_id": ((shot.get("judges") or {}).get(label) or {}).get(
+                                        "model_id"
+                                    ),
+                                    "primary": False,
+                                }
+                            )
+
+    if not primary and entries:
+        primary = entries[0]["label"]
+    for entry in entries:
+        entry["primary"] = entry["label"] == primary
+    # Ensure primary is first.
+    if primary:
+        entries.sort(key=lambda e: (0 if e["label"] == primary else 1, e["label"]))
+    return entries, primary
+
+
 def aggregate_difficulty(
     run_dir: Path | str,
     *,
@@ -125,7 +198,8 @@ def aggregate_difficulty(
     ``shot_success_rate``. Questions missing a model contribution are
     still included using the mean over available scored models. Ungraded
     freeform records (``pending_grade`` / null rate) are excluded from
-    averages rather than treated as 0%.
+    averages rather than treated as 0%. Ranking uses the primary judge's
+    canonical rates; per-judge breakdowns are stored alongside.
     """
     run_path = Path(run_dir)
     manifest: dict = {}
@@ -142,6 +216,7 @@ def aggregate_difficulty(
         else discover_model_labels(run_path, manifest=manifest)
     )
     by_model = load_model_predictions(run_path, labels)
+    judge_entries, primary_judge = _collect_judge_meta(manifest, by_model)
 
     ids_path = run_path / "question_ids.json"
     if question_ids is None:
@@ -171,6 +246,7 @@ def aggregate_difficulty(
                     "correct": None,
                     "missing": True,
                     "pending_grade": False,
+                    "per_judge": {},
                 }
                 continue
             if base is None:
@@ -185,6 +261,8 @@ def aggregate_difficulty(
                 "answer_prediction": record.get("answer_prediction"),
                 "missing": False,
                 "pending_grade": pending and rate is None,
+                "per_judge": dict(record.get("per_judge") or {}),
+                "primary_judge": record.get("primary_judge") or primary_judge,
             }
             if rate is not None:
                 rates.append(rate)
@@ -222,6 +300,10 @@ def aggregate_difficulty(
         rates: list[float] = []
         n_correct = 0
         n_pending = 0
+        per_judge_rates: dict[str, list[float]] = {
+            e["label"]: [] for e in judge_entries
+        }
+        per_judge_correct: dict[str, int] = {e["label"]: 0 for e in judge_entries}
         for qid in question_ids:
             record = preds.get(qid)
             if record is None:
@@ -232,13 +314,30 @@ def aggregate_difficulty(
                 continue
             rates.append(rate)
             n_correct += int(bool(record.get("correct")))
+            for jlabel, stats in (record.get("per_judge") or {}).items():
+                jrate = stats.get("shot_success_rate")
+                if jrate is None:
+                    continue
+                per_judge_rates.setdefault(jlabel, []).append(float(jrate))
+                per_judge_correct[jlabel] = per_judge_correct.get(jlabel, 0) + int(
+                    bool(stats.get("correct"))
+                )
         n = len(rates)
+        by_judge: dict[str, Any] = {}
+        for jlabel, jrates in per_judge_rates.items():
+            jn = len(jrates)
+            by_judge[jlabel] = {
+                "n": jn,
+                "accuracy": (per_judge_correct.get(jlabel, 0) / jn) if jn else None,
+                "avg_shot_success_rate": (sum(jrates) / jn) if jn else None,
+            }
         model_summaries[label] = {
             "n": n,
             "n_pending": n_pending,
             "accuracy": (n_correct / n) if n else None,
             "avg_shot_success_rate": (sum(rates) / n) if n else None,
             "missing": len(question_ids) - n - n_pending,
+            "per_judge": by_judge,
         }
 
     overall_rates = [
@@ -276,6 +375,10 @@ def aggregate_difficulty(
         scores["mode"] = manifest["mode"]
     if manifest.get("grader_model_id"):
         scores["grader_model_id"] = manifest["grader_model_id"]
+    if judge_entries:
+        scores["judges"] = judge_entries
+    if primary_judge:
+        scores["primary_judge"] = primary_judge
     if manifest.get("source_run_id"):
         scores["source_run_id"] = manifest["source_run_id"]
     if manifest.get("n_shots") is not None:

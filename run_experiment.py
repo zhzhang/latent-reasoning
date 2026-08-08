@@ -74,6 +74,7 @@ from mmar_models import (
 from mmar_common import (
     aggregate_n_shot_record,
     count_wavs,
+    judge_label,
     load_jsonl,
     make_run_id,
     resolve_path,
@@ -99,7 +100,8 @@ DEFAULT_N_SHOTS = 10
 DEFAULT_SEED = 42
 DEFAULT_MODE = "mc"
 DEFAULT_SOURCE_RUN_ID = "20260727T154400Z"
-DEFAULT_GRADER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen2.5-3B-Instruct",)
+DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
 
 # ---------------------------------------------------------------------------
 # Images
@@ -380,6 +382,42 @@ def _scoring_label(mode: str) -> str:
         if mode == "freeform"
         else "string_match_no_rubric"
     )
+
+
+def _parse_judge_model_ids(
+    judge_model_ids: str | None = None,
+    *,
+    grader_model_id: str | None = None,
+) -> list[str]:
+    """Ordered HF ids for freeform judges; first entry is primary.
+
+    ``grader_model_id`` is a back-compat single-judge alias used when
+    ``judge_model_ids`` is unset.
+    """
+    raw = (judge_model_ids or "").strip()
+    if raw:
+        ids = [part.strip() for part in raw.split(",") if part.strip()]
+    elif grader_model_id:
+        ids = [str(grader_model_id).strip()]
+    else:
+        ids = list(DEFAULT_JUDGE_MODEL_IDS)
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(ids))
+
+
+def _judge_manifest_entries(judge_model_ids: list[str]) -> list[dict]:
+    primary = judge_label(judge_model_ids[0]) if judge_model_ids else None
+    entries: list[dict] = []
+    for model_id in judge_model_ids:
+        label = judge_label(model_id)
+        entries.append(
+            {
+                "label": label,
+                "model_id": model_id,
+                "primary": label == primary,
+            }
+        )
+    return entries
 
 
 def _normalize_source_run_id(
@@ -827,6 +865,7 @@ def prepare_run(
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    judge_model_ids: str | None = None,
 ) -> dict:
     """Create question_ids + manifest before parallel model workers start.
 
@@ -842,6 +881,16 @@ def prepare_run(
     effective_source = _normalize_source_run_id(
         source_run_id, mode=prompt_mode, num_samples=num_samples
     )
+    judge_ids = _parse_judge_model_ids(
+        judge_model_ids, grader_model_id=grader_model_id
+    )
+    judge_entries = (
+        _judge_manifest_entries(judge_ids) if prompt_mode == "freeform" else []
+    )
+    primary_judge = (
+        judge_entries[0]["label"] if judge_entries else None
+    )
+    primary_model_id = judge_ids[0] if judge_ids and prompt_mode == "freeform" else None
 
     run_dir = _run_dir(output_dir, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -887,6 +936,23 @@ def prepare_run(
         label: resolve_sampling(label, override_ns) for label in merged_models
     }
 
+    # Merge judges from existing manifest when resuming freeform.
+    if prompt_mode == "freeform" and existing.get("judges") and not judge_model_ids:
+        existing_entries = existing.get("judges") or []
+        if existing_entries:
+            judge_entries = list(existing_entries)
+            primary_judge = existing.get("primary_judge") or judge_entries[0].get("label")
+            primary_model_id = existing.get("grader_model_id") or (
+                next(
+                    (
+                        e.get("model_id")
+                        for e in judge_entries
+                        if e.get("label") == primary_judge
+                    ),
+                    judge_entries[0].get("model_id"),
+                )
+            )
+
     manifest = {
         "run_id": run_id,
         "experiment": "exp-mmar-question-difficulty",
@@ -905,7 +971,13 @@ def prepare_run(
         "scoring": existing.get("scoring") or _scoring_label(prompt_mode),
         "grader_model_id": (
             existing.get("grader_model_id")
-            or (grader_model_id if prompt_mode == "freeform" else None)
+            or primary_model_id
+        ),
+        # For freeform, judge_entries/primary_judge already prefer existing
+        # manifest values when --judge-model-ids was not re-specified.
+        "judges": judge_entries if prompt_mode == "freeform" else existing.get("judges"),
+        "primary_judge": (
+            primary_judge if prompt_mode == "freeform" else existing.get("primary_judge")
         ),
         "source_run_id": existing.get("source_run_id") or effective_source,
         "inference": "vllm",
@@ -959,6 +1031,10 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
                 scores["mode"] = manifest["mode"]
             if manifest.get("grader_model_id"):
                 scores["grader_model_id"] = manifest["grader_model_id"]
+            if manifest.get("judges") is not None:
+                scores["judges"] = manifest["judges"]
+            if manifest.get("primary_judge"):
+                scores["primary_judge"] = manifest["primary_judge"]
             if manifest.get("source_run_id"):
                 scores["source_run_id"] = manifest["source_run_id"]
             write_json(run_dir / "scores.json", scores)
@@ -972,7 +1048,7 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
 
 @app.function(
     image=grader_image,
-    gpu="L40S",
+    gpu="H100",
     timeout=6 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
     secrets=[hf_secret],
@@ -983,10 +1059,12 @@ def run_freeform_grade(
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     model_labels: list[str] | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    judge_model_id: str | None = None,
+    primary_judge: str | None = None,
     batch_size: int = 64,
     force: bool = False,
 ) -> dict:
-    """Grade free-form predictions with Qwen2.5-3B-Instruct."""
+    """Grade free-form predictions with one local vLLM judge model."""
     from grader import grade_predictions_file, load_grader
 
     volume.reload()
@@ -996,15 +1074,24 @@ def run_freeform_grade(
     if not run_dir.exists():
         raise SystemExit(f"Run dir not found: {run_dir}")
 
+    model_id = judge_model_id or grader_model_id or DEFAULT_GRADER_MODEL_ID
+    judge_key = judge_label(model_id)
+    primary = primary_judge or judge_key
+
     labels = list(model_labels or DEFAULT_MODEL_LABELS)
-    handle = load_grader(grader_model_id)
+    handle = load_grader(model_id)
     per_model: dict[str, dict] = {}
     for label in labels:
         predictions_path = run_dir / "models" / label / "predictions.jsonl"
-        print(f"[grader] grading {label} -> {predictions_path}")
+        print(
+            f"[grader] grading {label} with {judge_key} "
+            f"(primary={primary}) -> {predictions_path}"
+        )
         per_model[label] = grade_predictions_file(
             predictions_path,
             handle,
+            judge_key=judge_key,
+            primary_judge=primary,
             batch_size=batch_size,
             force=force,
         )
@@ -1018,7 +1105,36 @@ def run_freeform_grade(
         except json.JSONDecodeError:
             manifest = {}
         manifest["scoring"] = "qwen_freeform_judge"
-        manifest["grader_model_id"] = grader_model_id
+        # Merge this judge into the manifest judges list.
+        entries = list(manifest.get("judges") or [])
+        by_label = {str(e.get("label")): e for e in entries if e.get("label")}
+        by_label[judge_key] = {
+            "label": judge_key,
+            "model_id": model_id,
+            "primary": judge_key == primary,
+        }
+        # Keep primary first.
+        ordered = []
+        if primary in by_label:
+            ordered.append(by_label[primary])
+        for label, entry in by_label.items():
+            if label == primary:
+                continue
+            entry["primary"] = False
+            ordered.append(entry)
+        if primary not in by_label and ordered:
+            ordered[0]["primary"] = True
+            primary = ordered[0]["label"]
+        for entry in ordered:
+            entry["primary"] = entry.get("label") == primary
+        manifest["judges"] = ordered
+        manifest["primary_judge"] = primary
+        primary_entry = next(
+            (e for e in ordered if e.get("label") == primary), None
+        )
+        manifest["grader_model_id"] = (
+            (primary_entry or {}).get("model_id") or model_id
+        )
         manifest["graded_at"] = datetime.now(timezone.utc).isoformat()
         write_json(manifest_path, manifest)
 
@@ -1026,7 +1142,9 @@ def run_freeform_grade(
     return {
         "status": "ok",
         "run_id": run_id,
-        "grader_model_id": grader_model_id,
+        "grader_model_id": model_id,
+        "judge_label": judge_key,
+        "primary_judge": primary,
         "by_model": per_model,
     }
 
@@ -1066,6 +1184,7 @@ def run_pipeline(
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
     grader_batch_size: int = 64,
@@ -1084,6 +1203,27 @@ def run_pipeline(
     effective_source = _normalize_source_run_id(
         source_run_id, mode=prompt_mode, num_samples=num_samples
     )
+    judge_ids = _parse_judge_model_ids(
+        judge_model_ids, grader_model_id=grader_model_id
+    )
+    primary_judge = judge_label(judge_ids[0]) if judge_ids else None
+
+    def _grade_all_judges() -> list[dict]:
+        results: list[dict] = []
+        for model_id in judge_ids:
+            grade = run_freeform_grade.remote(
+                run_id=resolved_run_id,
+                output_dir=output_dir,
+                model_labels=model_labels,
+                judge_model_id=model_id,
+                grader_model_id=model_id,
+                primary_judge=primary_judge,
+                batch_size=grader_batch_size,
+                force=force_grade,
+            )
+            print("Graded:", grade)
+            results.append(grade)
+        return results
 
     if aggregate_only:
         result = run_aggregate.remote(run_id=resolved_run_id, output_dir=output_dir)
@@ -1096,15 +1236,7 @@ def run_pipeline(
         }
 
     if grade_only:
-        grade = run_freeform_grade.remote(
-            run_id=resolved_run_id,
-            output_dir=output_dir,
-            model_labels=model_labels,
-            grader_model_id=grader_model_id,
-            batch_size=grader_batch_size,
-            force=force_grade,
-        )
-        print("Graded:", grade)
+        grade = _grade_all_judges()
         agg = None
         if not skip_aggregate:
             agg = run_aggregate.remote(
@@ -1160,7 +1292,8 @@ def run_pipeline(
         max_new_tokens=max_new_tokens,
         mode=prompt_mode,
         source_run_id=effective_source,
-        grader_model_id=grader_model_id,
+        grader_model_id=judge_ids[0] if judge_ids else grader_model_id,
+        judge_model_ids=",".join(judge_ids) if judge_ids else None,
     )
 
     progress = prep.get("progress") or {}
@@ -1213,15 +1346,7 @@ def run_pipeline(
 
     grade = None
     if prompt_mode == "freeform" and not skip_grade:
-        grade = run_freeform_grade.remote(
-            run_id=resolved_run_id,
-            output_dir=output_dir,
-            model_labels=model_labels,
-            grader_model_id=grader_model_id,
-            batch_size=grader_batch_size,
-            force=force_grade,
-        )
-        print("Graded:", grade)
+        grade = _grade_all_judges()
 
     if not skip_aggregate:
         agg = run_aggregate.remote(run_id=resolved_run_id, output_dir=output_dir)
@@ -1262,6 +1387,7 @@ def main(
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
+    judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
     grader_batch_size: int = 64,
@@ -1293,14 +1419,17 @@ def main(
         skip_aggregate: Run models but skip final aggregation.
         parallel_models: Spawn all model workers concurrently (default True).
         mode: ``mc`` (choices + string match) or ``freeform`` (no choices;
-            Qwen2.5-3B grades each shot).
+            local vLLM judges grade each shot).
         source_run_id: Copy ``question_ids.json`` from this prior run.
             Freeform defaults to ``20260727T154400Z``.
-        grader_model_id: Hugging Face id for the freeform judge.
-        grade_only: Skip generation; only run the freeform grader.
+        grader_model_id: Back-compat single-judge HF id (used when
+            ``judge_model_ids`` is unset).
+        judge_model_ids: Comma-separated HF ids for freeform judges; first
+            is primary (drives difficulty ranking).
+        grade_only: Skip generation; only run the freeform grader(s).
         force_grade: Re-grade shots even if already graded.
         grader_batch_size: Shots per grader generate() call.
-        skip_grade: Freeform generation without the Qwen grading pass.
+        skip_grade: Freeform generation without the grading pass.
     """
     # One remote spawn owns the full prepare→infer→grade→aggregate chain so
     # ``--detach`` does not stop the ephemeral app between phases.
@@ -1326,6 +1455,7 @@ def main(
         mode=mode,
         source_run_id=source_run_id,
         grader_model_id=grader_model_id,
+        judge_model_ids=judge_model_ids,
         grade_only=grade_only,
         force_grade=force_grade,
         grader_batch_size=grader_batch_size,

@@ -75,7 +75,12 @@ def infer_run_mode(
                 if record.get("pending_grade"):
                     saw_pending_grade = True
                 for shot in record.get("shots") or []:
-                    if shot.get("grader") or shot.get("grader_output"):
+                    judges = shot.get("judges") or {}
+                    if any(label != "string-match" for label in judges):
+                        saw_freeform_judge = True
+                    # Legacy flat grader fields imply a freeform LLM judge,
+                    # but ignore synthetic string-match stamps.
+                    elif shot.get("grader") or shot.get("grader_output"):
                         saw_freeform_judge = True
                     if shot.get("pending_grade"):
                         saw_pending_grade = True
@@ -94,6 +99,58 @@ def infer_run_mode(
     if saw_pending_grade:
         return "freeform"
     return "mc"
+
+
+def collect_judges(
+    manifest: dict | None = None,
+    scores: dict | None = None,
+    *,
+    predictions: dict[str, dict[str, dict]] | None = None,
+) -> list[dict]:
+    """Ordered judge entries ``[{label, model_id, primary}, ...]`` for a run."""
+    manifest = manifest or {}
+    scores = scores or {}
+    entries: list[dict] = []
+    seen: set[str] = set()
+    primary = scores.get("primary_judge") or manifest.get("primary_judge")
+
+    def _add(label: str | None, model_id: Any = None, is_primary: bool = False) -> None:
+        if not label or label in seen:
+            return
+        seen.add(str(label))
+        entries.append(
+            {
+                "label": str(label),
+                "model_id": model_id,
+                "primary": bool(is_primary) or str(label) == primary,
+            }
+        )
+
+    for raw in scores.get("judges") or manifest.get("judges") or []:
+        if isinstance(raw, dict):
+            _add(raw.get("label"), raw.get("model_id"), raw.get("primary"))
+        else:
+            _add(raw)
+
+    if predictions:
+        for per_model in predictions.values():
+            for record in per_model.values():
+                for label in record.get("judges") or []:
+                    _add(label)
+                for shot in record.get("shots") or []:
+                    for label, entry in (shot.get("judges") or {}).items():
+                        _add(
+                            label,
+                            (entry or {}).get("model_id") if isinstance(entry, dict) else None,
+                        )
+
+    if not primary and entries:
+        primary = entries[0]["label"]
+    for entry in entries:
+        entry["primary"] = entry["label"] == primary
+    if primary:
+        entries.sort(key=lambda e: (0 if e["label"] == primary else 1, e["label"]))
+    return entries
 
 
 def mode_label(mode: str) -> str:
@@ -357,6 +414,9 @@ def discover_runs(results_dir: Path) -> list[dict]:
                     "scoring": manifest.get("scoring") or scores.get("scoring"),
                     "grader_model_id": manifest.get("grader_model_id")
                     or scores.get("grader_model_id"),
+                    "judges": collect_judges(manifest, scores, predictions=sample_preds or None),
+                    "primary_judge": scores.get("primary_judge")
+                    or manifest.get("primary_judge"),
                     "source_run_id": manifest.get("source_run_id")
                     or scores.get("source_run_id"),
                 }
@@ -391,6 +451,12 @@ def load_run_bundle(run_id: str) -> dict[str, Any]:
         preds = load_jsonl(run_dir / "models" / label / "predictions.jsonl")
         predictions[label] = {str(p["id"]): p for p in preds if p.get("id")}
     mode = infer_run_mode(manifest, scores, predictions=predictions)
+    judges = collect_judges(manifest, scores, predictions=predictions)
+    primary_judge = (
+        scores.get("primary_judge")
+        or manifest.get("primary_judge")
+        or (judges[0]["label"] if judges else None)
+    )
     return {
         "difficulty": difficulty,
         "by_id": by_id,
@@ -400,6 +466,8 @@ def load_run_bundle(run_id: str) -> dict[str, Any]:
         "mode": mode,
         "mode_label": mode_label(mode),
         "model_labels": model_labels,
+        "judges": judges,
+        "primary_judge": primary_judge,
     }
 
 
@@ -641,6 +709,58 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 0.78rem; color: var(--muted);
     font-family: "IBM Plex Mono", monospace;
   }
+  .verdict-grid-wrap {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; margin: 0.75rem 0; overflow: auto;
+  }
+  .verdict-grid-wrap > .vg-title {
+    padding: 0.55rem 0.8rem; font-size: 0.78rem; font-weight: 600;
+    letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line); background: #f2f6f9;
+  }
+  .verdict-grid {
+    display: grid;
+    gap: 3px;
+    padding: 0.65rem 0.8rem 0.8rem;
+    align-items: center;
+    min-width: max-content;
+  }
+  .vg-corner { font-size: 0.72rem; color: var(--muted); }
+  .vg-judge {
+    text-align: center;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem; font-weight: 500;
+    padding: 0.15rem 0.25rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .vg-judge.primary { color: var(--accent); }
+  .vg-shot {
+    text-align: center;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.68rem; color: var(--muted);
+  }
+  .vg-model {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.75rem; font-weight: 500;
+    padding-right: 0.5rem; white-space: nowrap;
+  }
+  .vg-cell {
+    width: 1.05rem; height: 1.05rem; border-radius: 3px;
+    justify-self: center;
+    border: 1px solid transparent;
+  }
+  .vg-cell.pass { background: var(--good); }
+  .vg-cell.fail { background: var(--bad); }
+  .vg-cell.pending { background: #d5dde3; border-color: var(--line); }
+  .vg-cell.missing { background: transparent; border: 1px dashed var(--line); }
+  .judge-pills { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+  .judge-pill {
+    font-size: 0.68rem; font-family: "IBM Plex Mono", monospace;
+    padding: 0.08rem 0.35rem; border-radius: 999px;
+  }
+  .judge-pill.pass { color: var(--good); background: var(--soft-good); }
+  .judge-pill.fail { color: var(--bad); background: var(--soft-bad); }
+  .judge-pill.pending { color: var(--muted); background: #e8eef2; }
 </style>
 </head>
 <body>
@@ -682,6 +802,8 @@ const state = {
   mode: "mc",
   modeLabel: "MCQ",
   modelLabels: [],
+  judges: [],
+  primaryJudge: null,
   manifest: {},
   scores: {},
   questions: [],
@@ -709,15 +831,25 @@ function setHeaderMode(mode, modeLabel, manifest, scores) {
   badge.className = `mode-badge ${mode === "freeform" ? "freeform" : "mc"}`;
   badge.textContent = modeLabel || (mode === "freeform" ? "Freeform" : "MCQ");
   const sub = document.getElementById("brand-sub");
+  const judges = state.judges || [];
   if (mode === "freeform") {
-    sub.textContent = "Freeform answers · graded by Qwen judge · hardest-first";
+    const names = judges.map(j => j.label).filter(Boolean);
+    sub.textContent = names.length
+      ? `Freeform answers · judged by ${names.join(", ")} · hardest-first`
+      : "Freeform answers · graded by judge · hardest-first";
   } else {
     sub.textContent = "Multiple-choice · string-match scoring · hardest-first";
   }
   const metaBits = [];
   const scoring = manifest.scoring || scores.scoring;
   if (scoring) metaBits.push(`scoring: ${scoring}`);
-  if (manifest.grader_model_id || scores.grader_model_id) {
+  if (judges.length) {
+    const judgeBits = judges.map(j => {
+      const star = j.primary || j.label === state.primaryJudge ? "*" : "";
+      return `${j.label}${star}`;
+    });
+    metaBits.push(`judges: ${judgeBits.join(", ")}`);
+  } else if (manifest.grader_model_id || scores.grader_model_id) {
     metaBits.push(`grader: ${manifest.grader_model_id || scores.grader_model_id}`);
   }
   if (manifest.source_run_id || scores.source_run_id) {
@@ -827,6 +959,97 @@ function renderPromptAccordion(prompts, mode) {
   </details>`;
 }
 
+function shotJudgeEntry(shot, judgeLabel) {
+  const judges = shot.judges || {};
+  if (judges[judgeLabel]) return judges[judgeLabel];
+  // Legacy flat fields when this is the only / primary judge.
+  if (shot.grader && String(shot.grader).toLowerCase().endsWith(judgeLabel)) {
+    return { correct: shot.correct, output: shot.grader_output, model_id: shot.grader };
+  }
+  if (judgeLabel === "string-match" && shot.correct !== null && shot.correct !== undefined) {
+    return { correct: shot.correct, output: shot.correct ? "MATCH" : "NO_MATCH" };
+  }
+  return null;
+}
+
+function renderJudgePills(shot, judges) {
+  if (!judges.length) {
+    const pending = shot.pending_grade || shot.correct === null || shot.correct === undefined;
+    if (pending) return `<span class="chip">pending</span>`;
+    return `<span class="${shot.correct ? "pass" : "fail"}">${shot.correct ? "pass" : "fail"}</span>`;
+  }
+  const pills = judges.map(j => {
+    const entry = shotJudgeEntry(shot, j.label);
+    if (!entry || entry.correct === null || entry.correct === undefined) {
+      return `<span class="judge-pill pending" title="${escapeHtml(j.label)}: pending">${escapeHtml(j.label)}?</span>`;
+    }
+    const ok = !!entry.correct;
+    const tip = `${j.label}: ${entry.output ?? (ok ? "YES" : "NO")}`;
+    return `<span class="judge-pill ${ok ? "pass" : "fail"}" title="${escapeHtml(tip)}">${escapeHtml(j.label)} ${ok ? "✓" : "✗"}</span>`;
+  }).join("");
+  return `<span class="judge-pills">${pills}</span>`;
+}
+
+function renderVerdictGrid(modelLabels, predictions, judges) {
+  const labels = modelLabels || [];
+  let judgeList = (judges && judges.length) ? judges : [];
+  // Infer judges / n_shots from predictions when metadata is empty.
+  let nShots = 0;
+  for (const label of labels) {
+    const shots = ((predictions || {})[label] || {}).shots || [];
+    nShots = Math.max(nShots, shots.length);
+    if (!judgeList.length) {
+      for (const shot of shots) {
+        for (const j of Object.keys(shot.judges || {})) {
+          if (!judgeList.find(x => x.label === j)) judgeList.push({ label: j });
+        }
+      }
+    }
+  }
+  if (!labels.length || !nShots) return "";
+  if (!judgeList.length) {
+    judgeList = [{ label: state.mode === "freeform" ? "judge" : "string-match", primary: true }];
+  }
+  const cols = 1 + judgeList.length * nShots;
+  const judgeHeaders = judgeList.map(j => {
+    const primary = j.primary || j.label === state.primaryJudge;
+    return `<div class="vg-judge${primary ? " primary" : ""}" style="grid-column: span ${nShots}">${escapeHtml(j.label)}${primary ? " *" : ""}</div>`;
+  }).join("");
+  const shotHeaders = judgeList.map(() =>
+    Array.from({ length: nShots }, (_, i) => `<div class="vg-shot">s${i}</div>`).join("")
+  ).join("");
+  const rows = labels.map(label => {
+    const pred = (predictions || {})[label] || {};
+    const shots = pred.shots || [];
+    const cells = judgeList.map(j => {
+      return Array.from({ length: nShots }, (_, i) => {
+        const shot = shots.find(s => Number(s.shot_index) === i) || shots[i];
+        if (!shot) return `<div class="vg-cell missing" title="${escapeHtml(label)} / ${escapeHtml(j.label)} s${i}: missing"></div>`;
+        const entry = shotJudgeEntry(shot, j.label);
+        if (!entry || entry.correct === null || entry.correct === undefined) {
+          const pending = shot.pending_grade || shot.correct === null || shot.correct === undefined;
+          const cls = pending ? "pending" : "missing";
+          return `<div class="vg-cell ${cls}" title="${escapeHtml(label)} / ${escapeHtml(j.label)} s${i}: ${cls}"></div>`;
+        }
+        const ok = !!entry.correct;
+        const tip = `${label} / ${j.label} s${i}: ${ok ? "pass" : "fail"}${entry.output ? " — " + entry.output : ""}`;
+        return `<div class="vg-cell ${ok ? "pass" : "fail"}" title="${escapeHtml(tip)}"></div>`;
+      }).join("");
+    }).join("");
+    return `<div class="vg-model">${escapeHtml(label)}</div>${cells}`;
+  }).join("");
+  return `<div class="verdict-grid-wrap">
+    <div class="vg-title">Verdict grid · model × judge × shot</div>
+    <div class="verdict-grid" style="grid-template-columns: max-content repeat(${cols - 1}, 1.15rem)">
+      <div class="vg-corner"></div>
+      ${judgeHeaders}
+      <div class="vg-corner"></div>
+      ${shotHeaders}
+      ${rows}
+    </div>
+  </div>`;
+}
+
 async function selectQuestion(id) {
   state.selectedId = id;
   renderList();
@@ -836,6 +1059,8 @@ async function selectQuestion(id) {
   const row = data.difficulty;
   const mode = data.mode || state.mode;
   const modeLabel = data.mode_label || state.modeLabel;
+  const judges = (data.judges && data.judges.length) ? data.judges : state.judges;
+  if (data.primary_judge) state.primaryJudge = data.primary_judge;
   const choices = (row.choices || []).map((c, i) =>
     `<div>(${String.fromCharCode(65+i)}) ${escapeHtml(c)}</div>`
   ).join("");
@@ -843,6 +1068,7 @@ async function selectQuestion(id) {
   const labels = (data.model_labels && data.model_labels.length)
     ? data.model_labels
     : state.modelLabels;
+  const verdictGrid = renderVerdictGrid(labels, data.predictions || {}, judges);
   for (const label of labels) {
     const pred = (data.predictions || {})[label];
     const pm = (row.per_model || {})[label] || {};
@@ -852,23 +1078,12 @@ async function selectQuestion(id) {
     }
     const shots = pred.shots || [];
     const shotsHtml = shots.map(shot => {
-      const pending = shot.pending_grade || shot.correct === null || shot.correct === undefined;
-      const ok = shot.correct;
-      let verdict;
-      if (pending) {
-        verdict = `<span class="chip">pending</span>`;
-      } else {
-        verdict = `<span class="${ok ? "pass" : "fail"}">${ok ? "pass" : "fail"}</span>`;
-      }
-      const grader = shot.grader_output
-        ? `<span class="grader-note">judge: ${escapeHtml(shot.grader_output)}</span>`
-        : "";
+      const verdict = renderJudgePills(shot, judges);
       return `<div class="shot">
         <div class="shot-head">
           <span>shot ${shot.shot_index}</span>
           ${verdict}
           <span class="muted">parsed: ${escapeHtml(shot.answer_prediction || "")}</span>
-          ${grader}
         </div>
         <pre>${escapeHtml(shot.model_output || "")}</pre>
       </div>`;
@@ -897,6 +1112,7 @@ async function selectQuestion(id) {
     </div>
     <h3 style="margin:0.4rem 0 0.2rem">${escapeHtml(row.question || "")}</h3>
     <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")} · avg ${fmtRate(row.avg_success_rate)}</p>
+    ${verdictGrid}
     ${audio}
     ${renderPromptAccordion(data.prompts, mode)}
     <div class="${choicesClass}">${choicesTitle}${choices}</div>
@@ -912,6 +1128,8 @@ async function loadRun(runId) {
   state.mode = data.mode || "mc";
   state.modeLabel = data.mode_label || (state.mode === "freeform" ? "Freeform" : "MCQ");
   state.modelLabels = data.model_labels || data.manifest?.models || [];
+  state.judges = data.judges || [];
+  state.primaryJudge = data.primary_judge || (state.judges[0] && state.judges[0].label) || null;
   state.manifest = data.manifest || {};
   state.scores = data.scores || {};
   setHeaderMode(state.mode, state.modeLabel, state.manifest, state.scores);
@@ -996,6 +1214,8 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": bundle["mode"],
                     "mode_label": bundle["mode_label"],
                     "model_labels": bundle["model_labels"],
+                    "judges": bundle["judges"],
+                    "primary_judge": bundle["primary_judge"],
                 }
             )
             return
@@ -1034,6 +1254,8 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": bundle["mode"],
                     "mode_label": bundle["mode_label"],
                     "model_labels": model_labels,
+                    "judges": bundle["judges"],
+                    "primary_judge": bundle["primary_judge"],
                     "prompts": prompts,
                 }
             )

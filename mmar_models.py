@@ -137,7 +137,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "enforce_eager": True,
             "trust_remote_code": True,
             "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.97,
+            "gpu_memory_utilization": 0.95,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
