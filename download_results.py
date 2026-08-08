@@ -2,17 +2,18 @@
 
 Volume layout (mirrors locally under ``<repo>/outputs/``):
 
+    exp-mmar-question-difficulty/<run_id>/   # run_experiment.py (default)
+      question_ids.json
+      difficulty.jsonl
+      scores.json
+      manifest.json
+      models/<label>/predictions.jsonl
     mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
       predictions.evaluated.jsonl    # OpenAI rubric grades
       scores.json
       manifest.json
-    mmar/af-next-think/<run_id>/     # Audio Flamingo Next Think runs
-    exp-mmar-question-difficulty/<run_id>/
-      difficulty.jsonl
-      scores.json
-      manifest.json
-      models/<label>/predictions.jsonl
+    mmar/af-next-think/<run_id>/     # legacy single-model AF-Next runs
 
 ``modal volume get`` places the last path component under the local
 destination, so nested downloads must target the parent directory to
@@ -21,14 +22,15 @@ automatically.
 
 Usage:
 
+    # Default: all question-difficulty experiment runs
     uv run modal run download_results.py
     uv run modal run download_results.py --list-only
+    uv run modal run download_results.py \\
+      --remote-path exp-mmar-question-difficulty/20260807T031152Z
+    # Legacy single-model MMAR runs / full volume:
     uv run modal run download_results.py --remote-path mmar/af3
     uv run modal run download_results.py --remote-path mmar/af-next-think
-    uv run modal run download_results.py --remote-path mmar/af3/20260712T185300Z
-    uv run modal run download_results.py --remote-path exp-mmar-question-difficulty
-    uv run modal run download_results.py \\
-      --remote-path exp-mmar-question-difficulty/20260727T154400Z
+    uv run modal run download_results.py --remote-path /
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from pathlib import Path
 import modal
 
 RESULTS_VOLUME_NAME = "latent-reasoning-results"
-DEFAULT_REMOTE_PATH = "/"
+DEFAULT_REMOTE_PATH = "exp-mmar-question-difficulty"
 DEFAULT_LOCAL_DIR = Path(__file__).resolve().parent / "outputs"
 
 app = modal.App("download-results")
@@ -127,7 +129,8 @@ def main(
     """List or download files from ``latent-reasoning-results``.
 
     Args:
-        remote_path: Path inside the Volume (default: ``/``, the full tree).
+        remote_path: Path inside the Volume (default:
+            ``exp-mmar-question-difficulty``). Pass ``/`` for the full tree.
         local_dir: Local destination directory (default: ``<repo>/outputs``).
         list_only: Only print remote paths; do not download.
         force: Overwrite existing local files (passed to ``modal volume get``).
@@ -137,11 +140,16 @@ def main(
         return
 
     try:
-        download_results(remote_path=remote_path, local_dir=local_dir, force=force)
+        saved = download_results(
+            remote_path=remote_path, local_dir=local_dir, force=force
+        )
     except subprocess.CalledProcessError as exc:
         print(
             f"Download failed (exit {exc.returncode}). "
             "List what is on the volume with:\n"
-            "  uv run modal run download_results.py --list-only --remote-path /"
+            "  uv run modal run download_results.py --list-only"
         )
         raise SystemExit(exc.returncode) from exc
+
+    print("View with:\n  uv run python view_difficulty.py")
+    print(f"(saved under {saved})")

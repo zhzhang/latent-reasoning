@@ -1,21 +1,24 @@
 """Local viewer for MMAR question-difficulty experiment results.
 
-Browse fixed-sample questions sorted hardest-first by mean shot success
-rate across models, and inspect each model's 10 sampled responses.
+Browse questions sorted hardest-first by mean shot success rate across
+models, and inspect each model's sampled responses.
 
-Reads from ``outputs/exp-mmar-question-difficulty/<run_id>/``:
+Reads from ``outputs/`` (default), discovering run folders under
+``exp-mmar-question-difficulty/<run_id>/``:
 
     difficulty.jsonl
     scores.json
     manifest.json
     models/<label>/predictions.jsonl
 
+Missing ``difficulty.jsonl`` / ``scores.json`` are built on demand via
+``aggregate.aggregate_difficulty``.
+
 Usage:
 
     uv run python view_difficulty.py
-    uv run python view_difficulty.py --port 7861
-    uv run python view_difficulty.py \\
-      --results-dir ./outputs/exp-mmar-question-difficulty
+    uv run python view_difficulty.py --port 7860
+    uv run python view_difficulty.py --results-dir ./outputs
 """
 
 from __future__ import annotations
@@ -23,38 +26,61 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import shutil
+import tarfile
+import tempfile
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from aggregate import aggregate_difficulty, discover_model_labels
 from mmar_common import (
     AF_NEXT_THINK_SUFFIX,
     build_mmar_freeform_prompt,
     build_mmar_prompt,
 )
+from mmar_models import AF_NEXT_SYSTEM
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_RESULTS_DIR = REPO_ROOT / "outputs" / "exp-mmar-question-difficulty"
+DEFAULT_RESULTS_DIR = REPO_ROOT / "outputs"
+EXPERIMENT_SUBDIR = "exp-mmar-question-difficulty"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
 DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
-
-MODEL_LABELS = (
-    "af-next-think",
-    "mimo-audio-7b",
-    "interactive-omni-8b",
-    "qwen3-omni",
-    "voxtral-small-24b",
-)
+MMAR_REPO = "BoJack/MMAR"
+MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
+MIN_MMAR_WAVS = 1000
 
 CONFIG: dict[str, Any] = {}
 
 
-def infer_run_mode(manifest: dict | None = None, scores: dict | None = None) -> str:
-    """Return ``freeform`` or ``mc`` from manifest / scores stamps."""
+def infer_run_mode(
+    manifest: dict | None = None,
+    scores: dict | None = None,
+    *,
+    predictions: dict[str, dict[str, dict]] | None = None,
+) -> str:
+    """Return ``freeform`` or ``mc`` from manifest / scores / prediction stamps."""
     manifest = manifest or {}
     scores = scores or {}
+    saw_freeform_judge = False
+    saw_pending_grade = False
+    if predictions:
+        for per_model in predictions.values():
+            for record in per_model.values():
+                scoring = str(record.get("scoring") or "").lower()
+                if "freeform" in scoring or "qwen_freeform" in scoring:
+                    saw_freeform_judge = True
+                if record.get("pending_grade"):
+                    saw_pending_grade = True
+                for shot in record.get("shots") or []:
+                    if shot.get("grader") or shot.get("grader_output"):
+                        saw_freeform_judge = True
+                    if shot.get("pending_grade"):
+                        saw_pending_grade = True
+    if saw_freeform_judge:
+        return "freeform"
     mode = str(manifest.get("mode") or scores.get("mode") or "").strip().lower()
     if mode in {"freeform", "free_form", "free-form", "open"}:
         return "freeform"
@@ -64,6 +90,8 @@ def infer_run_mode(manifest: dict | None = None, scores: dict | None = None) -> 
         manifest.get("scoring") or scores.get("scoring") or ""
     ).lower()
     if "freeform" in scoring or "qwen_freeform" in scoring:
+        return "freeform"
+    if saw_pending_grade:
         return "freeform"
     return "mc"
 
@@ -97,8 +125,7 @@ def build_model_prompts(item: dict, mode: str) -> dict[str, str]:
     return {
         "shared": base,
         "af-next-think": (
-            "<|im_start|>system\n"
-            "You are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>system\n{AF_NEXT_SYSTEM}<|im_end|>\n"
             "<|im_start|>user\n"
             f"<sound>{af_base}<|im_end|>\n"
             "<|im_start|>assistant\n"
@@ -114,10 +141,6 @@ def build_model_prompts(item: dict, mode: str) -> dict[str, str]:
             f"{base}"
         ),
         "qwen3-omni": (
-            "<|im_start|>system\n"
-            "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
-            "Group, capable of perceiving auditory and visual inputs, as well as "
-            "generating text and speech.<|im_end|>\n"
             "<|im_start|>user\n"
             f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
             "<|im_start|>assistant\n"
@@ -153,57 +176,221 @@ def load_json(path: Path) -> dict | None:
         return json.load(handle)
 
 
+def count_wavs(audio_dir: Path) -> int:
+    if not audio_dir.is_dir():
+        return 0
+    return sum(
+        1
+        for path in audio_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".wav"
+    )
+
+
+def ensure_mmar_audio(audio_dir: Path, *, force: bool = False) -> Path:
+    """Download and extract the MMAR wav archive into ``audio_dir`` if needed."""
+    audio_dir = audio_dir.expanduser().resolve()
+    wav_count = count_wavs(audio_dir)
+    if wav_count >= MIN_MMAR_WAVS and not force:
+        print(f"MMAR audio ready: {wav_count} wav files in {audio_dir}", flush=True)
+        return audio_dir
+
+    from huggingface_hub import hf_hub_download
+
+    cache_root = audio_dir.parent
+    archive_cache = cache_root / MMAR_AUDIO_ARCHIVE
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"MMAR audio missing or incomplete ({wav_count} wavs); "
+        f"downloading {MMAR_AUDIO_ARCHIVE} from {MMAR_REPO} ...",
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="mmar-audio-") as tmp:
+        tmp_root = Path(tmp)
+        archive_tmp = Path(
+            hf_hub_download(
+                repo_id=MMAR_REPO,
+                filename=MMAR_AUDIO_ARCHIVE,
+                repo_type="dataset",
+                local_dir=str(tmp_root / "download"),
+            )
+        )
+        print(f"Extracting {archive_tmp.name} ...", flush=True)
+        extract_dir = tmp_root / "extract"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_tmp, "r:gz") as tar:
+            tar.extractall(path=extract_dir)
+
+        candidate_audio = extract_dir / "audio"
+        if not candidate_audio.is_dir():
+            matches = [path for path in extract_dir.rglob("audio") if path.is_dir()]
+            if not matches:
+                raise SystemExit(
+                    f"No audio/ directory found after extracting {archive_tmp}"
+                )
+            candidate_audio = matches[0]
+
+        if audio_dir.exists():
+            shutil.rmtree(audio_dir)
+        shutil.copytree(candidate_audio, audio_dir)
+        shutil.copy2(archive_tmp, archive_cache)
+
+    wav_count = count_wavs(audio_dir)
+    if wav_count < MIN_MMAR_WAVS:
+        raise SystemExit(
+            f"Expected at least {MIN_MMAR_WAVS} wav files in {audio_dir}, "
+            f"found {wav_count}."
+        )
+    print(f"MMAR audio ready: {wav_count} wav files in {audio_dir}", flush=True)
+    return audio_dir
+
+
+def is_experiment_run_dir(path: Path) -> bool:
+    """True for a run_experiment.py output folder."""
+    if not path.is_dir():
+        return False
+    if (path / "difficulty.jsonl").is_file() or (path / "manifest.json").is_file():
+        return True
+    models = path / "models"
+    return models.is_dir() and any(
+        (child / "predictions.jsonl").is_file()
+        for child in models.iterdir()
+        if child.is_dir()
+    )
+
+
+def resolve_run_roots(results_dir: Path) -> list[Path]:
+    """Directories that directly contain experiment run folders."""
+    results_dir = results_dir.expanduser().resolve()
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path) -> None:
+        if not path.is_dir():
+            return
+        resolved = path.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        roots.append(resolved)
+
+    exp = results_dir / EXPERIMENT_SUBDIR
+    if exp.is_dir():
+        _add(exp)
+    if results_dir.name == EXPERIMENT_SUBDIR:
+        _add(results_dir)
+    elif any(
+        is_experiment_run_dir(child)
+        for child in results_dir.iterdir()
+        if child.is_dir()
+    ):
+        _add(results_dir)
+    if not roots and results_dir.is_dir():
+        # Default layout even before the first download.
+        _add(exp if exp.parent == results_dir else results_dir)
+    return roots
+
+
+def needs_aggregation(run_dir: Path) -> bool:
+    return not (run_dir / "difficulty.jsonl").is_file() or not (
+        run_dir / "scores.json"
+    ).is_file()
+
+
+def ensure_aggregated(run_dir: Path, model_labels: list[str] | None = None) -> bool:
+    """Build difficulty.jsonl / scores.json when missing. Returns True if written."""
+    if not needs_aggregation(run_dir):
+        return False
+    labels = model_labels or discover_model_labels(run_dir)
+    if not labels:
+        return False
+    has_preds = any(
+        (run_dir / "models" / label / "predictions.jsonl").is_file()
+        for label in labels
+    )
+    if not has_preds:
+        return False
+    print(f"[viewer] aggregating scores for {run_dir.name} ...", flush=True)
+    aggregate_difficulty(run_dir, model_labels=labels)
+    load_run_bundle.cache_clear()
+    return True
+
+
 def discover_runs(results_dir: Path) -> list[dict]:
     runs: list[dict] = []
-    if not results_dir.is_dir():
-        return runs
-    for path in sorted(results_dir.iterdir(), reverse=True):
-        if not path.is_dir():
-            continue
-        manifest = load_json(path / "manifest.json") or {}
-        scores = load_json(path / "scores.json") or {}
-        difficulty = path / "difficulty.jsonl"
-        mode = infer_run_mode(manifest, scores)
-        runs.append(
-            {
-                "id": path.name,
-                "path": str(path),
-                "has_difficulty": difficulty.exists(),
-                "n_questions": scores.get("n_questions"),
-                "avg_success_rate": scores.get("avg_success_rate"),
-                "models": manifest.get("models") or list(MODEL_LABELS),
-                "seed": manifest.get("seed"),
-                "n_shots": manifest.get("n_shots"),
-                "temperature": manifest.get("temperature"),
-                "mode": mode,
-                "mode_label": mode_label(mode),
-                "scoring": manifest.get("scoring") or scores.get("scoring"),
-                "grader_model_id": manifest.get("grader_model_id")
-                or scores.get("grader_model_id"),
-                "source_run_id": manifest.get("source_run_id")
-                or scores.get("source_run_id"),
-            }
-        )
+    seen_ids: set[str] = set()
+    for root in resolve_run_roots(results_dir):
+        for path in sorted(root.iterdir(), reverse=True):
+            if not is_experiment_run_dir(path) or path.name in seen_ids:
+                continue
+            seen_ids.add(path.name)
+            manifest = load_json(path / "manifest.json") or {}
+            models = discover_model_labels(path, manifest=manifest)
+            ensure_aggregated(path, models)
+            scores = load_json(path / "scores.json") or {}
+            difficulty = path / "difficulty.jsonl"
+            # Lightweight mode hint from one prediction record when available.
+            sample_preds: dict[str, dict[str, dict]] = {}
+            for label in models[:1]:
+                rows = load_jsonl(path / "models" / label / "predictions.jsonl")
+                if rows:
+                    sample_preds[label] = {str(rows[0].get("id") or "0"): rows[0]}
+            mode = infer_run_mode(manifest, scores, predictions=sample_preds or None)
+            runs.append(
+                {
+                    "id": path.name,
+                    "path": str(path),
+                    "has_difficulty": difficulty.exists(),
+                    "n_questions": scores.get("n_questions")
+                    or manifest.get("n_questions")
+                    or manifest.get("num_samples"),
+                    "n_questions_scored": scores.get("n_questions_scored"),
+                    "n_questions_pending": scores.get("n_questions_pending"),
+                    "avg_success_rate": scores.get("avg_success_rate"),
+                    "models": models,
+                    "seed": manifest.get("seed"),
+                    "n_shots": manifest.get("n_shots"),
+                    "temperature": manifest.get("temperature"),
+                    "mode": mode,
+                    "mode_label": mode_label(mode),
+                    "scoring": manifest.get("scoring") or scores.get("scoring"),
+                    "grader_model_id": manifest.get("grader_model_id")
+                    or scores.get("grader_model_id"),
+                    "source_run_id": manifest.get("source_run_id")
+                    or scores.get("source_run_id"),
+                }
+            )
+    runs.sort(key=lambda row: row["id"], reverse=True)
     return runs
 
 
 def run_dir_for(run_id: str) -> Path:
-    return Path(CONFIG["results_dir"]) / run_id
+    results_dir = Path(CONFIG["results_dir"])
+    for root in resolve_run_roots(results_dir):
+        candidate = root / run_id
+        if candidate.is_dir():
+            return candidate
+    return results_dir / EXPERIMENT_SUBDIR / run_id
 
 
 @lru_cache(maxsize=8)
 def load_run_bundle(run_id: str) -> dict[str, Any]:
     run_dir = run_dir_for(run_id)
+    if not run_dir.is_dir():
+        raise FileNotFoundError(run_dir)
+    manifest = load_json(run_dir / "manifest.json") or {}
+    model_labels = discover_model_labels(run_dir, manifest=manifest)
+    ensure_aggregated(run_dir, model_labels)
     difficulty = load_jsonl(run_dir / "difficulty.jsonl")
     # Already hardest-first from aggregate; keep order.
     by_id = {str(row["id"]): row for row in difficulty}
+    scores = load_json(run_dir / "scores.json") or {}
     predictions: dict[str, dict[str, dict]] = {}
-    for label in MODEL_LABELS:
+    for label in model_labels:
         preds = load_jsonl(run_dir / "models" / label / "predictions.jsonl")
         predictions[label] = {str(p["id"]): p for p in preds if p.get("id")}
-    manifest = load_json(run_dir / "manifest.json") or {}
-    scores = load_json(run_dir / "scores.json") or {}
-    mode = infer_run_mode(manifest, scores)
+    mode = infer_run_mode(manifest, scores, predictions=predictions)
     return {
         "difficulty": difficulty,
         "by_id": by_id,
@@ -212,6 +399,7 @@ def load_run_bundle(run_id: str) -> dict[str, Any]:
         "manifest": manifest,
         "mode": mode,
         "mode_label": mode_label(mode),
+        "model_labels": model_labels,
     }
 
 
@@ -488,18 +676,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </section>
 </main>
 <script>
-const MODEL_LABELS = [
-  "af-next-think",
-  "mimo-audio-7b",
-  "interactive-omni-8b",
-  "qwen3-omni",
-  "voxtral-small-24b",
-];
 const state = {
   runs: [],
   runId: "",
   mode: "mc",
   modeLabel: "MCQ",
+  modelLabels: [],
   manifest: {},
   scores: {},
   questions: [],
@@ -542,21 +724,31 @@ function setHeaderMode(mode, modeLabel, manifest, scores) {
     metaBits.push(`source: ${manifest.source_run_id || scores.source_run_id}`);
   }
   if (manifest.n_shots || scores.n_shots) {
-    metaBits.push(`${manifest.n_shots || "—"} shots`);
+    metaBits.push(`${manifest.n_shots || scores.n_shots || "—"} shots`);
+  }
+  if (scores.n_questions_pending) {
+    metaBits.push(`${scores.n_questions_pending} pending grade`);
   }
   document.getElementById("run-meta").textContent = metaBits.join(" · ");
 }
 
 function renderStats(scores, mode, modeLabel) {
   const by = scores.by_model || {};
+  const labels = state.modelLabels.length
+    ? state.modelLabels
+    : Object.keys(by);
   const parts = [
     modeBadgeHtml(mode, modeLabel),
-    `<span><strong>${scores.n_questions ?? "—"}</strong> questions</span>`,
+    `<span><strong>${scores.n_questions ?? state.questions.length ?? "—"}</strong> questions</span>`,
     `<span>avg <strong>${fmtRate(scores.avg_success_rate)}</strong></span>`,
   ];
-  for (const label of MODEL_LABELS) {
+  if (scores.n_questions_pending) {
+    parts.push(`<span><strong>${scores.n_questions_pending}</strong> pending</span>`);
+  }
+  for (const label of labels) {
     const m = by[label] || {};
-    parts.push(`<span>${label}: <strong>${fmtRate(m.avg_shot_success_rate)}</strong></span>`);
+    const pending = m.n_pending ? ` (${m.n_pending} pend)` : "";
+    parts.push(`<span>${label}: <strong>${fmtRate(m.avg_shot_success_rate)}</strong>${pending}</span>`);
   }
   document.getElementById("stats").innerHTML = parts.join(" · ");
 }
@@ -564,13 +756,14 @@ function renderStats(scores, mode, modeLabel) {
 function renderList() {
   const q = document.getElementById("search").value.trim().toLowerCase();
   const list = document.getElementById("qlist");
+  const labels = state.modelLabels;
   const items = state.questions.filter(row => {
     if (!q) return true;
     return String(row.id).toLowerCase().includes(q)
       || String(row.question || "").toLowerCase().includes(q);
   });
   list.innerHTML = items.map(row => {
-    const chips = MODEL_LABELS.map(label => {
+    const chips = labels.map(label => {
       const pm = (row.per_model || {})[label] || {};
       return `<span class="chip">${label.split("-")[0]} ${fmtRate(pm.shot_success_rate)}</span>`;
     }).join("");
@@ -599,6 +792,7 @@ function renderPromptAccordion(prompts, mode) {
   if (!prompts) return "";
   const shared = prompts.shared || "";
   const modelOrder = [
+    ...state.modelLabels,
     "af-next-think",
     "mimo-audio-7b",
     "interactive-omni-8b",
@@ -606,8 +800,13 @@ function renderPromptAccordion(prompts, mode) {
     "voxtral-small-24b",
     "step-audio-2-mini",
   ];
+  const seen = new Set();
   const modelBlocks = modelOrder
-    .filter(label => prompts[label])
+    .filter(label => {
+      if (!prompts[label] || seen.has(label)) return false;
+      seen.add(label);
+      return true;
+    })
     .map(label => `<details class="prompt-model">
       <summary>${escapeHtml(label)}</summary>
       <pre>${escapeHtml(prompts[label])}</pre>
@@ -641,7 +840,10 @@ async function selectQuestion(id) {
     `<div>(${String.fromCharCode(65+i)}) ${escapeHtml(c)}</div>`
   ).join("");
   let modelsHtml = "";
-  for (const label of MODEL_LABELS) {
+  const labels = (data.model_labels && data.model_labels.length)
+    ? data.model_labels
+    : state.modelLabels;
+  for (const label of labels) {
     const pred = (data.predictions || {})[label];
     const pm = (row.per_model || {})[label] || {};
     if (!pred) {
@@ -650,23 +852,33 @@ async function selectQuestion(id) {
     }
     const shots = pred.shots || [];
     const shotsHtml = shots.map(shot => {
+      const pending = shot.pending_grade || shot.correct === null || shot.correct === undefined;
       const ok = shot.correct;
+      let verdict;
+      if (pending) {
+        verdict = `<span class="chip">pending</span>`;
+      } else {
+        verdict = `<span class="${ok ? "pass" : "fail"}">${ok ? "pass" : "fail"}</span>`;
+      }
       const grader = shot.grader_output
         ? `<span class="grader-note">judge: ${escapeHtml(shot.grader_output)}</span>`
         : "";
       return `<div class="shot">
         <div class="shot-head">
           <span>shot ${shot.shot_index}</span>
-          <span class="${ok ? "pass" : "fail"}">${ok ? "pass" : "fail"}</span>
+          ${verdict}
           <span class="muted">parsed: ${escapeHtml(shot.answer_prediction || "")}</span>
           ${grader}
         </div>
         <pre>${escapeHtml(shot.model_output || "")}</pre>
       </div>`;
     }).join("");
+    const rateChip = pm.pending_grade
+      ? `<span class="chip">pending grade</span>`
+      : `<span class="chip">${fmtRate(pm.shot_success_rate)} (${pm.n_shot_correct ?? "—"}/${pm.n_shots ?? "—"})</span>`;
     modelsHtml += `<div class="model-block">
       <h3>${label}
-        <span class="chip">${fmtRate(pm.shot_success_rate)} (${pm.n_shot_correct ?? "—"}/${pm.n_shots ?? "—"})</span>
+        ${rateChip}
       </h3>
       ${shotsHtml || "<p class='muted'>No shots stored.</p>"}
     </div>`;
@@ -699,6 +911,7 @@ async function loadRun(runId) {
   state.questions = data.questions || [];
   state.mode = data.mode || "mc";
   state.modeLabel = data.mode_label || (state.mode === "freeform" ? "Freeform" : "MCQ");
+  state.modelLabels = data.model_labels || data.manifest?.models || [];
   state.manifest = data.manifest || {};
   state.scores = data.scores || {};
   setHeaderMode(state.mode, state.modeLabel, state.manifest, state.scores);
@@ -719,8 +932,9 @@ async function init() {
   }
   sel.innerHTML = state.runs.map(r => {
     const tag = r.mode_label || (r.mode === "freeform" ? "Freeform" : "MCQ");
-    const avail = r.has_difficulty ? "" : " (no difficulty yet)";
-    return `<option value="${r.id}">[${tag}] ${r.id}${avail}</option>`;
+    const pending = r.n_questions_pending ? ` · ${r.n_questions_pending} pending` : "";
+    const avail = r.has_difficulty ? "" : " (no scores yet)";
+    return `<option value="${r.id}">[${tag}] ${r.id}${pending}${avail}</option>`;
   }).join("");
   sel.addEventListener("change", () => loadRun(sel.value));
   document.getElementById("search").addEventListener("input", renderList);
@@ -781,6 +995,7 @@ class Handler(BaseHTTPRequestHandler):
                     "manifest": bundle["manifest"],
                     "mode": bundle["mode"],
                     "mode_label": bundle["mode_label"],
+                    "model_labels": bundle["model_labels"],
                 }
             )
             return
@@ -796,9 +1011,10 @@ class Handler(BaseHTTPRequestHandler):
             if row is None:
                 self._send_json({"error": "question not found"}, 404)
                 return
+            model_labels = bundle["model_labels"]
             preds = {
                 label: bundle["predictions"].get(label, {}).get(qid)
-                for label in MODEL_LABELS
+                for label in model_labels
             }
             audio = resolve_audio(row.get("audio_path"))
             audio_url = None
@@ -806,7 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
                 audio_url = f"/audio/{audio.name}"
             # Prefer a prediction record (has full item fields) when building prompts.
             sample = next(
-                (preds[label] for label in MODEL_LABELS if preds.get(label)),
+                (preds[label] for label in model_labels if preds.get(label)),
                 row,
             )
             prompts = build_model_prompts(sample, bundle["mode"])
@@ -817,6 +1033,7 @@ class Handler(BaseHTTPRequestHandler):
                     "audio_url": audio_url,
                     "mode": bundle["mode"],
                     "mode_label": bundle["mode_label"],
+                    "model_labels": model_labels,
                     "prompts": prompts,
                 }
             )
@@ -838,12 +1055,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=7861)
+    parser.add_argument("--port", type=int, default=7860)
     parser.add_argument(
         "--results-dir",
         type=Path,
         default=DEFAULT_RESULTS_DIR,
-        help="Directory containing run folders",
+        help="Local outputs directory (discovers exp-mmar-question-difficulty/)",
     )
     parser.add_argument(
         "--audio-dir",
@@ -851,17 +1068,47 @@ def main() -> None:
         default=DEFAULT_AUDIO_DIR,
         help="Local MMAR wav directory",
     )
+    parser.add_argument(
+        "--skip-audio-download",
+        action="store_true",
+        help="Do not download MMAR wavs if the local audio cache is incomplete",
+    )
+    parser.add_argument(
+        "--force-audio-download",
+        action="store_true",
+        help="Re-download the MMAR wav archive even if wavs are present",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
     CONFIG["results_dir"] = args.results_dir.expanduser().resolve()
-    CONFIG["audio_dir"] = args.audio_dir.expanduser().resolve()
+    audio_dir = args.audio_dir.expanduser().resolve()
+    if not args.skip_audio_download:
+        try:
+            audio_dir = ensure_mmar_audio(
+                audio_dir, force=args.force_audio_download
+            )
+        except SystemExit as exc:
+            print(f"Audio setup failed: {exc}", flush=True)
+            print("Continuing without local audio; pass --skip-audio-download to silence.")
+    CONFIG["audio_dir"] = audio_dir
     load_run_bundle.cache_clear()
 
     print(f"Results: {CONFIG['results_dir']}")
+    for root in resolve_run_roots(CONFIG["results_dir"]):
+        print(f"  run root: {root}")
     print(f"Audio:   {CONFIG['audio_dir']}")
     runs = discover_runs(CONFIG["results_dir"])
     print(f"Found {len(runs)} run(s)")
+    for run in runs:
+        rate = run.get("avg_success_rate")
+        rate_s = f"{100 * rate:.1f}%" if rate is not None else "—"
+        pending = run.get("n_questions_pending") or 0
+        pending_s = f", {pending} pending" if pending else ""
+        print(
+            f"  [{run['mode_label']}] {run['id']}: "
+            f"{len(run['models'])} models, avg {rate_s}{pending_s}"
+        )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Open http://{args.host}:{args.port}")
     try:

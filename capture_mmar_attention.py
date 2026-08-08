@@ -29,6 +29,8 @@ import modal
 
 from audio_flamingo_runtime import (
     generate_one_with_attentions,
+    load_audio_flamingo3,
+    load_audio_flamingo_next,
     save_attention_artifact,
     seed_everything,
 )
@@ -54,10 +56,7 @@ from modal_cache import (
 
 DEFAULT_REPETITION_PENALTY = 1.2
 
-image = mmar_eval_image(
-    "run_audio_flamingo3_mmar",
-    "run_audio_flamingo_next_mmar",
-)
+image = mmar_eval_image()
 app = modal.App("capture-mmar-attention", image=image)
 
 
@@ -179,15 +178,11 @@ def capture_attention(
     )
 
     if family == "af-next-think":
-        from run_audio_flamingo_next_mmar import load_audio_flamingo_next
-
         model, processor = load_audio_flamingo_next(args)
         build_prompt = lambda s: build_mmar_prompt(s, think_suffix=AF_NEXT_THINK_SUFFIX)
         parse_output = parse_think_tagged_output
         generation_extra = {"repetition_penalty": repetition_penalty}
     else:
-        from run_audio_flamingo3_mmar import load_audio_flamingo3
-
         model, processor = load_audio_flamingo3(args)
         build_prompt = lambda s: build_mmar_prompt(
             s, think_suffix=AF3_THINK_SUFFIX if think else None

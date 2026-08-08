@@ -59,10 +59,13 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
+        # HF generation_config.json: max_new_tokens=2048 + README repetition_penalty
+        # 1.2 (card omits do_sample ⇒ greedy). We use T=0.2 like Voxtral so
+        # n-shot difficulty runs keep mild sample variance.
         "sampling": {
-            "temperature": 1.0,
+            "temperature": 0.2,
             "top_p": 1.0,
-            "max_tokens": 512,
+            "max_tokens": 2048,
             "repetition_penalty": 1.2,
         },
     },
@@ -73,9 +76,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm_omni",
         "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
         "sampling_rate": 24000,
+        # Official MiMo-Audio audio_understanding global sampler (HF card →
+        # XiaomiMiMo/MiMo-Audio inference): T=0.3, top_p=0.95. repetition_penalty
+        # 1.1 matches vLLM-Omni's mimo_audio deploy defaults.
         "sampling": {
-            "temperature": 1.0,
-            "top_p": 1.0,
+            "temperature": 0.3,
+            "top_p": 0.95,
             "max_tokens": 512,
             "repetition_penalty": 1.1,
         },
@@ -102,11 +108,13 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
+        # HF README: generation_config = dict(max_new_tokens=1024, do_sample=True)
+        # (no temp/top_p/rep → transformers sampling defaults T=1.0, top_p=1.0).
         "sampling": {
             "temperature": 1.0,
             "top_p": 1.0,
-            "max_tokens": 512,
-            "repetition_penalty": 1.1,
+            "max_tokens": 1024,
+            "repetition_penalty": 1.0,
         },
     },
     # MoE thinker-only (~3B active); fits one A100-80GB via plain vLLM.
@@ -338,6 +346,19 @@ def _parse_fn_for(args: SimpleNamespace, default: Callable = parse_choice_output
 # ---------------------------------------------------------------------------
 
 
+# From nvidia/audio-flamingo-next-think-hf chat_template.jinja (injected when
+# the conversation has no system turn).
+AF_NEXT_SYSTEM = (
+    "You are Audio Flamingo-Next, a multimodal assistant for language and "
+    "audio. On each turn you receive an optional audio clip which may contain "
+    "speech, music, or ambient sounds and optional text, you will receive at "
+    "least one or both; use your world knowledge and reasoning to help the "
+    "user with any task. Interpret the entirety of the content of any input "
+    "audio—regardless of whether the user calls it audio, speech, music, or "
+    "sound."
+)
+
+
 def _af_next_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     question = _build_prompt(
         sample,
@@ -346,8 +367,7 @@ def _af_next_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     )
     # MusicFlamingo / AF-Next chat format (same placeholder family as AF3).
     return (
-        "<|im_start|>system\n"
-        "You are a helpful assistant.<|im_end|>\n"
+        f"<|im_start|>system\n{AF_NEXT_SYSTEM}<|im_end|>\n"
         "<|im_start|>user\n"
         f"<sound>{question}<|im_end|>\n"
         "<|im_start|>assistant\n"
@@ -400,17 +420,11 @@ def _interactive_omni_messages(sample: dict, args: SimpleNamespace | None = None
     ]
 
 
-QWEN3_OMNI_SYSTEM = (
-    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
-    "Group, capable of perceiving auditory and visual inputs, as well as "
-    "generating text and speech."
-)
-
-
 def _qwen3_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    # Qwen3-Omni Thinking primary examples omit a system turn; the chat
+    # template only emits one when messages[0].role == "system".
     question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     return (
-        f"<|im_start|>system\n{QWEN3_OMNI_SYSTEM}<|im_end|>\n"
         "<|im_start|>user\n"
         f"<|audio_start|><|audio_pad|><|audio_end|>{question}<|im_end|>\n"
         "<|im_start|>assistant\n"

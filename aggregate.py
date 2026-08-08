@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+# Default experiment model set (used by run_experiment aggregation).
 MODEL_LABELS = (
     "af-next-think",
     "mimo-audio-7b",
@@ -13,6 +14,8 @@ MODEL_LABELS = (
     "qwen3-omni",
     "voxtral-small-24b",
 )
+# Preferred display / discovery order; extras append after known labels.
+MODEL_LABEL_ORDER = MODEL_LABELS + ("step-audio-2-mini",)
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -52,6 +55,34 @@ def _index_by_id(records: list[dict]) -> dict[str, dict]:
     return out
 
 
+def order_model_labels(labels: list[str] | tuple[str, ...]) -> list[str]:
+    found = list(dict.fromkeys(str(x) for x in labels if x))
+    known = [label for label in MODEL_LABEL_ORDER if label in found]
+    rest = [label for label in found if label not in MODEL_LABEL_ORDER]
+    return known + rest
+
+
+def discover_model_labels(
+    run_dir: Path,
+    *,
+    manifest: dict | None = None,
+    fallback: tuple[str, ...] | list[str] = MODEL_LABELS,
+) -> list[str]:
+    """Models that have ``predictions.jsonl`` on disk (else manifest / fallback)."""
+    labels: list[str] = []
+    models_root = Path(run_dir) / "models"
+    if models_root.is_dir():
+        for child in sorted(models_root.iterdir()):
+            if child.is_dir() and (child / "predictions.jsonl").is_file():
+                labels.append(child.name)
+    if labels:
+        return order_model_labels(labels)
+    from_manifest = [str(x) for x in (manifest or {}).get("models") or []]
+    if from_manifest:
+        return order_model_labels(from_manifest)
+    return order_model_labels(list(fallback))
+
+
 def load_model_predictions(
     run_dir: Path,
     model_labels: tuple[str, ...] | list[str] = MODEL_LABELS,
@@ -65,20 +96,52 @@ def load_model_predictions(
     return by_model
 
 
+def _record_rate(record: dict) -> float | None:
+    """Return shot success rate, or None when the record is still unscored."""
+    rate = record.get("shot_success_rate")
+    if rate is not None:
+        return float(rate)
+    if record.get("pending_grade"):
+        return None
+    n_shots = record.get("n_shots")
+    n_correct = record.get("n_shot_correct")
+    if n_shots and n_correct is not None:
+        return float(n_correct) / float(n_shots)
+    shots = record.get("shots") or []
+    if shots and all(shot.get("correct") is not None for shot in shots):
+        return sum(1 for shot in shots if shot.get("correct")) / len(shots)
+    return None
+
+
 def aggregate_difficulty(
     run_dir: Path | str,
     *,
     question_ids: list[str] | None = None,
-    model_labels: tuple[str, ...] | list[str] = MODEL_LABELS,
+    model_labels: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Write ``difficulty.jsonl`` (hardest first) and ``scores.json``.
 
     Per-question ``avg_success_rate`` is the mean of each model's
     ``shot_success_rate``. Questions missing a model contribution are
-    still included using the mean over available models.
+    still included using the mean over available scored models. Ungraded
+    freeform records (``pending_grade`` / null rate) are excluded from
+    averages rather than treated as 0%.
     """
     run_path = Path(run_dir)
-    by_model = load_model_predictions(run_path, model_labels)
+    manifest: dict = {}
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            manifest = {}
+
+    labels = (
+        order_model_labels(list(model_labels))
+        if model_labels is not None
+        else discover_model_labels(run_path, manifest=manifest)
+    )
+    by_model = load_model_predictions(run_path, labels)
 
     ids_path = run_path / "question_ids.json"
     if question_ids is None:
@@ -98,7 +161,7 @@ def aggregate_difficulty(
         per_model: dict[str, Any] = {}
         rates: list[float] = []
         base: dict | None = None
-        for label in model_labels:
+        for label in labels:
             record = by_model.get(label, {}).get(qid)
             if record is None:
                 per_model[label] = {
@@ -107,12 +170,13 @@ def aggregate_difficulty(
                     "n_shots": None,
                     "correct": None,
                     "missing": True,
+                    "pending_grade": False,
                 }
                 continue
             if base is None:
                 base = record
-            rate = float(record.get("shot_success_rate") or 0.0)
-            rates.append(rate)
+            rate = _record_rate(record)
+            pending = bool(record.get("pending_grade")) or rate is None
             per_model[label] = {
                 "shot_success_rate": rate,
                 "n_shot_correct": record.get("n_shot_correct"),
@@ -120,9 +184,12 @@ def aggregate_difficulty(
                 "correct": record.get("correct"),
                 "answer_prediction": record.get("answer_prediction"),
                 "missing": False,
+                "pending_grade": pending and rate is None,
             }
+            if rate is not None:
+                rates.append(rate)
 
-        avg = (sum(rates) / len(rates)) if rates else 0.0
+        avg = (sum(rates) / len(rates)) if rates else None
         row = {
             "id": qid,
             "avg_success_rate": avg,
@@ -139,32 +206,49 @@ def aggregate_difficulty(
         }
         difficulty_rows.append(row)
 
-    difficulty_rows.sort(key=lambda r: (r["avg_success_rate"], str(r["id"])))
+    # Hardest first among scored questions; unscored (all pending) last.
+    difficulty_rows.sort(
+        key=lambda r: (
+            0 if r["n_models_scored"] else 1,
+            float(r["avg_success_rate"]) if r["avg_success_rate"] is not None else 1.0,
+            str(r["id"]),
+        )
+    )
 
     # Per-model summary over the fixed question set.
     model_summaries: dict[str, Any] = {}
-    for label in model_labels:
+    for label in labels:
         preds = by_model.get(label, {})
-        rates = []
+        rates: list[float] = []
         n_correct = 0
+        n_pending = 0
         for qid in question_ids:
             record = preds.get(qid)
             if record is None:
                 continue
-            rates.append(float(record.get("shot_success_rate") or 0.0))
+            rate = _record_rate(record)
+            if rate is None:
+                n_pending += 1
+                continue
+            rates.append(rate)
             n_correct += int(bool(record.get("correct")))
         n = len(rates)
         model_summaries[label] = {
             "n": n,
+            "n_pending": n_pending,
             "accuracy": (n_correct / n) if n else None,
             "avg_shot_success_rate": (sum(rates) / n) if n else None,
-            "missing": len(question_ids) - n,
+            "missing": len(question_ids) - n - n_pending,
         }
 
-    overall_rates = [r["avg_success_rate"] for r in difficulty_rows if r["n_models_scored"]]
+    overall_rates = [
+        r["avg_success_rate"]
+        for r in difficulty_rows
+        if r["n_models_scored"] and r["avg_success_rate"] is not None
+    ]
     # Prefer per-record scoring stamp (freeform judge) when present.
     scoring = "mean_shot_success_rate_string_match"
-    for label in model_labels:
+    for label in labels:
         for record in by_model.get(label, {}).values():
             if record.get("scoring"):
                 scoring = f"mean_shot_success_rate_{record['scoring']}"
@@ -172,17 +256,30 @@ def aggregate_difficulty(
         else:
             continue
         break
+    if manifest.get("scoring"):
+        scoring = str(manifest["scoring"])
+
     scores = {
         "n_questions": len(difficulty_rows),
-        "n_models": len(model_labels),
-        "model_labels": list(model_labels),
+        "n_models": len(labels),
+        "model_labels": list(labels),
         "scoring": scoring,
         "sort": "avg_success_rate_asc_hardest_first",
         "avg_success_rate": (
             sum(overall_rates) / len(overall_rates) if overall_rates else None
         ),
         "by_model": model_summaries,
+        "n_questions_scored": len(overall_rates),
+        "n_questions_pending": len(difficulty_rows) - len(overall_rates),
     }
+    if manifest.get("mode"):
+        scores["mode"] = manifest["mode"]
+    if manifest.get("grader_model_id"):
+        scores["grader_model_id"] = manifest["grader_model_id"]
+    if manifest.get("source_run_id"):
+        scores["source_run_id"] = manifest["source_run_id"]
+    if manifest.get("n_shots") is not None:
+        scores["n_shots"] = manifest["n_shots"]
 
     write_jsonl(run_path / "difficulty.jsonl", difficulty_rows)
     write_json(run_path / "scores.json", scores)

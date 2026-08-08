@@ -522,6 +522,100 @@ def resolve_model_dir(model_id: str, local_model_dir: str | None) -> str:
     return str(seeded)
 
 
+def load_audio_flamingo_next(args):
+    """Load AF-Next / MusicFlamingo via HuggingFace transformers."""
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoProcessor
+
+    target_dtype = torch_dtype_value(torch, args.torch_dtype)
+    if target_dtype == "auto":
+        target_dtype = torch.bfloat16
+
+    local_id = resolve_model_dir(args.model_id, args.local_model_dir)
+    device_map = getattr(args, "device_map", "auto")
+    attn_implementation = getattr(args, "attn_implementation", None)
+
+    processor = AutoProcessor.from_pretrained(local_id)
+    load_kwargs: dict = {"dtype": target_dtype}
+    if attn_implementation:
+        load_kwargs["attn_implementation"] = attn_implementation
+    if device_map in (None, "auto"):
+        load_kwargs["device_map"] = "auto"
+    elif device_map in ("cuda", "cuda:0"):
+        load_kwargs["device_map"] = {"": "cuda:0"} if torch.cuda.is_available() else "cpu"
+    else:
+        load_kwargs["device_map"] = device_map
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(local_id, **load_kwargs)
+    # Audio-tower LayerNorms can remain float32 after dtype=bfloat16 load.
+    cast_model_floating_tensors(model, target_dtype)
+    model.eval()
+    print(
+        f"Model ready: class={type(model).__name__} (HF), "
+        f"param_dtype={model_param_dtype(model)}, "
+        f"audio_tower_dtype={audio_tower_dtype(model)}, "
+        f"device={model_input_device(model)}"
+    )
+    return model, processor
+
+
+def load_audio_flamingo3(args):
+    """Load Audio Flamingo 3 (+ optional AF-Think PEFT adapter)."""
+    import torch
+    from peft import PeftModel
+    from transformers import AudioFlamingo3ForConditionalGeneration, AutoProcessor
+
+    target_dtype = torch_dtype_value(torch, args.torch_dtype)
+    kwargs = {
+        "device_map": args.device_map,
+        "torch_dtype": target_dtype,
+    }
+    if args.attn_implementation:
+        kwargs["attn_implementation"] = args.attn_implementation
+
+    local_id = resolve_model_dir(args.model_id, args.local_model_dir)
+    processor = AutoProcessor.from_pretrained(local_id)
+    model = AudioFlamingo3ForConditionalGeneration.from_pretrained(local_id, **kwargs)
+
+    if not args.no_think:
+        non_lora_path = os.path.join(local_id, "think", "non_lora_trainables.bin")
+        if not os.path.exists(non_lora_path):
+            raise SystemExit(
+                f"Think adapter weights not found at {non_lora_path}. "
+                "Re-seed with seed_volume.py --models af3 (think/*.bin must be kept), "
+                "or pass --no-think."
+            )
+
+        print("Loading AF-Think PEFT adapter ...")
+        # non_lora weights are typically saved as float32; cast before load so we
+        # do not silently mix Float and BFloat16 parameters inside the encoder.
+        resolve_dtype = (
+            model_param_dtype(model) if target_dtype == "auto" else target_dtype
+        )
+        non_lora_trainables = cast_floating_state_dict(
+            torch.load(
+                non_lora_path,
+                map_location="cpu",
+                weights_only=False,
+            ),
+            resolve_dtype,
+        )
+        model.load_state_dict(non_lora_trainables, strict=False)
+        model = PeftModel.from_pretrained(model, local_id, subfolder="think")
+
+    # Unify floating dtypes after adapter load. Think non_lora weights and some
+    # embeddings/LayerNorms otherwise remain float32 while convs are bf16.
+    unify_dtype = model_param_dtype(model) if target_dtype == "auto" else target_dtype
+    cast_model_floating_tensors(model, unify_dtype)
+    model.eval()
+    print(
+        f"Model ready: param_dtype={model_param_dtype(model)}, "
+        f"audio_tower_dtype={audio_tower_dtype(model)}, "
+        f"device={model_input_device(model)}"
+    )
+    return model, processor
+
+
 def processor_tokenizer(processor):
     return getattr(processor, "tokenizer", processor)
 

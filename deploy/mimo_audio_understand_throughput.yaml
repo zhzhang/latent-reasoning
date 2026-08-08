@@ -30,9 +30,10 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
+    # Match Xiaomi audio_understanding global sampler + Omni rep penalty.
     default_sampling_params:
-      temperature: 1.0
-      top_p: 1.0
+      temperature: 0.3
+      top_p: 0.95
       top_k: -1
       max_tokens: 512
       seed: 42
