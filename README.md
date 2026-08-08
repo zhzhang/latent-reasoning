@@ -39,9 +39,11 @@ uv run modal run seed_volume.py --datasets mmar \
 
 # Freeform judge weights (add more aliases as needed)
 uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
+uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-27b-fp8
 ```
 
 `mimo-audio-7b` also seeds `XiaomiMiMo/MiMo-Audio-Tokenizer` automatically.
+Judge aliases: `qwen2.5-3b`, `qwen3.6-27b-fp8` (→ `Qwen/Qwen3.6-27B-FP8`).
 
 ## Run
 
@@ -57,7 +59,7 @@ uv run modal run --detach run_experiment.py \
 # Multiple judges (first is primary — drives difficulty ranking)
 uv run modal run --detach run_experiment.py \
   --mode freeform --source-run-id 20260727T154400Z \
-  --judge-model-ids Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen3-8B
+  --judge-model-ids qwen2.5-3b,qwen3.6-27b-fp8
 
 # Smoke test one model on 8 questions (plain vLLM: SamplingParams n=2)
 uv run modal run run_experiment.py \
@@ -158,12 +160,12 @@ uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
 # Add a judge; keep the existing primary for difficulty ranking
 uv run modal run --detach rejudge_run.py \
   --run-id 20260807T145000Z \
-  --judge-model-id Qwen/Qwen3-8B
+  --judge-model-id qwen3.6-27b-fp8
 
 # Promote the new judge to primary
 uv run modal run --detach rejudge_run.py \
   --run-id 20260807T145000Z \
-  --judge-model-id Qwen/Qwen3-8B \
+  --judge-model-id Qwen/Qwen3.6-27B-FP8 \
   --make-primary
 ```
 

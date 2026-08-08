@@ -10,6 +10,7 @@ Layout on the ``latent-reasoning`` Volume:
     /models/nvidia/audio-flamingo-next-think-hf/
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
+    /models/Qwen/Qwen3.6-27B-FP8/
     /models/mistralai/Voxtral-Small-24B-2507/
     ...
 
@@ -73,6 +74,9 @@ MODEL_ALIASES: dict[str, str] = {
     "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
     "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
     "qwen-3b": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen3.6-27b-fp8": "Qwen/Qwen3.6-27B-FP8",
+    "qwen3.6-27b": "Qwen/Qwen3.6-27B-FP8",
+    "qwen3.6": "Qwen/Qwen3.6-27B-FP8",
     "step-audio-2-mini": "stepfun-ai/Step-Audio-2-mini",
     "step-audio-2": "stepfun-ai/Step-Audio-2-mini",
     "mimo-audio-7b": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
@@ -100,6 +104,7 @@ ALL_MODELS = (
     "af2",
     "qwen3-omni",
     "qwen2.5-3b",
+    "qwen3.6-27b-fp8",
     "step-audio-2-mini",
     "mimo-audio-7b",
     "interactive-omni-8b",

@@ -7,18 +7,19 @@ re-running generation, then regenerates ``difficulty.jsonl`` / ``scores.json``.
 Prereq: seed the judge weights on the data volume, e.g.::
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
+    uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-27b-fp8
 
 Usage::
 
     # Add a new judge; keep the existing primary for difficulty ranking
     uv run modal run --detach rejudge_run.py \\
       --run-id 20260807T145000Z \\
-      --judge-model-id Qwen/Qwen3-8B
+      --judge-model-id qwen3.6-27b-fp8
 
     # Add a judge and make it primary
     uv run modal run --detach rejudge_run.py \\
       --run-id 20260807T145000Z \\
-      --judge-model-id Qwen/Qwen3-8B \\
+      --judge-model-id Qwen/Qwen3.6-27B-FP8 \\
       --make-primary
 
     # Re-grade even if this judge already has verdicts
@@ -48,7 +49,7 @@ from modal_cache import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
-DEFAULT_BATCH_SIZE = 64
+DEFAULT_BATCH_SIZE = 256
 
 app = modal.App("exp-mmar-rejudge")
 
@@ -74,10 +75,11 @@ def _mount_sources(image: modal.Image) -> modal.Image:
     )
 
 
+# 0.26+ recommended for Qwen3.6 gated-delta hybrid / FP8 checkpoints.
 grader_image = _mount_sources(
     _cuda_base_image()
     .uv_pip_install(
-        "vllm==0.24.0",
+        "vllm==0.26.0",
         "transformers>=5.5.3",
         "huggingface-hub>=0.30.0",
         "librosa>=0.11.0",
@@ -207,6 +209,8 @@ def prepare_rejudge(
     models: str = "all",
 ) -> dict:
     """Validate the run is freeform and resolve model labels / primary."""
+    from grader import resolve_judge_model_id
+
     results_volume.reload()
     run_dir = _run_dir(output_dir, run_id)
     if not run_dir.is_dir():
@@ -215,6 +219,7 @@ def prepare_rejudge(
     manifest = _load_manifest(run_dir)
     mode = _assert_freeform_run(manifest, run_id)
 
+    judge_model_id = resolve_judge_model_id(judge_model_id)
     judge_key = judge_label(judge_model_id)
     if not judge_key:
         raise SystemExit(f"Invalid judge_model_id: {judge_model_id!r}")
@@ -289,10 +294,13 @@ def grade_with_judge(
     if not run_dir.is_dir():
         raise SystemExit(f"Run dir not found: {run_dir}")
 
+    from grader import resolve_judge_model_id
+
     # Re-check mode inside the grader container (defense in depth).
     manifest = _load_manifest(run_dir)
     _assert_freeform_run(manifest, run_id)
 
+    judge_model_id = resolve_judge_model_id(judge_model_id)
     judge_key = judge_label(judge_model_id)
     handle = load_grader(judge_model_id)
     per_model: dict[str, dict] = {}

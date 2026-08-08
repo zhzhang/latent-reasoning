@@ -288,8 +288,9 @@ cpu_image = _mount_local_sources(
     )
 )
 
-# Text-only freeform grader (Qwen2.5-3B-Instruct via vLLM).
-grader_image = _vllm_image(vllm_version="0.24.0")
+# Text-only freeform grader (Qwen2.5-3B / Qwen3.6-27B-FP8 via vLLM).
+# 0.26+ recommended for Qwen3.6 gated-delta hybrid checkpoints.
+grader_image = _vllm_image(vllm_version="0.26.0")
 
 app = modal.App("exp-mmar-question-difficulty")
 
@@ -392,8 +393,11 @@ def _parse_judge_model_ids(
     """Ordered HF ids for freeform judges; first entry is primary.
 
     ``grader_model_id`` is a back-compat single-judge alias used when
-    ``judge_model_ids`` is unset.
+    ``judge_model_ids`` is unset. Short aliases (e.g. ``qwen3.6-27b-fp8``)
+    are expanded via ``grader.resolve_judge_model_id``.
     """
+    from grader import resolve_judge_model_id
+
     raw = (judge_model_ids or "").strip()
     if raw:
         ids = [part.strip() for part in raw.split(",") if part.strip()]
@@ -401,6 +405,7 @@ def _parse_judge_model_ids(
         ids = [str(grader_model_id).strip()]
     else:
         ids = list(DEFAULT_JUDGE_MODEL_IDS)
+    ids = [resolve_judge_model_id(x) for x in ids]
     # Deduplicate while preserving order.
     return list(dict.fromkeys(ids))
 
@@ -1061,7 +1066,7 @@ def run_freeform_grade(
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
     judge_model_id: str | None = None,
     primary_judge: str | None = None,
-    batch_size: int = 64,
+    batch_size: int = 256,
     force: bool = False,
 ) -> dict:
     """Grade free-form predictions with one local vLLM judge model."""
@@ -1187,7 +1192,7 @@ def run_pipeline(
     judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
-    grader_batch_size: int = 64,
+    grader_batch_size: int = 256,
     skip_grade: bool = False,
 ) -> dict:
     """Remote orchestrator for prepare → models → grade → aggregate.
@@ -1390,7 +1395,7 @@ def main(
     judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
-    grader_batch_size: int = 64,
+    grader_batch_size: int = 256,
     skip_grade: bool = False,
 ):
     """Launch the MMAR question-difficulty experiment.

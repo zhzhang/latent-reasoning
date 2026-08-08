@@ -20,8 +20,37 @@ DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen2.5-3B-Instruct",)
 DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
 GRADER_LABEL = judge_label(DEFAULT_GRADER_MODEL_ID)
 
+# Short names accepted by judge CLIs (mirrors seed_volume.MODEL_ALIASES).
+JUDGE_MODEL_ALIASES: dict[str, str] = {
+    "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen-3b": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen3.6-27b-fp8": "Qwen/Qwen3.6-27B-FP8",
+    "qwen3.6-27b": "Qwen/Qwen3.6-27B-FP8",
+    "qwen3.6": "Qwen/Qwen3.6-27B-FP8",
+}
+
 YES_RE = re.compile(r"\b(yes|true|correct|match(?:es)?)\b", re.IGNORECASE)
 NO_RE = re.compile(r"\b(no|false|incorrect|wrong|mismatch(?:es)?)\b", re.IGNORECASE)
+
+
+def resolve_judge_model_id(model_id: str) -> str:
+    """Expand a judge alias (e.g. ``qwen3.6-27b-fp8``) to a Hub repo id."""
+    key = str(model_id or "").strip()
+    if not key:
+        return key
+    return JUDGE_MODEL_ALIASES.get(key.lower(), key)
+
+
+def _looks_fp8(model_id: str) -> bool:
+    text = model_id.lower()
+    return "fp8" in text or text.endswith("-fp8")
+
+
+def _needs_language_model_only(model_id: str) -> bool:
+    """Qwen3.5/3.6 multimodal checkpoints: skip the vision tower for text judging."""
+    text = model_id.lower()
+    return any(token in text for token in ("qwen3.5", "qwen3.6", "qwen3_5", "qwen3_6"))
 
 
 def build_grade_prompt(*, question: str, answer: str, prediction: str) -> str:
@@ -92,19 +121,41 @@ def _record_needs_grade(record: dict, judge_key: str) -> bool:
 def load_grader(model_id: str = DEFAULT_GRADER_MODEL_ID) -> dict[str, Any]:
     from vllm import LLM, SamplingParams
 
+    model_id = resolve_judge_model_id(model_id)
     local_id = resolve_model_dir(model_id, None)
-    llm = LLM(
-        model=local_id,
-        dtype="bfloat16",
+    # FP8 checkpoints must use auto dtype; BF16 judges keep explicit bfloat16.
+    dtype = "auto" if _looks_fp8(model_id) else "bfloat16"
+    llm_kwargs: dict[str, Any] = {
+        "model": local_id,
+        "dtype": dtype,
         # Cap judge context (not a KV/throughput lever).
-        max_model_len=4096,
-        max_num_batched_tokens=8192,
-        enforce_eager=True,
-        enable_prefix_caching=True,
-        trust_remote_code=True,
-    )
+        "max_model_len": 4096,
+        "max_num_batched_tokens": 8192,
+        "enforce_eager": True,
+        "enable_prefix_caching": True,
+        "trust_remote_code": True,
+    }
+    # Multimodal Qwen3.6: text-only path frees VRAM for KV / batching.
+    if _needs_language_model_only(model_id):
+        llm_kwargs["language_model_only"] = True
+    try:
+        llm = LLM(**llm_kwargs)
+    except TypeError as exc:
+        # Older vLLM builds may not accept language_model_only.
+        if "language_model_only" not in llm_kwargs:
+            raise
+        print(
+            f"[grader] language_model_only unsupported ({exc}); "
+            "retrying without it"
+        )
+        llm_kwargs.pop("language_model_only", None)
+        llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
-    print(f"Freeform grader ready: {model_id} ({local_id})")
+    print(
+        f"Freeform grader ready: {model_id} ({local_id}) "
+        f"dtype={dtype}"
+        f"{' language_model_only' if _needs_language_model_only(model_id) else ''}"
+    )
     return {
         "llm": llm,
         "tokenizer": tokenizer,
@@ -186,7 +237,7 @@ def grade_predictions_file(
     *,
     judge_key: str | None = None,
     primary_judge: str | None = None,
-    batch_size: int = 64,
+    batch_size: int = 256,
     force: bool = False,
 ) -> dict[str, Any]:
     """Grade (or re-grade) one judge for all shots in a predictions.jsonl file."""
