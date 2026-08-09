@@ -7,7 +7,7 @@ write predictions or scores.
 Usage::
 
     uv run modal run debug_judge.py
-    uv run modal run debug_judge.py --model-id qwen3.6-27b-fp8 --max-cases 4
+    uv run modal run debug_judge.py --model-id qwen3.6-35b-a3b-fp8 --max-cases 4
     uv run modal run debug_judge.py --run-id 20260807T145000Z --model-label qwen3-omni
 """
 
@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 DEFAULT_RUN_ID = "20260807T145000Z"
 DEFAULT_MODEL_LABEL = "qwen3-omni"
-DEFAULT_JUDGE_MODEL_ID = "Qwen/Qwen3.6-27B-FP8"
+DEFAULT_JUDGE_MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
 
 app = modal.App("debug-judge")
 
@@ -132,7 +132,7 @@ def _load_cases(
             )
             if not str(prediction).strip():
                 continue
-            judge_entry = (shot.get("judges") or {}).get("qwen3.6-27b-fp8") or {}
+            judge_entry = (shot.get("judges") or {}).get("qwen3.6-35b-a3b-fp8") or {}
             cases.append(
                 {
                     "id": record.get("id"),

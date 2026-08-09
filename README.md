@@ -11,7 +11,7 @@ Two prompt / scoring modes:
 | `mc` (default) | question + 4 choices | string-match against gold choice (stored as a synthetic `string-match` judge) |
 | `freeform` | question only (no choices) | one or more local vLLM judges grade each shot vs gold; first judge is **primary** and drives difficulty ranking |
 
-Default freeform judge: `Qwen/Qwen2.5-3B-Instruct`. Pass multiple with `--judge-model-ids` (comma-separated; first = primary).
+Default freeform judge: `Qwen/Qwen3.6-35B-A3B-FP8`. Pass multiple with `--judge-model-ids` (comma-separated; first = primary).
 
 Inference uses **offline** vLLM (`LLM.generate` / Omni) with continuous
 batching — not an OpenAI-compatible server. `n_shots` means independent
@@ -39,11 +39,11 @@ uv run modal run seed_volume.py --datasets mmar \
 
 # Freeform judge weights (add more aliases as needed)
 uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
-uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-27b-fp8
+uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 ```
 
 `mimo-audio-7b` also seeds `XiaomiMiMo/MiMo-Audio-Tokenizer` automatically.
-Judge aliases: `qwen2.5-3b`, `qwen3.6-27b-fp8` (→ `Qwen/Qwen3.6-27B-FP8`).
+Judge aliases: `qwen2.5-3b`, `qwen3.6-35b-a3b-fp8` (→ `Qwen/Qwen3.6-35B-A3B-FP8`).
 
 ## Run
 
@@ -59,7 +59,7 @@ uv run modal run --detach run_experiment.py \
 # Multiple judges (first is primary — drives difficulty ranking)
 uv run modal run --detach run_experiment.py \
   --mode freeform --source-run-id 20260727T154400Z \
-  --judge-model-ids qwen2.5-3b,qwen3.6-27b-fp8
+  --judge-model-ids qwen2.5-3b,qwen3.6-35b-a3b-fp8
 
 # Smoke test one model on 8 questions (plain vLLM: SamplingParams n=2)
 uv run modal run run_experiment.py \
@@ -124,6 +124,10 @@ before aggregation.
 - MiMo Omni YAML: stage-0 prefix caching on; `max_num_seqs: 1` stays for the
   two-stage memory split on one GPU (not raised for speed).
 - `--grader-batch-size`: freeform judge only (separate from model inference).
+- Judge engines are tuned with `tune_judge.py` (see below). For the
+  `qwen3.6-35b-a3b-fp8` MoE judge, `enforce_eager: False` was worth 332 →
+  4,824 output tok/s on an H100; only 3B params are active per token, so
+  decode is kernel-launch bound and CUDA graphs dominate everything else.
 - Watch logs for `Avg generation throughput`, `Running: N reqs`, and
   `GPU KV cache usage` (`disable_log_stats: False`). Confirm loaders print
   `vLLM ready` rather than `falling back to` HF.
@@ -139,7 +143,8 @@ before aggregation.
 ```bash
 # Default remote path is exp-mmar-question-difficulty/
 uv run modal run download_results.py
-uv run python view_difficulty.py          # results UI (:7860)
+uv run python view_difficulty.py          # single-run UI (:7860)
+uv run python view_mode_compare.py        # MCQ ↔ freeform compare (:7861)
 ```
 
 Open http://127.0.0.1:7860 — questions are ordered hardest-first
@@ -148,6 +153,11 @@ opens with a **verdict grid** (test model × judge × shot, green/red cells).
 If a run is missing `difficulty.jsonl` / `scores.json`, the viewer
 aggregates them on startup.
 
+Open http://127.0.0.1:7861 for the mode-compare viewer: it pairs an MC run
+with a freeform run on the same question ids, sorts by
+Δ = MCQ avg − freeform avg, and shows both modes’ per-model shots when a
+question is selected.
+
 ## Re-judge a past freeform run
 
 Add (or replace) a judge on an existing freeform run without regenerating
@@ -155,19 +165,71 @@ answers. Errors if the run is MCQ:
 
 ```bash
 # Seed the new judge weights first if needed
-uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
+uv run modal run seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
 # Add a judge; keep the existing primary for difficulty ranking
 uv run modal run --detach rejudge_run.py \
   --run-id 20260807T145000Z \
-  --judge-model-id qwen3.6-27b-fp8
+  --judge-model-id qwen3.6-35b-a3b-fp8
 
 # Promote the new judge to primary
 uv run modal run --detach rejudge_run.py \
   --run-id 20260807T145000Z \
-  --judge-model-id Qwen/Qwen3.6-27B-FP8 \
+  --judge-model-id Qwen/Qwen3.6-35B-A3B-FP8 \
   --make-primary
+
+# Re-run a judge to replace its previous verdicts (default)
+uv run modal run --detach rejudge_run.py \
+  --run-id 20260807T145000Z \
+  --judge-model-id qwen3.6-35b-a3b-fp8
 ```
+
+Re-running a judge label always replaces prior `shots[].judges[<label>]`
+entries (full `generation` included). Pass `--no-force` only when adding a
+brand-new judge and you want to skip shots that somehow already have it.
+
+## Tune a judge engine
+
+`tune_judge.py` replays real grade prompts from a past freeform run against
+one judge under several vLLM engine configs and concurrency levels, reporting
+output tok/s, parse rate, and verdict agreement. It writes nothing:
+
+```bash
+# Full sweep — one H100 container per engine variant, run in parallel
+uv run modal run tune_judge.py::main
+
+# Fast speed check on a single variant
+uv run modal run tune_judge.py::main --variants graphs --n-cases 64
+
+# Concurrency sweep for one engine config
+uv run modal run tune_judge.py::main --variants graphs --batch-sizes 128,256,512
+
+# Confirm the committed JUDGE_SPECS entry through the real grader path
+uv run modal run tune_judge.py::verify
+```
+
+Measured for `qwen3.6-35b-a3b-fp8` on one H100 over 512 replayed shots
+(mean ~600 output tokens/shot):
+
+| config | batch | output tok/s | sec / 1k shots |
+| --- | --- | --- | --- |
+| eager (pre-tuning) | 64 | 332 | 1,730 |
+| eager (pre-tuning) | 128 | 648 | 902 |
+| CUDA graphs | 128 | 3,542 | 171 |
+| CUDA graphs | 256 | 4,824 | 126 |
+| CUDA graphs | 512 | 7,044 | 84 |
+
+`async_scheduling` and raising `max_num_seqs` / `max_num_batched_tokens` were
+within run-to-run noise once CUDA graphs were on, so the committed spec leaves
+them at their defaults. `tune_judge.py::verify` measures the committed spec
+end-to-end through `grade_shot_batch` at 5,908 output tok/s (100 s per 1k
+shots, ~9 min engine init), so grading all 10k shots of a 5-model run takes
+roughly 17 minutes of H100 time.
+
+The `agree` column compares against stored verdicts from another judge on the
+same shots. Check `stored_pass_rate` before trusting it — a stored judge that
+passed 0 of 1000 shots (e.g. one run with too small a token budget to emit a
+verdict) makes agreement against it only restate the new judge's fail rate.
 
 ## Retrofit existing runs
 
@@ -204,16 +266,23 @@ Freeform shot records store per-judge verdicts under `shots[].judges`:
   "answer_prediction": "…",
   "correct": false,
   "grader": "Qwen/Qwen2.5-3B-Instruct",
-  "grader_output": "NO",
+  "grader_output": "Fail",
   "judges": {
     "qwen2.5-3b-instruct": {
       "correct": false,
-      "output": "NO",
+      "verdict": "fail",
+      "output": "Fail",
+      "generation": "…full judge generation ending in Fail…",
       "model_id": "Qwen/Qwen2.5-3B-Instruct"
     }
   }
 }
 ```
+
+`generation` is the full judge reply (up to 4096 tokens); `output` /
+`verdict` are the parsed final `Pass`/`Fail`. Re-running the same judge
+(via `rejudge_run.py` or `--force-grade`) replaces prior entries for that
+label.
 
 Record / manifest fields: `judges` (ordered labels, `[0]` = primary),
 `primary_judge`, `per_judge`, plus legacy `grader` / `scoring:

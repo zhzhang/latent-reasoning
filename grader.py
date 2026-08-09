@@ -16,7 +16,7 @@ from mmar_common import (
     write_jsonl,
 )
 
-DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen2.5-3B-Instruct",)
+DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen3.6-35B-A3B-FP8",)
 # Back-compat aliases.
 DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
 GRADER_LABEL = judge_label(DEFAULT_GRADER_MODEL_ID)
@@ -36,12 +36,10 @@ JUDGE_MODEL_ALIASES: dict[str, str] = {
     "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
     "qwen2.5-3b-instruct": "Qwen/Qwen2.5-3B-Instruct",
     "qwen-3b": "Qwen/Qwen2.5-3B-Instruct",
-    "qwen3.6-27b-fp8": "Qwen/Qwen3.6-27B-FP8",
-    "qwen3.6-27b": "Qwen/Qwen3.6-27B-FP8",
-    "qwen3.6": "Qwen/Qwen3.6-27B-FP8",
     "qwen3.6-35b-a3b-fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6-35b-a3b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "qwen3.6": "Qwen/Qwen3.6-35B-A3B-FP8",
 }
 
 # Per-judge vLLM engine + SamplingParams (mirrors MODEL_SPECS for test takers).
@@ -67,28 +65,6 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
             "seed": 0,
         },
         "batch_size": 128,
-    },
-    "qwen3.6-27b-fp8": {
-        "model_id": "Qwen/Qwen3.6-27B-FP8",
-        "engine": {
-            "dtype": "auto",
-            "max_model_len": 8192,
-            "max_num_batched_tokens": 8192,
-            "enforce_eager": True,
-            "enable_prefix_caching": True,
-            "trust_remote_code": True,
-            # Text-only path: skip vision tower for grading.
-            "language_model_only": True,
-        },
-        # generation_config.json: T=1.0, top_p=0.95, top_k=20
-        "sampling": {
-            "temperature": 0.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "max_tokens": 4096,
-            "seed": 0,
-        },
-        "batch_size": 64,
     },
     "qwen3.6-35b-a3b-fp8": {
         "model_id": "Qwen/Qwen3.6-35B-A3B-FP8",
@@ -137,7 +113,7 @@ FAIL_LABELS = frozenset({"FAIL", "F", "NO", "N", "FALSE", "INCORRECT", "WRONG"})
 
 
 def resolve_judge_model_id(model_id: str) -> str:
-    """Expand a judge alias (e.g. ``qwen3.6-27b-fp8``) to a Hub repo id."""
+    """Expand a judge alias (e.g. ``qwen3.6-35b-a3b-fp8``) to a Hub repo id."""
     key = str(model_id or "").strip()
     if not key:
         return key

@@ -7,7 +7,6 @@ re-running generation, then regenerates ``difficulty.jsonl`` / ``scores.json``.
 Prereq: seed the judge weights on the data volume, e.g.::
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
-    uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-27b-fp8
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
 Usage::

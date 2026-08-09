@@ -54,9 +54,8 @@ DEFAULT_RUN_ID = "20260807T145000Z"
 DEFAULT_JUDGE_MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
 # Stored judge shown in the summary table's agreement column. Agreement
 # against a degenerate judge is meaningless, so ``stored_pass_rate`` is
-# reported alongside it — 20260807T145000Z's qwen3.6-27b-fp8 verdicts, for
-# instance, are all Fail (it was run with too small a token budget to ever
-# emit a verdict).
+# reported alongside it — e.g. a prior judge that passed 0 shots because its
+# token budget was too small to emit a verdict.
 PARITY_JUDGE_LABEL = "qwen2.5-3b-instruct"
 TARGET_OUTPUT_TOKS_PER_S = 1200.0
 

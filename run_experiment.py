@@ -5,7 +5,7 @@ model (per-model SamplingParams), then aggregates mean success rates.
 
 Modes:
   - ``mc`` (default): multiple-choice prompts + string-match scoring
-  - ``freeform``: question-only prompts; Qwen2.5-3B-Instruct grades each shot
+  - ``freeform``: question-only prompts; Qwen3.6-35B-A3B-FP8 grades each shot
     against the gold answer
 
 Inference backends:
@@ -100,7 +100,7 @@ DEFAULT_N_SHOTS = 10
 DEFAULT_SEED = 42
 DEFAULT_MODE = "mc"
 DEFAULT_SOURCE_RUN_ID = "20260727T154400Z"
-DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen2.5-3B-Instruct",)
+DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen3.6-35B-A3B-FP8",)
 DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
 
 # ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ cpu_image = _mount_local_sources(
     )
 )
 
-# Text-only freeform grader (Qwen2.5-3B / Qwen3.6-27B-FP8 via vLLM).
+# Text-only freeform grader (Qwen2.5-3B / Qwen3.6-35B-A3B-FP8 via vLLM).
 # 0.26+ recommended for Qwen3.6 gated-delta hybrid checkpoints.
 grader_image = _vllm_image(vllm_version="0.26.0")
 
@@ -393,7 +393,7 @@ def _parse_judge_model_ids(
     """Ordered HF ids for freeform judges; first entry is primary.
 
     ``grader_model_id`` is a back-compat single-judge alias used when
-    ``judge_model_ids`` is unset. Short aliases (e.g. ``qwen3.6-27b-fp8``)
+    ``judge_model_ids`` is unset. Short aliases (e.g. ``qwen3.6-35b-a3b-fp8``)
     are expanded via ``grader.resolve_judge_model_id``.
     """
     from grader import resolve_judge_model_id
@@ -1456,8 +1456,7 @@ def main(
         grade_only: Skip generation; only run the freeform grader(s).
         force_grade: Re-grade shots even if already graded.
         grader_batch_size: Shots per grader generate() call (default: per-judge
-            spec — 128 for qwen2.5-3b-instruct, 64 for qwen3.6-27b-fp8,
-            512 for qwen3.6-35b-a3b-fp8).
+            spec — 128 for qwen2.5-3b-instruct, 512 for qwen3.6-35b-a3b-fp8).
         skip_grade: Freeform generation without the grading pass.
     """
     # One remote spawn owns the full prepare→infer→grade→aggregate chain so
