@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from audio_flamingo_runtime import resolve_model_dir
@@ -20,6 +21,16 @@ DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen2.5-3B-Instruct",)
 DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
 GRADER_LABEL = judge_label(DEFAULT_GRADER_MODEL_ID)
 
+# Default judge sampling fallback (unknown judges).
+DEFAULT_JUDGE_SAMPLING: dict[str, Any] = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_tokens": 4096,
+    "seed": 0,
+}
+DEFAULT_JUDGE_MAX_TOKENS = int(DEFAULT_JUDGE_SAMPLING["max_tokens"])
+DEFAULT_JUDGE_BATCH_SIZE = 64
+
 # Short names accepted by judge CLIs (mirrors seed_volume.MODEL_ALIASES).
 JUDGE_MODEL_ALIASES: dict[str, str] = {
     "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
@@ -28,10 +39,101 @@ JUDGE_MODEL_ALIASES: dict[str, str] = {
     "qwen3.6-27b-fp8": "Qwen/Qwen3.6-27B-FP8",
     "qwen3.6-27b": "Qwen/Qwen3.6-27B-FP8",
     "qwen3.6": "Qwen/Qwen3.6-27B-FP8",
+    "qwen3.6-35b-a3b-fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "qwen3.6-35b-a3b": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B-FP8",
 }
 
-YES_RE = re.compile(r"\b(yes|true|correct|match(?:es)?)\b", re.IGNORECASE)
-NO_RE = re.compile(r"\b(no|false|incorrect|wrong|mismatch(?:es)?)\b", re.IGNORECASE)
+# Per-judge vLLM engine + SamplingParams (mirrors MODEL_SPECS for test takers).
+JUDGE_SPECS: dict[str, dict[str, Any]] = {
+    "qwen2.5-3b-instruct": {
+        "model_id": "Qwen/Qwen2.5-3B-Instruct",
+        "engine": {
+            "dtype": "bfloat16",
+            # Grade prompt + up to max_tokens generation.
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192,
+            "enforce_eager": True,
+            "enable_prefix_caching": True,
+            "trust_remote_code": True,
+        },
+        # generation_config.json: T=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05
+        "sampling": {
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "top_k": 20,
+            "repetition_penalty": 1.05,
+            "max_tokens": 4096,
+            "seed": 0,
+        },
+        "batch_size": 128,
+    },
+    "qwen3.6-27b-fp8": {
+        "model_id": "Qwen/Qwen3.6-27B-FP8",
+        "engine": {
+            "dtype": "auto",
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192,
+            "enforce_eager": True,
+            "enable_prefix_caching": True,
+            "trust_remote_code": True,
+            # Text-only path: skip vision tower for grading.
+            "language_model_only": True,
+        },
+        # generation_config.json: T=1.0, top_p=0.95, top_k=20
+        "sampling": {
+            "temperature": 0.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "max_tokens": 4096,
+            "seed": 0,
+        },
+        "batch_size": 64,
+    },
+    "qwen3.6-35b-a3b-fp8": {
+        "model_id": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "engine": {
+            "dtype": "auto",
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192,
+            # Only 3B params are active per token, so decode is kernel-launch
+            # bound and CUDA graphs dominate: eager measured 332 output tok/s
+            # vs 4.8-7k with graphs on one H100 (see tune_judge.py).
+            "enforce_eager": False,
+            "enable_prefix_caching": True,
+            "trust_remote_code": True,
+            "gpu_memory_utilization": 0.92,
+            # Text-only path: skip vision tower for grading.
+            "language_model_only": True,
+        },
+        # Thinking-mode defaults: T=1.0, top_p=0.95, top_k=20
+        # (judging forces temperature=0 for determinism).
+        # Grade replies average ~600 tokens; 4096 leaves headroom for the rare
+        # runaway (~0.2% of shots) whose truncation would score as a Fail.
+        "sampling": {
+            "temperature": 0.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "max_tokens": 4096,
+            "seed": 0,
+        },
+        # Throughput keeps scaling with concurrency (128→3.5k, 256→4.8k,
+        # 512→7.0k output tok/s); KV holds ~1M tokens so 512 seqs fit easily.
+        "batch_size": 512,
+    },
+}
+
+ALL_JUDGE_LABELS = tuple(JUDGE_SPECS.keys())
+
+# Final-answer tokens (preferred) plus legacy YES/NO from older runs.
+# Soft whole-region fallback — keep this narrow so prose like "correct in
+# meaning" does not count as a verdict; token labels above still accept
+# a bare "correct" / "incorrect" final line.
+PASS_RE = re.compile(r"\b(pass|yes|true)\b", re.IGNORECASE)
+FAIL_RE = re.compile(r"\b(fail|no|false)\b", re.IGNORECASE)
+THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+PASS_LABELS = frozenset({"PASS", "P", "YES", "Y", "TRUE", "CORRECT"})
+FAIL_LABELS = frozenset({"FAIL", "F", "NO", "N", "FALSE", "INCORRECT", "WRONG"})
 
 
 def resolve_judge_model_id(model_id: str) -> str:
@@ -40,6 +142,109 @@ def resolve_judge_model_id(model_id: str) -> str:
     if not key:
         return key
     return JUDGE_MODEL_ALIASES.get(key.lower(), key)
+
+
+def _default_judge_engine(model_id: str) -> dict[str, Any]:
+    """Fallback engine kwargs for judges not listed in JUDGE_SPECS."""
+    engine: dict[str, Any] = {
+        "dtype": "auto" if _looks_fp8(model_id) else "bfloat16",
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 8192,
+        "enforce_eager": True,
+        "enable_prefix_caching": True,
+        "trust_remote_code": True,
+    }
+    if _needs_language_model_only(model_id):
+        engine["language_model_only"] = True
+    return engine
+
+
+def resolve_judge_spec(model_id: str) -> dict[str, Any]:
+    """Return the full judge spec dict for a Hub id or alias."""
+    resolved_id = resolve_judge_model_id(model_id)
+    label = judge_label(resolved_id)
+    spec = JUDGE_SPECS.get(label)
+    if spec:
+        return spec
+    return {
+        "model_id": resolved_id,
+        "engine": _default_judge_engine(resolved_id),
+        "sampling": dict(DEFAULT_JUDGE_SAMPLING),
+        "batch_size": DEFAULT_JUDGE_BATCH_SIZE,
+    }
+
+
+def resolve_judge_batch_size(
+    model_id: str,
+    batch_size: int | None = None,
+) -> int:
+    """Return shots-per-generate batch size for a judge."""
+    if batch_size is not None:
+        return int(batch_size)
+    spec = resolve_judge_spec(model_id)
+    return int(spec.get("batch_size", DEFAULT_JUDGE_BATCH_SIZE))
+
+
+def resolve_judge_sampling(
+    model_id: str,
+    args: SimpleNamespace | None = None,
+) -> dict[str, Any]:
+    """Return SamplingParams kwargs for a judge (per-model; no global defaults).
+
+    Optional CLI overrides on ``args`` (``temperature``, ``top_p``,
+    ``max_new_tokens``) replace the model values when not ``None``.
+    """
+    spec = resolve_judge_spec(model_id)
+    if "sampling" not in spec:
+        raise ValueError(
+            f"Judge {model_id!r} ({judge_label(resolve_judge_model_id(model_id))!r}) "
+            "has no per-judge sampling config"
+        )
+    out = dict(spec["sampling"])
+    if args is None:
+        return out
+    if getattr(args, "temperature", None) is not None:
+        out["temperature"] = float(args.temperature)
+    if getattr(args, "top_p", None) is not None:
+        out["top_p"] = float(args.top_p)
+    if getattr(args, "max_new_tokens", None) is not None:
+        out["max_tokens"] = int(args.max_new_tokens)
+    return out
+
+
+def resolve_judge_engine(
+    model_id: str,
+    args: SimpleNamespace | None = None,
+) -> dict[str, Any]:
+    """Return vLLM LLM kwargs for a judge (excluding ``model`` path)."""
+    spec = resolve_judge_spec(model_id)
+    engine = dict(spec["engine"])
+    if args is None:
+        return engine
+    if getattr(args, "max_num_seqs", None) is not None:
+        engine["max_num_seqs"] = int(args.max_num_seqs)
+    if getattr(args, "gpu_memory_utilization", None) is not None:
+        engine["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
+    if getattr(args, "max_model_len", None) is not None:
+        engine["max_model_len"] = int(args.max_model_len)
+    return engine
+
+
+def judge_sampling_params(
+    model_id: str,
+    args: SimpleNamespace | None = None,
+    *,
+    max_tokens: int | None = None,
+):
+    """Build a vLLM SamplingParams instance for one judge."""
+    from vllm import SamplingParams
+
+    kwargs = resolve_judge_sampling(model_id, args)
+    temperature = float(kwargs.get("temperature", 0.0))
+    kwargs["temperature"] = temperature if temperature > 0 else 0.0
+    if max_tokens is not None:
+        kwargs["max_tokens"] = int(max_tokens)
+    return SamplingParams(**kwargs)
 
 
 def _looks_fp8(model_id: str) -> bool:
@@ -57,43 +262,79 @@ def build_grade_prompt(*, question: str, answer: str, prediction: str) -> str:
     return (
         "You are grading a free-form answer to an audio understanding question.\n"
         "Decide whether the model answer is semantically equivalent to the "
-        "correct answer. Minor wording differences are fine; the meaning must "
-        "match. If the model answer is empty, nonsense, or contradicts the "
+        "correct answer. Accept answers where it is clear that the test taker understands "
+        "what the correct answer is. If the model answer is empty, nonsense, or contradicts the "
         "correct answer, mark it incorrect.\n\n"
         f"Question: {question}\n"
         f"Correct answer: {answer}\n"
         f"Model answer: {prediction}\n\n"
-        "Reply with only YES or NO."
+        "Reason briefly if needed, then end your reply with a single final line "
+        'containing only "Pass" or "Fail".'
     )
 
 
-def parse_grade_verdict(text: str) -> bool | None:
-    """Parse a YES/NO grader reply. Returns None if unparseable."""
+def _answer_region(text: str) -> str:
+    """Prefer text after a closed ``</think>`` block; else the full string."""
     cleaned = (text or "").strip()
     if not cleaned:
+        return ""
+    match = THINK_BLOCK_RE.search(cleaned)
+    if match:
+        remainder = (cleaned[: match.start()] + cleaned[match.end() :]).strip()
+        if remainder:
+            return remainder
+    return cleaned
+
+
+def parse_grade_verdict(text: str) -> bool | None:
+    """Parse a Pass/Fail (or legacy YES/NO) judge reply. Returns None if unparseable."""
+    region = _answer_region(text)
+    if not region:
         return None
-    # Prefer the last non-empty line (models sometimes preamble).
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    candidate = lines[-1] if lines else cleaned
-    # Strip common wrappers.
-    candidate = candidate.strip("`\"' ").upper()
-    if candidate in {"Y", "YES", "TRUE", "CORRECT"}:
+    lines = [line.strip() for line in region.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    def _token_verdict(raw: str) -> bool | None:
+        token = raw.strip("`\"' .").upper()
+        if ":" in token:
+            token = token.split(":")[-1].strip("`\"' .")
+        # Keep only the last whitespace-separated word (e.g. "Answer Pass").
+        if " " in token:
+            token = token.split()[-1].strip("`\"' .")
+        if token in PASS_LABELS:
+            return True
+        if token in FAIL_LABELS:
+            return False
+        return None
+
+    # Prefer an explicit Pass/Fail (or legacy YES/NO) on the final line.
+    last = _token_verdict(lines[-1])
+    if last is not None:
+        return last
+
+    # Scan earlier lines only for a clean Pass/Fail token (ignore prose).
+    for line in reversed(lines[:-1]):
+        hit = _token_verdict(line)
+        if hit is not None:
+            return hit
+
+    # Last resort: whole-region exclusive keyword match (legacy YES/NO dumps).
+    has_pass = bool(PASS_RE.search(region))
+    has_fail = bool(FAIL_RE.search(region))
+    if has_pass and not has_fail:
         return True
-    if candidate in {"N", "NO", "FALSE", "INCORRECT", "WRONG"}:
+    if has_fail and not has_pass:
         return False
-    has_yes = bool(YES_RE.search(candidate))
-    has_no = bool(NO_RE.search(candidate))
-    if has_yes and not has_no:
-        return True
-    if has_no and not has_yes:
-        return False
-    # Fall back to full text.
-    has_yes = bool(YES_RE.search(cleaned))
-    has_no = bool(NO_RE.search(cleaned))
-    if has_yes and not has_no:
-        return True
-    if has_no and not has_yes:
-        return False
+    return None
+
+
+def format_grade_output(verdict: bool | None) -> str | None:
+    """Short Pass/Fail label for schema ``output`` / tips."""
+    if verdict is True:
+        return "Pass"
+    if verdict is False:
+        return "Fail"
     return None
 
 
@@ -118,31 +359,25 @@ def _record_needs_grade(record: dict, judge_key: str) -> bool:
     return any(_shot_needs_grade(shot, judge_key) for shot in shots)
 
 
-def load_grader(model_id: str = DEFAULT_GRADER_MODEL_ID) -> dict[str, Any]:
+def load_grader(
+    model_id: str = DEFAULT_GRADER_MODEL_ID,
+    args: SimpleNamespace | None = None,
+) -> dict[str, Any]:
     from vllm import LLM, SamplingParams
 
     model_id = resolve_judge_model_id(model_id)
+    label = judge_label(model_id)
     local_id = resolve_model_dir(model_id, None)
-    # FP8 checkpoints must use auto dtype; BF16 judges keep explicit bfloat16.
-    dtype = "auto" if _looks_fp8(model_id) else "bfloat16"
-    llm_kwargs: dict[str, Any] = {
-        "model": local_id,
-        "dtype": dtype,
-        # Cap judge context (not a KV/throughput lever).
-        "max_model_len": 4096,
-        "max_num_batched_tokens": 8192,
-        "enforce_eager": True,
-        "enable_prefix_caching": True,
-        "trust_remote_code": True,
-    }
-    # Multimodal Qwen3.6: text-only path frees VRAM for KV / batching.
-    if _needs_language_model_only(model_id):
-        llm_kwargs["language_model_only"] = True
+    engine = resolve_judge_engine(model_id, args)
+    sampling = resolve_judge_sampling(model_id, args)
+
+    llm_kwargs: dict[str, Any] = {"model": local_id, **engine}
+    language_model_only = bool(engine.get("language_model_only"))
     try:
         llm = LLM(**llm_kwargs)
     except TypeError as exc:
         # Older vLLM builds may not accept language_model_only.
-        if "language_model_only" not in llm_kwargs:
+        if not language_model_only:
             raise
         print(
             f"[grader] language_model_only unsupported ({exc}); "
@@ -151,16 +386,19 @@ def load_grader(model_id: str = DEFAULT_GRADER_MODEL_ID) -> dict[str, Any]:
         llm_kwargs.pop("language_model_only", None)
         llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
+    dtype = engine.get("dtype", "?")
     print(
         f"Freeform grader ready: {model_id} ({local_id}) "
-        f"dtype={dtype}"
-        f"{' language_model_only' if _needs_language_model_only(model_id) else ''}"
+        f"label={label} dtype={dtype} sampling={sampling}"
+        f"{' language_model_only' if language_model_only else ''}"
     )
     return {
         "llm": llm,
         "tokenizer": tokenizer,
         "model_id": model_id,
+        "judge_label": label,
         "SamplingParams": SamplingParams,
+        "sampling": sampling,
     }
 
 
@@ -179,12 +417,13 @@ def grade_shot_batch(
     handle: dict[str, Any],
     jobs: list[dict],
     *,
-    max_tokens: int = 8,
+    max_tokens: int | None = None,
 ) -> list[dict]:
     """Grade a list of ``{question, answer, prediction}`` jobs.
 
-    Returns one result dict per job with ``correct``, ``grader_output``,
-    and ``grader``.
+    Returns one result dict per job with ``correct``, ``verdict``,
+    ``generation`` (full text), ``grader_output`` (short Pass/Fail), and
+    ``grader``.
     """
     if not jobs:
         return []
@@ -200,27 +439,27 @@ def grade_shot_batch(
         )
         for job in jobs
     ]
-    sampling = handle["SamplingParams"](
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=int(max_tokens),
-        seed=0,
-    )
+    model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
+    sampling = judge_sampling_params(model_id, max_tokens=max_tokens)
     outputs = handle["llm"].generate(prompts, sampling_params=sampling)
     results: list[dict] = []
-    model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
     for job, out in zip(jobs, outputs):
         text = ""
         outs = getattr(out, "outputs", None) or []
         if outs:
             text = str(getattr(outs[0], "text", "") or "")
         verdict = parse_grade_verdict(text)
+        short = format_grade_output(verdict)
         # Empty / unparseable answers default to incorrect.
         correct = bool(verdict) if verdict is not None else False
         results.append(
             {
                 "correct": correct,
-                "grader_output": text,
+                "verdict": (
+                    "pass" if verdict is True else "fail" if verdict is False else None
+                ),
+                "generation": text,
+                "grader_output": short,
                 "grader": model_id,
                 "grader_verdict_raw": verdict,
                 "question": job.get("question"),
@@ -237,10 +476,13 @@ def grade_predictions_file(
     *,
     judge_key: str | None = None,
     primary_judge: str | None = None,
-    batch_size: int = 256,
+    batch_size: int | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Grade (or re-grade) one judge for all shots in a predictions.jsonl file."""
+    """Grade (or re-grade) one judge for all shots in a predictions.jsonl file.
+
+    When ``force`` is True, existing entries for ``judge_key`` are replaced.
+    """
     if not predictions_path.exists():
         return {
             "status": "missing",
@@ -252,6 +494,7 @@ def grade_predictions_file(
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
     key = judge_key or judge_label(model_id) or GRADER_LABEL
     primary = primary_judge or key
+    effective_batch_size = resolve_judge_batch_size(model_id, batch_size)
 
     records: list[dict] = []
     with open(predictions_path, encoding="utf-8") as handle_in:
@@ -293,9 +536,9 @@ def grade_predictions_file(
             owners.append((record_index, shot_index))
 
     graded = 0
-    for start in range(0, len(jobs), batch_size):
-        chunk = jobs[start : start + batch_size]
-        chunk_owners = owners[start : start + batch_size]
+    for start in range(0, len(jobs), effective_batch_size):
+        chunk = jobs[start : start + effective_batch_size]
+        chunk_owners = owners[start : start + effective_batch_size]
         results = grade_shot_batch(handle, chunk)
         for (record_index, shot_index), result in zip(chunk_owners, results):
             record = records[record_index]
@@ -303,9 +546,12 @@ def grade_predictions_file(
                 if int(shot.get("shot_index", -1)) != shot_index:
                     continue
                 judges = shot.setdefault("judges", {})
+                # Replace any previous entry for this judge key.
                 judges[key] = {
                     "correct": bool(result["correct"]),
-                    "output": result["grader_output"],
+                    "verdict": result.get("verdict"),
+                    "output": result.get("grader_output"),
+                    "generation": result.get("generation") or "",
                     "model_id": model_id,
                 }
                 graded += 1
@@ -336,4 +582,5 @@ def grade_predictions_file(
         "grader": model_id,
         "judge_label": key,
         "primary_judge": primary,
+        "replaced": bool(force),
     }

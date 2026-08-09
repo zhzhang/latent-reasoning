@@ -409,6 +409,14 @@ def ensure_judge_schema(
             shot["judges"] = judges
 
         if judges:
+            # Normalize: ensure generation key exists for LLM judge entries.
+            for label, entry in list(judges.items()):
+                if not isinstance(entry, dict):
+                    continue
+                if "generation" not in entry:
+                    entry["generation"] = entry.get("output") or ""
+                if "verdict" not in entry and entry.get("correct") is not None:
+                    entry["verdict"] = "pass" if entry.get("correct") else "fail"
             continue
 
         if is_freeform and _shot_has_legacy_judge(shot):
@@ -424,15 +432,18 @@ def ensure_judge_schema(
                 or "qwen2.5-3b-instruct"
             )
             if shot.get("correct") is not None or shot.get("grader_output") is not None:
+                legacy_out = shot.get("grader_output")
                 judges[label] = {
                     "correct": shot.get("correct"),
-                    "output": shot.get("grader_output"),
+                    "output": legacy_out,
+                    "generation": legacy_out if legacy_out is not None else "",
                     "model_id": model_id or None,
                 }
         elif not is_freeform and shot.get("correct") is not None:
             judges[STRING_MATCH_JUDGE_LABEL] = {
                 "correct": bool(shot.get("correct")),
                 "output": "MATCH" if shot.get("correct") else "NO_MATCH",
+                "generation": "",
                 "model_id": None,
             }
 
@@ -524,8 +535,12 @@ def recompute_multi_judge_scores(
                 shot.pop("grader", None)
                 shot.pop("grader_output", None)
             else:
-                if entry.get("output") is not None:
-                    shot["grader_output"] = entry.get("output")
+                # Prefer short Pass/Fail label; fall back to full generation.
+                short = entry.get("output")
+                if short is None and entry.get("generation") is not None:
+                    short = entry.get("generation")
+                if short is not None:
+                    shot["grader_output"] = short
                 if entry.get("model_id"):
                     shot["grader"] = entry.get("model_id")
                     primary_model_id = entry.get("model_id")

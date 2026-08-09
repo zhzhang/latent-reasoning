@@ -761,6 +761,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .judge-pill.pass { color: var(--good); background: var(--soft-good); }
   .judge-pill.fail { color: var(--bad); background: var(--soft-bad); }
   .judge-pill.pending { color: var(--muted); background: #e8eef2; }
+  .judge-gens { margin-top: 0.45rem; display: flex; flex-direction: column; gap: 0.35rem; }
+  .judge-gen details.accordion { margin: 0; }
+  .judge-gen details.accordion > summary {
+    font-size: 0.78rem; padding: 0.4rem 0.65rem;
+  }
+  .judge-gen .accordion-body { padding: 0.55rem 0.65rem 0.7rem; }
+  .judge-gen pre { margin-top: 0; }
 </style>
 </head>
 <body>
@@ -964,12 +971,31 @@ function shotJudgeEntry(shot, judgeLabel) {
   if (judges[judgeLabel]) return judges[judgeLabel];
   // Legacy flat fields when this is the only / primary judge.
   if (shot.grader && String(shot.grader).toLowerCase().endsWith(judgeLabel)) {
-    return { correct: shot.correct, output: shot.grader_output, model_id: shot.grader };
+    return {
+      correct: shot.correct,
+      output: shot.grader_output,
+      generation: shot.grader_output,
+      model_id: shot.grader,
+    };
   }
   if (judgeLabel === "string-match" && shot.correct !== null && shot.correct !== undefined) {
-    return { correct: shot.correct, output: shot.correct ? "MATCH" : "NO_MATCH" };
+    return { correct: shot.correct, output: shot.correct ? "MATCH" : "NO_MATCH", generation: "" };
   }
   return null;
+}
+
+function judgeGenerationText(entry) {
+  if (!entry) return "";
+  if (entry.generation != null && String(entry.generation).length) return String(entry.generation);
+  if (entry.output != null && String(entry.output).length) return String(entry.output);
+  return "";
+}
+
+function judgeVerdictLabel(entry) {
+  if (!entry || entry.correct === null || entry.correct === undefined) return "pending";
+  if (entry.verdict === "pass" || entry.verdict === "fail") return entry.verdict;
+  if (entry.output) return String(entry.output);
+  return entry.correct ? "Pass" : "Fail";
 }
 
 function renderJudgePills(shot, judges) {
@@ -984,10 +1010,45 @@ function renderJudgePills(shot, judges) {
       return `<span class="judge-pill pending" title="${escapeHtml(j.label)}: pending">${escapeHtml(j.label)}?</span>`;
     }
     const ok = !!entry.correct;
-    const tip = `${j.label}: ${entry.output ?? (ok ? "YES" : "NO")}`;
+    const tip = `${j.label}: ${judgeVerdictLabel(entry)}`;
     return `<span class="judge-pill ${ok ? "pass" : "fail"}" title="${escapeHtml(tip)}">${escapeHtml(j.label)} ${ok ? "✓" : "✗"}</span>`;
   }).join("");
   return `<span class="judge-pills">${pills}</span>`;
+}
+
+function renderJudgeGenerations(shot, judges) {
+  const list = (judges && judges.length) ? judges : [];
+  const blocks = [];
+  const seen = new Set();
+  for (const j of list) {
+    const entry = shotJudgeEntry(shot, j.label);
+    const gen = judgeGenerationText(entry);
+    if (!gen) continue;
+    seen.add(j.label);
+    const verdict = judgeVerdictLabel(entry);
+    const open = list.length === 1 ? " open" : "";
+    blocks.push(`<div class="judge-gen">
+      <details class="accordion"${open}>
+        <summary><span>Judge ${escapeHtml(j.label)} · ${escapeHtml(verdict)}</span></summary>
+        <div class="accordion-body"><pre>${escapeHtml(gen)}</pre></div>
+      </details>
+    </div>`);
+  }
+  // Also show any shot-level judges not listed in metadata.
+  for (const [label, entry] of Object.entries(shot.judges || {})) {
+    if (seen.has(label)) continue;
+    const gen = judgeGenerationText(entry);
+    if (!gen) continue;
+    const verdict = judgeVerdictLabel(entry);
+    blocks.push(`<div class="judge-gen">
+      <details class="accordion">
+        <summary><span>Judge ${escapeHtml(label)} · ${escapeHtml(verdict)}</span></summary>
+        <div class="accordion-body"><pre>${escapeHtml(gen)}</pre></div>
+      </details>
+    </div>`);
+  }
+  if (!blocks.length) return "";
+  return `<div class="judge-gens">${blocks.join("")}</div>`;
 }
 
 function renderVerdictGrid(modelLabels, predictions, judges) {
@@ -1032,7 +1093,7 @@ function renderVerdictGrid(modelLabels, predictions, judges) {
           return `<div class="vg-cell ${cls}" title="${escapeHtml(label)} / ${escapeHtml(j.label)} s${i}: ${cls}"></div>`;
         }
         const ok = !!entry.correct;
-        const tip = `${label} / ${j.label} s${i}: ${ok ? "pass" : "fail"}${entry.output ? " — " + entry.output : ""}`;
+        const tip = `${label} / ${j.label} s${i}: ${judgeVerdictLabel(entry)}`;
         return `<div class="vg-cell ${ok ? "pass" : "fail"}" title="${escapeHtml(tip)}"></div>`;
       }).join("");
     }).join("");
@@ -1079,6 +1140,7 @@ async function selectQuestion(id) {
     const shots = pred.shots || [];
     const shotsHtml = shots.map(shot => {
       const verdict = renderJudgePills(shot, judges);
+      const judgeGens = renderJudgeGenerations(shot, judges);
       return `<div class="shot">
         <div class="shot-head">
           <span>shot ${shot.shot_index}</span>
@@ -1086,6 +1148,7 @@ async function selectQuestion(id) {
           <span class="muted">parsed: ${escapeHtml(shot.answer_prediction || "")}</span>
         </div>
         <pre>${escapeHtml(shot.model_output || "")}</pre>
+        ${judgeGens}
       </div>`;
     }).join("");
     const rateChip = pm.pending_grade

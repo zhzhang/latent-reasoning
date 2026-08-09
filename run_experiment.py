@@ -1066,11 +1066,11 @@ def run_freeform_grade(
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
     judge_model_id: str | None = None,
     primary_judge: str | None = None,
-    batch_size: int = 256,
+    batch_size: int | None = None,
     force: bool = False,
 ) -> dict:
     """Grade free-form predictions with one local vLLM judge model."""
-    from grader import grade_predictions_file, load_grader
+    from grader import grade_predictions_file, load_grader, resolve_judge_batch_size
 
     volume.reload()
     results_volume.reload()
@@ -1082,6 +1082,7 @@ def run_freeform_grade(
     model_id = judge_model_id or grader_model_id or DEFAULT_GRADER_MODEL_ID
     judge_key = judge_label(model_id)
     primary = primary_judge or judge_key
+    effective_batch_size = resolve_judge_batch_size(model_id, batch_size)
 
     labels = list(model_labels or DEFAULT_MODEL_LABELS)
     handle = load_grader(model_id)
@@ -1090,14 +1091,15 @@ def run_freeform_grade(
         predictions_path = run_dir / "models" / label / "predictions.jsonl"
         print(
             f"[grader] grading {label} with {judge_key} "
-            f"(primary={primary}) -> {predictions_path}"
+            f"(primary={primary}, batch_size={effective_batch_size}) "
+            f"-> {predictions_path}"
         )
         per_model[label] = grade_predictions_file(
             predictions_path,
             handle,
             judge_key=judge_key,
             primary_judge=primary,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             force=force,
         )
         results_volume.commit()
@@ -1192,7 +1194,7 @@ def run_pipeline(
     judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
-    grader_batch_size: int = 256,
+    grader_batch_size: int | None = None,
     skip_grade: bool = False,
 ) -> dict:
     """Remote orchestrator for prepare → models → grade → aggregate.
@@ -1214,8 +1216,27 @@ def run_pipeline(
     primary_judge = judge_label(judge_ids[0]) if judge_ids else None
 
     def _grade_all_judges() -> list[dict]:
+        # Re-running a judge label replaces prior verdicts for that label.
+        existing_labels: set[str] = set()
+        try:
+            results_volume.reload()
+            manifest_path = _run_dir(output_dir, resolved_run_id) / "manifest.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                for raw in manifest.get("judges") or []:
+                    if isinstance(raw, dict) and raw.get("label"):
+                        existing_labels.add(str(raw["label"]))
+                    elif isinstance(raw, str) and raw:
+                        existing_labels.add(raw)
+                if manifest.get("primary_judge"):
+                    existing_labels.add(str(manifest["primary_judge"]))
+        except Exception as exc:  # noqa: BLE001 — best-effort replace detection
+            print(f"[grade] could not read existing judges ({exc}); using force_grade only")
+
         results: list[dict] = []
         for model_id in judge_ids:
+            key = judge_label(model_id)
+            replace = bool(force_grade) or key in existing_labels
             grade = run_freeform_grade.remote(
                 run_id=resolved_run_id,
                 output_dir=output_dir,
@@ -1224,10 +1245,11 @@ def run_pipeline(
                 grader_model_id=model_id,
                 primary_judge=primary_judge,
                 batch_size=grader_batch_size,
-                force=force_grade,
+                force=replace,
             )
-            print("Graded:", grade)
+            print(f"Graded (replace={replace}):", grade)
             results.append(grade)
+            existing_labels.add(key)
         return results
 
     if aggregate_only:
@@ -1395,7 +1417,7 @@ def main(
     judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
-    grader_batch_size: int = 256,
+    grader_batch_size: int | None = None,
     skip_grade: bool = False,
 ):
     """Launch the MMAR question-difficulty experiment.
@@ -1433,7 +1455,9 @@ def main(
             is primary (drives difficulty ranking).
         grade_only: Skip generation; only run the freeform grader(s).
         force_grade: Re-grade shots even if already graded.
-        grader_batch_size: Shots per grader generate() call.
+        grader_batch_size: Shots per grader generate() call (default: per-judge
+            spec — 128 for qwen2.5-3b-instruct, 64 for qwen3.6-27b-fp8,
+            512 for qwen3.6-35b-a3b-fp8).
         skip_grade: Freeform generation without the grading pass.
     """
     # One remote spawn owns the full prepare→infer→grade→aggregate chain so

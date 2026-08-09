@@ -8,25 +8,25 @@ Prereq: seed the judge weights on the data volume, e.g.::
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-27b-fp8
+    uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
 Usage::
 
     # Add a new judge; keep the existing primary for difficulty ranking
     uv run modal run --detach rejudge_run.py \\
       --run-id 20260807T145000Z \\
-      --judge-model-id qwen3.6-27b-fp8
+      --judge-model-id qwen3.6-35b-a3b-fp8
 
     # Add a judge and make it primary
     uv run modal run --detach rejudge_run.py \\
       --run-id 20260807T145000Z \\
-      --judge-model-id Qwen/Qwen3.6-27B-FP8 \\
+      --judge-model-id Qwen/Qwen3.6-35B-A3B-FP8 \\
       --make-primary
 
-    # Re-grade even if this judge already has verdicts
-    uv run modal run rejudge_run.py \\
+    # Re-running the same judge replaces prior verdicts / generations
+    uv run modal run --detach rejudge_run.py \\
       --run-id 20260807T145000Z \\
-      --judge-model-id Qwen/Qwen2.5-3B-Instruct \\
-      --force
+      --judge-model-id Qwen/Qwen2.5-3B-Instruct
 """
 
 from __future__ import annotations
@@ -49,7 +49,6 @@ from modal_cache import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
-DEFAULT_BATCH_SIZE = 256
 
 app = modal.App("exp-mmar-rejudge")
 
@@ -281,11 +280,11 @@ def grade_with_judge(
     primary_judge: str,
     model_labels: list[str],
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    batch_size: int | None = None,
     force: bool = False,
 ) -> dict:
     """Grade all shots with one new judge; merge into predictions + manifest."""
-    from grader import grade_predictions_file, load_grader
+    from grader import grade_predictions_file, load_grader, resolve_judge_batch_size
 
     volume.reload()
     results_volume.reload()
@@ -302,20 +301,22 @@ def grade_with_judge(
 
     judge_model_id = resolve_judge_model_id(judge_model_id)
     judge_key = judge_label(judge_model_id)
+    effective_batch_size = resolve_judge_batch_size(judge_model_id, batch_size)
     handle = load_grader(judge_model_id)
     per_model: dict[str, dict] = {}
     for label in model_labels:
         predictions_path = run_dir / "models" / label / "predictions.jsonl"
         print(
             f"[rejudge] {label} with {judge_key} "
-            f"(primary={primary_judge}) -> {predictions_path}"
+            f"(primary={primary_judge}, batch_size={effective_batch_size}) "
+            f"-> {predictions_path}"
         )
         per_model[label] = grade_predictions_file(
             predictions_path,
             handle,
             judge_key=judge_key,
             primary_judge=primary_judge,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             force=force,
         )
         results_volume.commit()
@@ -377,11 +378,14 @@ def main(
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     models: str = "all",
     make_primary: bool = False,
-    force: bool = False,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    force: bool = True,
+    batch_size: int | None = None,
     skip_aggregate: bool = False,
 ):
     """Re-judge a freeform run with ``judge_model_id``.
+
+    Re-running the same judge replaces prior verdicts / generations for that
+    judge label (``force`` defaults to True).
 
     Args:
         run_id: Existing ``exp-mmar-question-difficulty/<run_id>`` folder.
@@ -390,8 +394,9 @@ def main(
         models: Comma-separated test-model labels or ``all``.
         make_primary: If True, the new judge becomes primary (affects ranking).
             Default keeps the existing primary and only adds this judge.
-        force: Re-grade shots even when this judge already has a verdict.
-        batch_size: Shots per grader generate() call.
+        force: Replace existing verdicts for this judge (default True).
+            Pass ``--no-force`` to only fill missing shots.
+        batch_size: Shots per grader generate() call (default: per-judge spec).
         skip_aggregate: Grade only; skip difficulty.jsonl / scores.json.
     """
     if not run_id or not str(run_id).strip():
@@ -406,13 +411,18 @@ def main(
         make_primary=make_primary,
         models=models,
     )
+    # Always replace when this judge was already applied (even if caller
+    # passed --no-force for a brand-new judge label, leave as requested).
+    existing = {str(x) for x in (prep.get("existing_judges") or []) if x}
+    replace = bool(force) or prep["judge_label"] in existing
     print(
         f"Rejudging run_id={prep['run_id']} mode={prep['mode']} "
         f"judge={prep['judge_label']} ({prep['judge_model_id']}) "
         f"primary={prep['primary_judge']} "
         f"(existing_primary={prep['existing_primary']}) "
         f"models={prep['model_labels']} "
-        f"existing_judges={prep['existing_judges']} force={force}"
+        f"existing_judges={prep['existing_judges']} "
+        f"force={force} replace={replace}"
     )
 
     grade = grade_with_judge.remote(
@@ -422,7 +432,7 @@ def main(
         model_labels=prep["model_labels"],
         output_dir=output_dir,
         batch_size=batch_size,
-        force=force,
+        force=replace,
     )
     print("Graded:", grade)
 
