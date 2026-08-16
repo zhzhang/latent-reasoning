@@ -13,6 +13,8 @@ Inference backends:
   - mimo-audio-7b: vLLM-Omni 0.24
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
   - qwen3-omni: vLLM 0.26 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
+  - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
+    nemotron-3-nano-omni: vLLM 0.26 audio
   - voxtral-small-24b: vLLM 0.26 Mistral-format audio
 
 Results layout on ``latent-reasoning-results``:
@@ -39,6 +41,13 @@ Usage:
       --mode freeform --source-run-id 20260727T154400Z
     uv run modal run run_experiment.py \\
       --models af-next-think --num-samples 8 --n-shots 2
+    # Open-ended freeform (seed the new checkpoints first):
+    uv run modal run --detach seed_volume.py --datasets none \\
+      --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni
+    uv run modal run --detach run_experiment.py \\
+      --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni \\
+      --mode freeform --n-shots 5 --num-samples -1 --source-run-id none \\
+      --question-ids-csv answer-variety/open_ended_question_ids.csv
     # Resume after a crash (reuse question set; skip finished models /
     # already-written questions):
     uv run modal run --detach run_experiment.py \\
@@ -76,6 +85,7 @@ from mmar_common import (
     count_wavs,
     judge_label,
     load_jsonl,
+    load_question_ids_csv,
     make_run_id,
     resolve_path,
     write_json,
@@ -93,6 +103,7 @@ from modal_cache import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 _DEPLOY_MOUNT = "/root/deploy"
+_ANSWER_VARIETY_MOUNT = "/root/answer-variety"
 
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 DEFAULT_NUM_SAMPLES = 200
@@ -122,8 +133,10 @@ _SHARED_SOURCES = (
 def _mount_local_sources(image: modal.Image) -> modal.Image:
     """Attach Python modules + Omni deploy YAML (must be last image steps)."""
     return (
-        image.add_local_python_source(*_SHARED_SOURCES).add_local_dir(
-            str(REPO_ROOT / "deploy"), remote_path=_DEPLOY_MOUNT
+        image.add_local_python_source(*_SHARED_SOURCES)
+        .add_local_dir(str(REPO_ROOT / "deploy"), remote_path=_DEPLOY_MOUNT)
+        .add_local_dir(
+            str(REPO_ROOT / "answer-variety"), remote_path=_ANSWER_VARIETY_MOUNT
         )
     )
 
@@ -304,6 +317,21 @@ def _run_dir(output_dir: str, run_id: str) -> Path:
     return Path(output_dir).expanduser().resolve() / run_id
 
 
+def _resolve_question_ids_csv(path: str | None) -> Path | None:
+    """Resolve a CSV path on the local machine or the Modal answer-variety mount."""
+    if not path:
+        return None
+    candidate = Path(path).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    alt = Path(_ANSWER_VARIETY_MOUNT) / candidate.name
+    if alt.is_file():
+        return alt
+    raise SystemExit(
+        f"question-ids-csv not found: {path} (also tried {alt})"
+    )
+
+
 def _shot_seed(seed: int, question_id: str, shot_index: int) -> int:
     digest = hashlib.md5(f"{seed}:{question_id}:{shot_index}".encode()).hexdigest()
     return seed + (int(digest[:8], 16) % 1_000_000)
@@ -455,6 +483,7 @@ def _ensure_question_ids(
     start: int = 0,
     source_run_id: str | None = None,
     output_dir: str | None = None,
+    question_ids_csv: str | None = None,
 ) -> list[str]:
     ids_path = run_dir / "question_ids.json"
     if ids_path.exists():
@@ -463,6 +492,37 @@ def _ensure_question_ids(
         if ids:
             print(f"Reusing {len(ids)} question ids from {ids_path}")
             return ids
+
+    csv_path = _resolve_question_ids_csv(question_ids_csv)
+    if csv_path is not None:
+        wanted = load_question_ids_csv(csv_path)
+        by_id = {str(item["id"]): item for item in load_jsonl(meta_path)}
+        ids: list[str] = []
+        for qid in wanted:
+            item = by_id.get(qid)
+            if item is None:
+                print(f"Skipping {qid}: not in MMAR meta")
+                continue
+            audio_path = resolve_path(data_root, item["audio_path"])
+            if not os.path.exists(audio_path):
+                print(f"Skipping {qid}: missing audio at {audio_path}")
+                continue
+            ids.append(qid)
+        if not ids:
+            raise SystemExit(f"No usable ids from question-ids-csv={csv_path}")
+        payload = {
+            "seed": seed,
+            "start": start,
+            "num_samples": len(ids),
+            "n": len(ids),
+            "ids": ids,
+            "question_ids_csv": str(csv_path),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_json(ids_path, payload)
+        results_volume.commit()
+        print(f"Wrote {len(ids)} question ids from {csv_path} -> {ids_path}")
+        return ids
 
     # Copy the fixed question set from a prior run when requested.
     if source_run_id:
@@ -575,6 +635,7 @@ def _run_model_eval(
     tokenizer_id: str | None = None,
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
+    question_ids_csv: str | None = None,
 ) -> dict:
     """Load one model and write n-shot predictions for the fixed question set."""
     volume.reload()
@@ -640,6 +701,7 @@ def _run_model_eval(
         seed=seed,
         source_run_id=source_run_id,
         output_dir=output_dir,
+        question_ids_csv=question_ids_csv,
     )
     items = _load_selected_items(meta_path, data_root_path, question_ids)
     selected_ids = {str(item["id"]) for item in items}
@@ -851,6 +913,66 @@ def run_voxtral(**kwargs) -> dict:
 
 
 @app.function(
+    image=large_mm_image,
+    gpu="L40S",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_qwen25_omni(**kwargs) -> dict:
+    return _run_model_eval(model_label="qwen2.5-omni-7b", **kwargs)
+
+
+@app.function(
+    image=large_mm_image,
+    gpu="L40S",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_phi4_multimodal(**kwargs) -> dict:
+    return _run_model_eval(model_label="phi-4-multimodal", **kwargs)
+
+
+@app.function(
+    image=large_mm_image,
+    gpu="L40S",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_gemma_4_e4b(**kwargs) -> dict:
+    return _run_model_eval(model_label="gemma-4-e4b", **kwargs)
+
+
+@app.function(
+    image=large_mm_image,
+    gpu="A100-80GB",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_qwen3_omni_instruct(**kwargs) -> dict:
+    return _run_model_eval(model_label="qwen3-omni-instruct", **kwargs)
+
+
+@app.function(
+    image=large_mm_image,
+    gpu="H100",
+    timeout=12 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+    memory=65536,
+)
+def run_nemotron_omni(**kwargs) -> dict:
+    return _run_model_eval(model_label="nemotron-3-nano-omni", **kwargs)
+
+
+@app.function(
     image=cpu_image,
     timeout=30 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
@@ -869,6 +991,7 @@ def prepare_run(
     max_new_tokens: int | None = None,
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
+    question_ids_csv: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
     judge_model_ids: str | None = None,
 ) -> dict:
@@ -882,10 +1005,12 @@ def prepare_run(
     results_volume.reload()
 
     prompt_mode = _normalize_mode(mode)
-    # Freeform defaults to the fixed MC difficulty question set unless overridden.
-    effective_source = _normalize_source_run_id(
-        source_run_id, mode=prompt_mode, num_samples=num_samples
-    )
+    # CSV question sets skip the freeform 200-id auto-pin.
+    effective_source = None
+    if not question_ids_csv:
+        effective_source = _normalize_source_run_id(
+            source_run_id, mode=prompt_mode, num_samples=num_samples
+        )
     judge_ids = _parse_judge_model_ids(
         judge_model_ids, grader_model_id=grader_model_id
     )
@@ -909,6 +1034,7 @@ def prepare_run(
         seed=seed,
         source_run_id=effective_source,
         output_dir=output_dir,
+        question_ids_csv=question_ids_csv,
     )
 
     now = datetime.now(timezone.utc).isoformat()
@@ -985,6 +1111,7 @@ def prepare_run(
             primary_judge if prompt_mode == "freeform" else existing.get("primary_judge")
         ),
         "source_run_id": existing.get("source_run_id") or effective_source,
+        "question_ids_csv": existing.get("question_ids_csv") or question_ids_csv,
         "inference": "vllm",
         "n_questions": len(question_ids),
         "created_at": existing.get("created_at") or now,
@@ -1023,7 +1150,7 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
     run_dir = _run_dir(output_dir, run_id)
     if not run_dir.exists():
         raise SystemExit(f"Run dir not found: {run_dir}")
-    result = aggregate_difficulty(run_dir, model_labels=DEFAULT_MODEL_LABELS)
+    result = aggregate_difficulty(run_dir)
     # Stamp scoring mode from manifest when present.
     manifest_path = run_dir / "manifest.json"
     if manifest_path.exists():
@@ -1051,15 +1178,7 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
     return result
 
 
-@app.function(
-    image=grader_image,
-    gpu="H100",
-    timeout=6 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=32768,
-)
-def run_freeform_grade(
+def _run_freeform_grade_body(
     run_id: str,
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     model_labels: list[str] | None = None,
@@ -1068,9 +1187,20 @@ def run_freeform_grade(
     primary_judge: str | None = None,
     batch_size: int | None = None,
     force: bool = False,
+    grade_prompt: str = "permissive",
+    include_gold: bool = True,
+    first_shot_only: bool = False,
+    make_primary: bool = False,
 ) -> dict:
     """Grade free-form predictions with one local vLLM judge model."""
-    from grader import grade_predictions_file, load_grader, resolve_judge_batch_size
+    from grader import (
+        grade_predictions_file,
+        load_grader,
+        parse_grade_prompt_list,
+        parse_shot_indices,
+        resolve_grade_judge_key,
+        resolve_judge_batch_size,
+    )
 
     volume.reload()
     results_volume.reload()
@@ -1080,68 +1210,90 @@ def run_freeform_grade(
         raise SystemExit(f"Run dir not found: {run_dir}")
 
     model_id = judge_model_id or grader_model_id or DEFAULT_GRADER_MODEL_ID
-    judge_key = judge_label(model_id)
-    primary = primary_judge or judge_key
-    effective_batch_size = resolve_judge_batch_size(model_id, batch_size)
-
+    prompts = parse_grade_prompt_list(grade_prompt)
+    shot_indices = parse_shot_indices(first_shot_only)
     labels = list(model_labels or DEFAULT_MODEL_LABELS)
     handle = load_grader(model_id)
     per_model: dict[str, dict] = {}
-    for label in labels:
-        predictions_path = run_dir / "models" / label / "predictions.jsonl"
-        print(
-            f"[grader] grading {label} with {judge_key} "
-            f"(primary={primary}, batch_size={effective_batch_size}) "
-            f"-> {predictions_path}"
-        )
-        per_model[label] = grade_predictions_file(
-            predictions_path,
-            handle,
-            judge_key=judge_key,
-            primary_judge=primary,
-            batch_size=effective_batch_size,
-            force=force,
-        )
-        results_volume.commit()
-        print(f"[grader] {label}:", per_model[label])
+    last_key = None
 
     manifest_path = run_dir / "manifest.json"
+    manifest: dict = {}
     if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             manifest = {}
+    existing_primary = manifest.get("primary_judge") or primary_judge
+
+    for prompt_name in prompts:
+        key = resolve_grade_judge_key(
+            handle, prompt=prompt_name, include_gold=include_gold
+        )
+        last_key = key
+        effective_batch_size = (
+            int(batch_size)
+            if batch_size is not None
+            else (handle.get("batch_size") or resolve_judge_batch_size(model_id, None))
+        )
+        use_primary = key if make_primary else existing_primary or key
+        for label in labels:
+            predictions_path = run_dir / "models" / label / "predictions.jsonl"
+            print(
+                f"[grader] grading {label} with {key} "
+                f"(primary={use_primary}, batch_size={effective_batch_size}) "
+                f"-> {predictions_path}"
+            )
+            per_model[f"{label}/{key}"] = grade_predictions_file(
+                predictions_path,
+                handle,
+                judge_key=key,
+                primary_judge=use_primary,
+                batch_size=effective_batch_size,
+                force=force,
+                prompt=prompt_name,
+                include_gold=include_gold,
+                shot_indices=shot_indices,
+                make_primary=make_primary,
+            )
+            results_volume.commit()
+            print(f"[grader] {label}:", per_model[f"{label}/{key}"])
+
         manifest["scoring"] = "qwen_freeform_judge"
-        # Merge this judge into the manifest judges list.
         entries = list(manifest.get("judges") or [])
         by_label = {str(e.get("label")): e for e in entries if e.get("label")}
-        by_label[judge_key] = {
-            "label": judge_key,
+        by_label[key] = {
+            "label": key,
             "model_id": model_id,
-            "primary": judge_key == primary,
+            "prompt": prompt_name,
+            "include_gold": bool(include_gold),
+            "primary": False,
         }
-        # Keep primary first.
+        primary = existing_primary
+        if make_primary or not primary:
+            primary = key if make_primary else (existing_primary or key)
         ordered = []
-        if primary in by_label:
+        if primary and primary in by_label:
             ordered.append(by_label[primary])
         for label, entry in by_label.items():
             if label == primary:
                 continue
-            entry["primary"] = False
             ordered.append(entry)
-        if primary not in by_label and ordered:
-            ordered[0]["primary"] = True
+        if not ordered and by_label:
+            ordered = list(by_label.values())
             primary = ordered[0]["label"]
         for entry in ordered:
             entry["primary"] = entry.get("label") == primary
         manifest["judges"] = ordered
-        manifest["primary_judge"] = primary
-        primary_entry = next(
-            (e for e in ordered if e.get("label") == primary), None
-        )
-        manifest["grader_model_id"] = (
-            (primary_entry or {}).get("model_id") or model_id
-        )
+        if make_primary or not existing_primary:
+            manifest["primary_judge"] = primary
+            primary_entry = next(
+                (e for e in ordered if e.get("label") == primary), None
+            )
+            manifest["grader_model_id"] = (
+                (primary_entry or {}).get("model_id") or model_id
+            )
+            existing_primary = primary
         manifest["graded_at"] = datetime.now(timezone.utc).isoformat()
         write_json(manifest_path, manifest)
 
@@ -1150,10 +1302,52 @@ def run_freeform_grade(
         "status": "ok",
         "run_id": run_id,
         "grader_model_id": model_id,
-        "judge_label": judge_key,
-        "primary_judge": primary,
+        "judge_label": last_key,
+        "primary_judge": manifest.get("primary_judge") or existing_primary,
         "by_model": per_model,
+        "prompt": prompts[-1] if prompts else "permissive",
+        "include_gold": include_gold,
     }
+
+
+_GRADE_FN_KW = dict(
+    timeout=6 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    secrets=[hf_secret],
+)
+
+
+@app.function(image=grader_image, gpu="H100", memory=32768, **_GRADE_FN_KW)
+def run_freeform_grade(**kwargs) -> dict:
+    return _run_freeform_grade_body(**kwargs)
+
+
+@app.function(image=large_mm_image, gpu="L40S", memory=65536, **_GRADE_FN_KW)
+def run_freeform_grade_l40s(**kwargs) -> dict:
+    return _run_freeform_grade_body(**kwargs)
+
+
+@app.function(image=large_mm_image, gpu="A100-80GB", memory=65536, **_GRADE_FN_KW)
+def run_freeform_grade_a100(**kwargs) -> dict:
+    return _run_freeform_grade_body(**kwargs)
+
+
+@app.function(image=large_mm_image, gpu="H100", memory=65536, **_GRADE_FN_KW)
+def run_freeform_grade_suite_h100(**kwargs) -> dict:
+    return _run_freeform_grade_body(**kwargs)
+
+
+def _grade_worker_for(model_id: str):
+    from grader import _suite_label_for
+
+    label = _suite_label_for(model_id)
+    if label in {"qwen2.5-omni-7b", "phi-4-multimodal", "gemma-4-e4b"}:
+        return run_freeform_grade_l40s
+    if label == "qwen3-omni-instruct":
+        return run_freeform_grade_a100
+    if label == "nemotron-3-nano-omni":
+        return run_freeform_grade_suite_h100
+    return run_freeform_grade
 
 
 _MODEL_FNS = {
@@ -1161,6 +1355,11 @@ _MODEL_FNS = {
     "mimo-audio-7b": run_mimo_audio,
     "interactive-omni-8b": run_interactive_omni,
     "qwen3-omni": run_qwen3_omni,
+    "qwen3-omni-instruct": run_qwen3_omni_instruct,
+    "qwen2.5-omni-7b": run_qwen25_omni,
+    "phi-4-multimodal": run_phi4_multimodal,
+    "gemma-4-e4b": run_gemma_4_e4b,
+    "nemotron-3-nano-omni": run_nemotron_omni,
     "voxtral-small-24b": run_voxtral,
 }
 
@@ -1190,12 +1389,17 @@ def run_pipeline(
     parallel_models: bool = True,
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
+    question_ids_csv: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
     judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
     grader_batch_size: int | None = None,
     skip_grade: bool = False,
+    grade_prompt: str = "permissive",
+    include_gold: bool = True,
+    first_shot_only: bool = False,
+    make_primary: bool = False,
 ) -> dict:
     """Remote orchestrator for prepare → models → grade → aggregate.
 
@@ -1207,15 +1411,19 @@ def run_pipeline(
     resolved_run_id = run_id or make_run_id()
     model_labels = parse_model_list(models)
     prompt_mode = _normalize_mode(mode)
-    effective_source = _normalize_source_run_id(
-        source_run_id, mode=prompt_mode, num_samples=num_samples
-    )
+    effective_source = None
+    if not question_ids_csv:
+        effective_source = _normalize_source_run_id(
+            source_run_id, mode=prompt_mode, num_samples=num_samples
+        )
     judge_ids = _parse_judge_model_ids(
         judge_model_ids, grader_model_id=grader_model_id
     )
     primary_judge = judge_label(judge_ids[0]) if judge_ids else None
 
     def _grade_all_judges() -> list[dict]:
+        from grader import _suite_label_for, parse_grade_prompt_list, resolve_grade_judge_key
+
         # Re-running a judge label replaces prior verdicts for that label.
         existing_labels: set[str] = set()
         try:
@@ -1234,10 +1442,20 @@ def run_pipeline(
             print(f"[grade] could not read existing judges ({exc}); using force_grade only")
 
         results: list[dict] = []
+        first_prompt = parse_grade_prompt_list(grade_prompt)[0]
         for model_id in judge_ids:
-            key = judge_label(model_id)
+            worker = _grade_worker_for(model_id)
+            suite = _suite_label_for(model_id)
+            fake_handle = {
+                "judge_label": suite or judge_label(model_id),
+                "model_id": model_id,
+                "suite_label": suite,
+            }
+            key = resolve_grade_judge_key(
+                fake_handle, prompt=first_prompt, include_gold=include_gold
+            )
             replace = bool(force_grade) or key in existing_labels
-            grade = run_freeform_grade.remote(
+            grade = worker.remote(
                 run_id=resolved_run_id,
                 output_dir=output_dir,
                 model_labels=model_labels,
@@ -1246,6 +1464,10 @@ def run_pipeline(
                 primary_judge=primary_judge,
                 batch_size=grader_batch_size,
                 force=replace,
+                grade_prompt=grade_prompt,
+                include_gold=include_gold,
+                first_shot_only=first_shot_only,
+                make_primary=make_primary,
             )
             print(f"Graded (replace={replace}):", grade)
             results.append(grade)
@@ -1294,6 +1516,7 @@ def run_pipeline(
         gpu_memory_utilization=gpu_memory_utilization,
         mode=prompt_mode,
         source_run_id=effective_source,
+        question_ids_csv=question_ids_csv,
     )
 
     print(
@@ -1319,6 +1542,7 @@ def run_pipeline(
         max_new_tokens=max_new_tokens,
         mode=prompt_mode,
         source_run_id=effective_source,
+        question_ids_csv=question_ids_csv,
         grader_model_id=judge_ids[0] if judge_ids else grader_model_id,
         judge_model_ids=",".join(judge_ids) if judge_ids else None,
     )
@@ -1358,16 +1582,24 @@ def run_pipeline(
                 print(f"Spawned {label} call_id={call.object_id}")
                 calls.append((label, call))
             for label, call in calls:
-                result = call.get()
-                print(f"Finished {label}:", result)
-                results.append(result)
+                try:
+                    result = call.get()
+                    print(f"Finished {label}:", result)
+                    results.append(result)
+                except Exception as exc:  # noqa: BLE001 — keep sibling workers alive
+                    print(f"FAILED {label}: {exc}")
+                    results.append({"status": "error", "model_label": label, "error": str(exc)})
         else:
             for label in pending_labels:
                 call = _MODEL_FNS[label].spawn(**common)
                 print(f"Spawned {label} call_id={call.object_id}")
-                result = call.get()
-                print(f"Finished {label}:", result)
-                results.append(result)
+                try:
+                    result = call.get()
+                    print(f"Finished {label}:", result)
+                    results.append(result)
+                except Exception as exc:  # noqa: BLE001 — keep sibling workers alive
+                    print(f"FAILED {label}: {exc}")
+                    results.append({"status": "error", "model_label": label, "error": str(exc)})
     else:
         print("All requested models already complete; skipping inference.")
 
@@ -1413,12 +1645,17 @@ def main(
     parallel_models: bool = True,
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
+    question_ids_csv: str | None = None,
     grader_model_id: str = DEFAULT_GRADER_MODEL_ID,
     judge_model_ids: str | None = None,
     grade_only: bool = False,
     force_grade: bool = False,
     grader_batch_size: int | None = None,
     skip_grade: bool = False,
+    grade_prompt: str = "permissive",
+    include_gold: bool = True,
+    first_shot_only: bool = False,
+    make_primary: bool = False,
 ):
     """Launch the MMAR question-difficulty experiment.
 
@@ -1448,7 +1685,10 @@ def main(
         mode: ``mc`` (choices + string match) or ``freeform`` (no choices;
             local vLLM judges grade each shot).
         source_run_id: Copy ``question_ids.json`` from this prior run.
-            Freeform defaults to ``20260727T154400Z``.
+            Freeform defaults to ``20260727T154400Z``. Pass ``none`` when
+            using ``question_ids_csv``.
+        question_ids_csv: Restrict the run to ids in this CSV (mounted from
+            ``answer-variety/``). Wins over ``source_run_id`` sampling.
         grader_model_id: Back-compat single-judge HF id (used when
             ``judge_model_ids`` is unset).
         judge_model_ids: Comma-separated HF ids for freeform judges; first
@@ -1458,6 +1698,10 @@ def main(
         grader_batch_size: Shots per grader generate() call (default: per-judge
             spec — 128 for qwen2.5-3b-instruct, 512 for qwen3.6-35b-a3b-fp8).
         skip_grade: Freeform generation without the grading pass.
+        grade_prompt: ``permissive``, ``neutral``, or a comma list.
+        include_gold: Include MCQ gold in the grade prompt (default True).
+        first_shot_only: Grade ``shot_index == 0`` only.
+        make_primary: Promote this judge to primary (default keeps existing).
     """
     # One remote spawn owns the full prepare→infer→grade→aggregate chain so
     # ``--detach`` does not stop the ephemeral app between phases.
@@ -1482,12 +1726,17 @@ def main(
         parallel_models=parallel_models,
         mode=mode,
         source_run_id=source_run_id,
+        question_ids_csv=question_ids_csv,
         grader_model_id=grader_model_id,
         judge_model_ids=judge_model_ids,
         grade_only=grade_only,
         force_grade=force_grade,
         grader_batch_size=grader_batch_size,
         skip_grade=skip_grade,
+        grade_prompt=grade_prompt,
+        include_gold=include_gold,
+        first_shot_only=first_shot_only,
+        make_primary=make_primary,
     ).get()
 
     print("Done:", out)

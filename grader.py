@@ -101,6 +101,34 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
 
 ALL_JUDGE_LABELS = tuple(JUDGE_SPECS.keys())
 
+# Open vLLM models that grade each other in round-robin (not mimo / voxtral /
+# AF-Next / Thinking unless they appear in a run and are passed explicitly).
+ROUND_ROBIN_SUITE: tuple[str, ...] = (
+    "qwen2.5-omni-7b",
+    "phi-4-multimodal",
+    "gemma-4-e4b",
+    "qwen3-omni-instruct",
+    "nemotron-3-nano-omni",
+)
+
+GRADE_PROMPT_NAMES = ("permissive", "neutral")
+DEFAULT_GRADE_PROMPT = "permissive"
+DEFAULT_INCLUDE_GOLD = True
+
+_GRADE_MECHANICAL = (
+    "You are grading a free-form answer to an audio understanding question."
+)
+_GRADE_PASS_FAIL = (
+    "Reason briefly if needed, then end your reply with a single final line "
+    'containing only "Pass" or "Fail".'
+)
+_GRADE_PERMISSIVE_RULES = (
+    "Decide whether the model answer is semantically equivalent to the "
+    "correct answer. Accept answers where it is clear that the test taker understands "
+    "what the correct answer is. If the model answer is empty, nonsense, or contradicts the "
+    "correct answer, mark it incorrect."
+)
+
 # Final-answer tokens (preferred) plus legacy YES/NO from older runs.
 # Soft whole-region fallback — keep this narrow so prose like "correct in
 # meaning" does not count as a verdict; token labels above still accept
@@ -234,18 +262,93 @@ def _needs_language_model_only(model_id: str) -> bool:
     return any(token in text for token in ("qwen3.5", "qwen3.6", "qwen3_5", "qwen3_6"))
 
 
-def build_grade_prompt(*, question: str, answer: str, prediction: str) -> str:
+def normalize_grade_prompt(name: str | None) -> str:
+    value = str(name or DEFAULT_GRADE_PROMPT).strip().lower()
+    if value not in GRADE_PROMPT_NAMES:
+        raise ValueError(
+            f"Unknown grade prompt {name!r}; expected one of {GRADE_PROMPT_NAMES}"
+        )
+    return value
+
+
+def parse_grade_prompt_list(value: str | None) -> list[str]:
+    raw = str(value or DEFAULT_GRADE_PROMPT).strip()
+    if not raw or raw.lower() == "all":
+        return list(GRADE_PROMPT_NAMES)
+    names = [normalize_grade_prompt(part) for part in raw.split(",") if part.strip()]
+    if not names:
+        return [DEFAULT_GRADE_PROMPT]
+    return list(dict.fromkeys(names))
+
+
+def gold_tag(include_gold: bool) -> str:
+    return "gold" if include_gold else "nongold"
+
+
+def compose_judge_key(
+    model_label: str,
+    *,
+    prompt: str = DEFAULT_GRADE_PROMPT,
+    include_gold: bool = DEFAULT_INCLUDE_GOLD,
+) -> str:
+    """Stable key: ``{label}__{prompt}__{gold|nongold}``."""
+    label = str(model_label or "").strip()
+    if not label:
+        raise ValueError("compose_judge_key requires a model_label")
+    return f"{label}__{normalize_grade_prompt(prompt)}__{gold_tag(include_gold)}"
+
+
+def resolve_grade_judge_key(
+    handle: dict[str, Any],
+    *,
+    prompt: str = DEFAULT_GRADE_PROMPT,
+    include_gold: bool = DEFAULT_INCLUDE_GOLD,
+    judge_key: str | None = None,
+) -> str:
+    """Composite key for suite / non-default prompts; legacy label otherwise.
+
+    Existing unlabeled keys (e.g. ``qwen3.6-35b-a3b-fp8``) stay as-is when
+    grading with the default permissive + gold prompt.
+    """
+    if judge_key:
+        return str(judge_key)
+    label = str(handle.get("judge_label") or judge_label(handle.get("model_id")) or GRADER_LABEL)
+    prompt_name = normalize_grade_prompt(prompt)
+    if handle.get("suite_label") or prompt_name != DEFAULT_GRADE_PROMPT or not include_gold:
+        return compose_judge_key(label, prompt=prompt_name, include_gold=include_gold)
+    return label
+
+
+def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
+    return (0,) if first_shot_only else None
+
+
+def build_grade_prompt(
+    *,
+    question: str,
+    answer: str,
+    prediction: str,
+    prompt: str = DEFAULT_GRADE_PROMPT,
+    include_gold: bool = DEFAULT_INCLUDE_GOLD,
+) -> str:
+    name = normalize_grade_prompt(prompt)
+    fields = [f"Question: {question}"]
+    if include_gold:
+        fields.append(f"Correct answer: {answer}")
+    fields.append(f"Model answer: {prediction}")
+    body = "\n".join(fields)
+    if name == "neutral":
+        return (
+            f"{_GRADE_MECHANICAL}\n\n"
+            f"{body}\n\n"
+            "Did the test-taker answer correctly?\n"
+            f"{_GRADE_PASS_FAIL}"
+        )
     return (
-        "You are grading a free-form answer to an audio understanding question.\n"
-        "Decide whether the model answer is semantically equivalent to the "
-        "correct answer. Accept answers where it is clear that the test taker understands "
-        "what the correct answer is. If the model answer is empty, nonsense, or contradicts the "
-        "correct answer, mark it incorrect.\n\n"
-        f"Question: {question}\n"
-        f"Correct answer: {answer}\n"
-        f"Model answer: {prediction}\n\n"
-        "Reason briefly if needed, then end your reply with a single final line "
-        'containing only "Pass" or "Fail".'
+        f"{_GRADE_MECHANICAL}\n"
+        f"{_GRADE_PERMISSIVE_RULES}\n\n"
+        f"{body}\n\n"
+        f"{_GRADE_PASS_FAIL}"
     )
 
 
@@ -328,11 +431,49 @@ def _shot_needs_grade(shot: dict, judge_key: str) -> bool:
     return True
 
 
-def _record_needs_grade(record: dict, judge_key: str) -> bool:
+def _record_needs_grade(
+    record: dict,
+    judge_key: str,
+    *,
+    shot_indices: tuple[int, ...] | list[int] | None = None,
+) -> bool:
     shots = record.get("shots") or []
+    if shot_indices is not None:
+        allowed = {int(i) for i in shot_indices}
+        shots = [
+            shot for shot in shots if int(shot.get("shot_index", 0)) in allowed
+        ]
     if not shots:
         return False
     return any(_shot_needs_grade(shot, judge_key) for shot in shots)
+
+
+def _suite_label_for(model_id: str) -> str | None:
+    """Return a MODEL_SPECS label when ``model_id`` is a suite alias or HF id."""
+    from mmar_models import MODEL_SPECS
+
+    key = str(model_id or "").strip()
+    if not key:
+        return None
+    if key in MODEL_SPECS:
+        return key
+    for label, spec in MODEL_SPECS.items():
+        if spec.get("model_id") == key:
+            return label
+    return None
+
+
+def _grade_sampling_for_engine(engine: dict[str, Any], sampling: dict[str, Any]) -> dict[str, Any]:
+    """Force deterministic grading; cap max_tokens to fit ``max_model_len``."""
+    out = dict(sampling)
+    out["temperature"] = 0.0
+    max_len = int(engine.get("max_model_len") or 8192)
+    requested = int(out.get("max_tokens") or DEFAULT_JUDGE_MAX_TOKENS)
+    # Leave headroom for the grade prompt; Pass/Fail does not need long CoT.
+    cap = max(256, min(requested, 1024, max_len // 2))
+    out["max_tokens"] = cap
+    out["seed"] = 0
+    return out
 
 
 def load_grader(
@@ -341,11 +482,51 @@ def load_grader(
 ) -> dict[str, Any]:
     from vllm import LLM, SamplingParams
 
+    suite_label = _suite_label_for(model_id)
+    if suite_label is not None:
+        from mmar_models import MODEL_SPECS, load_model
+
+        spec = MODEL_SPECS[suite_label]
+        ns = SimpleNamespace(
+            model_id=spec["model_id"],
+            tokenizer_id=spec.get("tokenizer_id"),
+            local_model_dir=None,
+            local_tokenizer_dir=None,
+            max_num_seqs=getattr(args, "max_num_seqs", None) if args else None,
+            gpu_memory_utilization=(
+                getattr(args, "gpu_memory_utilization", None) if args else None
+            ),
+            max_model_len=getattr(args, "max_model_len", None) if args else None,
+            seed=0,
+        )
+        loaded = load_model(suite_label, ns)
+        llm = loaded["llm"]
+        tokenizer = llm.get_tokenizer()
+        sampling = _grade_sampling_for_engine(spec.get("engine") or {}, spec.get("sampling") or {})
+        print(
+            f"Freeform grader ready (suite): {suite_label} ({spec['model_id']}) "
+            f"sampling={sampling}"
+        )
+        chat_kwargs = loaded.get("chat_kwargs") or {}
+        return {
+            "llm": llm,
+            "tokenizer": tokenizer,
+            "model_id": spec["model_id"],
+            "judge_label": suite_label,
+            "suite_label": suite_label,
+            "SamplingParams": SamplingParams,
+            "sampling": sampling,
+            "lora_request": loaded.get("lora_request"),
+            "chat_template_kwargs": chat_kwargs.get("chat_template_kwargs") or {},
+            "batch_size": 32,
+        }
+
     model_id = resolve_judge_model_id(model_id)
     label = judge_label(model_id)
     local_id = resolve_model_dir(model_id, None)
     engine = resolve_judge_engine(model_id, args)
     sampling = resolve_judge_sampling(model_id, args)
+    sampling = _grade_sampling_for_engine(engine, sampling)
 
     llm_kwargs: dict[str, Any] = {"model": local_id, **engine}
     language_model_only = bool(engine.get("language_model_only"))
@@ -373,19 +554,36 @@ def load_grader(
         "tokenizer": tokenizer,
         "model_id": model_id,
         "judge_label": label,
+        "suite_label": None,
         "SamplingParams": SamplingParams,
         "sampling": sampling,
+        "lora_request": None,
+        "chat_template_kwargs": {},
     }
 
 
-def _format_chat(tokenizer: Any, user_text: str) -> str:
+def _format_chat(
+    tokenizer: Any,
+    user_text: str,
+    *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> str:
     messages = [{"role": "user", "content": user_text}]
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        kwargs = dict(chat_template_kwargs or {})
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **kwargs,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
     return f"User: {user_text}\nAssistant:"
 
 
@@ -394,6 +592,8 @@ def grade_shot_batch(
     jobs: list[dict],
     *,
     max_tokens: int | None = None,
+    prompt: str = DEFAULT_GRADE_PROMPT,
+    include_gold: bool = DEFAULT_INCLUDE_GOLD,
 ) -> list[dict]:
     """Grade a list of ``{question, answer, prediction}`` jobs.
 
@@ -404,6 +604,7 @@ def grade_shot_batch(
     if not jobs:
         return []
     tokenizer = handle["tokenizer"]
+    chat_template_kwargs = handle.get("chat_template_kwargs") or {}
     prompts = [
         _format_chat(
             tokenizer,
@@ -411,13 +612,30 @@ def grade_shot_batch(
                 question=str(job.get("question") or ""),
                 answer=str(job.get("answer") or ""),
                 prediction=str(job.get("prediction") or ""),
+                prompt=prompt,
+                include_gold=include_gold,
             ),
+            chat_template_kwargs=chat_template_kwargs,
         )
         for job in jobs
     ]
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
     sampling = judge_sampling_params(model_id, max_tokens=max_tokens)
-    outputs = handle["llm"].generate(prompts, sampling_params=sampling)
+    # Suite judges are not in JUDGE_SPECS; use the handle's T=0 sampling.
+    if handle.get("suite_label") and handle.get("sampling"):
+        from vllm import SamplingParams
+
+        kwargs = dict(handle["sampling"])
+        if max_tokens is not None:
+            kwargs["max_tokens"] = int(max_tokens)
+        kwargs["temperature"] = 0.0
+        sampling = SamplingParams(**kwargs)
+    generate_kwargs: dict[str, Any] = {}
+    if handle.get("lora_request") is not None:
+        generate_kwargs["lora_request"] = handle["lora_request"]
+    outputs = handle["llm"].generate(
+        prompts, sampling_params=sampling, **generate_kwargs
+    )
     results: list[dict] = []
     for job, out in zip(jobs, outputs):
         text = ""
@@ -441,6 +659,8 @@ def grade_shot_batch(
                 "question": job.get("question"),
                 "answer": job.get("answer"),
                 "prediction": job.get("prediction"),
+                "prompt": normalize_grade_prompt(prompt),
+                "include_gold": bool(include_gold),
             }
         )
     return results
@@ -454,10 +674,18 @@ def grade_predictions_file(
     primary_judge: str | None = None,
     batch_size: int | None = None,
     force: bool = False,
+    prompt: str = DEFAULT_GRADE_PROMPT,
+    include_gold: bool = DEFAULT_INCLUDE_GOLD,
+    shot_indices: tuple[int, ...] | list[int] | None = None,
+    make_primary: bool = False,
+    sidecar_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Grade (or re-grade) one judge for all shots in a predictions.jsonl file.
+    """Grade shots in a predictions.jsonl file for one judge configuration.
 
     When ``force`` is True, existing entries for ``judge_key`` are replaced.
+    When ``sidecar_path`` is set, verdicts are written there instead of
+    rewriting ``predictions.jsonl`` (safe for concurrent round-robin judges).
+    ``make_primary`` False keeps each record's existing ``primary_judge``.
     """
     if not predictions_path.exists():
         return {
@@ -468,9 +696,18 @@ def grade_predictions_file(
         }
 
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
-    key = judge_key or judge_label(model_id) or GRADER_LABEL
-    primary = primary_judge or key
-    effective_batch_size = resolve_judge_batch_size(model_id, batch_size)
+    prompt_name = normalize_grade_prompt(prompt)
+    include_gold = bool(include_gold)
+    key = resolve_grade_judge_key(
+        handle, prompt=prompt_name, include_gold=include_gold, judge_key=judge_key
+    )
+    allowed = {int(i) for i in shot_indices} if shot_indices is not None else None
+    if batch_size is not None:
+        effective_batch_size = int(batch_size)
+    elif handle.get("batch_size"):
+        effective_batch_size = int(handle["batch_size"])
+    else:
+        effective_batch_size = resolve_judge_batch_size(model_id, None)
 
     records: list[dict] = []
     with open(predictions_path, encoding="utf-8") as handle_in:
@@ -489,12 +726,16 @@ def grade_predictions_file(
     jobs: list[dict] = []
     owners: list[tuple[int, int]] = []  # (record_index, shot_index)
     for record_index, record in enumerate(records):
-        if not force and not _record_needs_grade(record, key):
+        if not force and not _record_needs_grade(
+            record, key, shot_indices=shot_indices
+        ):
             continue
         question = str(record.get("question") or "")
         answer = str(record.get("answer") or "")
         for shot in record.get("shots") or []:
             shot_index = int(shot.get("shot_index", 0))
+            if allowed is not None and shot_index not in allowed:
+                continue
             if not force and not _shot_needs_grade(shot, key):
                 continue
             prediction = (
@@ -512,42 +753,80 @@ def grade_predictions_file(
             owners.append((record_index, shot_index))
 
     graded = 0
+    partials: list[dict] = []
     for start in range(0, len(jobs), effective_batch_size):
         chunk = jobs[start : start + effective_batch_size]
         chunk_owners = owners[start : start + effective_batch_size]
-        results = grade_shot_batch(handle, chunk)
+        results = grade_shot_batch(
+            handle,
+            chunk,
+            prompt=prompt_name,
+            include_gold=include_gold,
+        )
         for (record_index, shot_index), result in zip(chunk_owners, results):
             record = records[record_index]
+            entry = {
+                "correct": bool(result["correct"]),
+                "verdict": result.get("verdict"),
+                "output": result.get("grader_output"),
+                "generation": result.get("generation") or "",
+                "model_id": model_id,
+                "prompt": prompt_name,
+                "include_gold": include_gold,
+            }
+            if sidecar_path is not None:
+                partials.append(
+                    {
+                        "id": record.get("id"),
+                        "shot_index": shot_index,
+                        "judge_key": key,
+                        "entry": entry,
+                    }
+                )
+                graded += 1
+                continue
             for shot in record.get("shots") or []:
                 if int(shot.get("shot_index", -1)) != shot_index:
                     continue
                 judges = shot.setdefault("judges", {})
-                # Replace any previous entry for this judge key.
-                judges[key] = {
-                    "correct": bool(result["correct"]),
-                    "verdict": result.get("verdict"),
-                    "output": result.get("grader_output"),
-                    "generation": result.get("generation") or "",
-                    "model_id": model_id,
-                }
+                judges[key] = entry
                 graded += 1
                 break
 
+    if sidecar_path is not None:
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        write_jsonl(sidecar_path, partials, mode="w")
+        return {
+            "status": "ok",
+            "predictions_path": str(predictions_path),
+            "sidecar_path": str(sidecar_path),
+            "n_records": len(records),
+            "n_shots_graded": graded,
+            "grader": model_id,
+            "judge_label": key,
+            "prompt": prompt_name,
+            "include_gold": include_gold,
+            "replaced": bool(force),
+        }
+
     for record in records:
-        # Keep judge order: primary first, then any previously seen, then this key.
+        existing_primary = record.get("primary_judge")
+        if make_primary:
+            use_primary = key
+        else:
+            use_primary = existing_primary or primary_judge
         existing = [str(x) for x in (record.get("judges") or []) if x]
         ordered: list[str] = []
-        if primary:
-            ordered.append(primary)
+        if use_primary:
+            ordered.append(str(use_primary))
         for label in existing:
             if label not in ordered:
                 ordered.append(label)
         if key not in ordered:
             ordered.append(key)
         record["judges"] = ordered
-        record["primary_judge"] = primary
         record["scoring"] = "qwen_freeform_judge"
-        recompute_multi_judge_scores(record, primary)
+        recompute_multi_judge_scores(record, use_primary)
 
     write_jsonl(predictions_path, records, mode="w")
     return {
@@ -557,6 +836,94 @@ def grade_predictions_file(
         "n_shots_graded": graded,
         "grader": model_id,
         "judge_label": key,
-        "primary_judge": primary,
+        "primary_judge": primary_judge,
+        "prompt": prompt_name,
+        "include_gold": include_gold,
         "replaced": bool(force),
+    }
+
+
+def apply_judge_partials(
+    predictions_path: Path,
+    partial_paths: list[Path],
+    *,
+    make_primary: bool = False,
+    primary_judge: str | None = None,
+) -> dict[str, Any]:
+    """Merge sidecar judge verdicts into ``predictions.jsonl``."""
+    if not predictions_path.exists():
+        return {
+            "status": "missing",
+            "predictions_path": str(predictions_path),
+            "n_applied": 0,
+            "judge_keys": [],
+        }
+    records: list[dict] = []
+    by_id: dict[str, dict] = {}
+    with open(predictions_path, encoding="utf-8") as handle_in:
+        for line in handle_in:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            record = json.loads(stripped)
+            records.append(record)
+            rid = str(record.get("id") or "")
+            if rid:
+                by_id[rid] = record
+
+    applied = 0
+    keys: list[str] = []
+    for path in partial_paths:
+        if not path.is_file():
+            continue
+        with open(path, encoding="utf-8") as handle_in:
+            for line in handle_in:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                row = json.loads(stripped)
+                key = str(row.get("judge_key") or "")
+                entry = row.get("entry") or {}
+                if not key or not isinstance(entry, dict):
+                    continue
+                if key not in keys:
+                    keys.append(key)
+                record = by_id.get(str(row.get("id") or ""))
+                if record is None:
+                    continue
+                shot_index = int(row.get("shot_index", 0))
+                ensure_judge_schema(record, fallback_label=key)
+                for shot in record.get("shots") or []:
+                    if int(shot.get("shot_index", -1)) != shot_index:
+                        continue
+                    shot.setdefault("judges", {})[key] = entry
+                    applied += 1
+                    break
+
+    for record in records:
+        existing_primary = record.get("primary_judge")
+        if make_primary and keys:
+            use_primary = keys[0] if primary_judge is None else primary_judge
+        else:
+            use_primary = existing_primary or primary_judge
+        existing = [str(x) for x in (record.get("judges") or []) if x]
+        ordered: list[str] = []
+        if use_primary:
+            ordered.append(str(use_primary))
+        for label in existing:
+            if label not in ordered:
+                ordered.append(label)
+        for key in keys:
+            if key not in ordered:
+                ordered.append(key)
+        record["judges"] = ordered
+        record["scoring"] = record.get("scoring") or "qwen_freeform_judge"
+        recompute_multi_judge_scores(record, use_primary)
+
+    write_jsonl(predictions_path, records, mode="w")
+    return {
+        "status": "ok",
+        "predictions_path": str(predictions_path),
+        "n_applied": applied,
+        "judge_keys": keys,
     }

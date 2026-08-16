@@ -14,11 +14,9 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-if os.environ.get("OPENAI_API_KEY") is None:
-    raise ValueError("Environment variable OPENAI_API_KEY is not set. Please export it before running.")
-
 EVALUATE_SYS_PROMPT = "You are a impartial and meticulous AI evaluator. Your task is to assess a model's response to a question by evaluating its reasoning and its final answer. You must strictly follow the provided ground truth information and the detailed scoring rubric."
 MODEL_NAME = "gpt-4o-2024-11-20"
+ANTHROPIC_MODEL_NAME = "claude-sonnet-4-5"
 NUM_RATERS = 5
 SEED = 42
 LENGTH_LIMIT = 10000
@@ -104,65 +102,71 @@ class AsyncRateLimiter:
                 wait_time = self.next_time - now
                 await asyncio.sleep(wait_time)
                 now = time.monotonic()
-            
+
             self.next_time = now + self.interval
 
 
-class Scorer:
-    def __init__(self, api_max_retries: int, api_retry_interval: float, max_workers: int, qps: float, timeout: float):
+class BaseScorer:
+    """Shared retry / rate-limit loop for LLM rubric judges."""
+
+    def __init__(
+        self,
+        api_max_retries: int,
+        api_retry_interval: float,
+        max_workers: int,
+        qps: float,
+        timeout: float,
+        model_name: str,
+    ):
         self.api_max_retries = api_max_retries
         self.api_retry_interval = api_retry_interval
         self.max_workers = max_workers
         self.qps = qps
         self.timeout = timeout
+        self.model_name = model_name
+        self.rate_limiter = AsyncRateLimiter(qps=qps)
 
-        self.rate_limiter =  AsyncRateLimiter(qps=qps)
-        self.client = AsyncOpenAI()
+    async def _complete(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        raise NotImplementedError
 
-    async def call(self, log_id: str, parser: Callable, user_prompt: str, system_prompt: str = EVALUATE_SYS_PROMPT) -> Tuple[Any, str]:
-        for attempt in range(1, self.api_max_retries+1):
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        if status in (429, 418):
+            return True
+        return "rate" in str(exc).lower()
 
-            # === API call ===
-            
+    async def call(
+        self,
+        log_id: str,
+        parser: Callable,
+        user_prompt: str,
+        system_prompt: str = EVALUATE_SYS_PROMPT,
+        **complete_kwargs,
+    ) -> Tuple[Any, str]:
+        for attempt in range(1, self.api_max_retries + 1):
             try:
-                await self.rate_limiter.acquire()        
-
-                response = await self.client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.0,
-                    seed=SEED,
-                    timeout=self.timeout
+                await self.rate_limiter.acquire()
+                response_str = await self._complete(
+                    system_prompt, user_prompt, **complete_kwargs
                 )
                 self.rate_limiter.restore()
-                response_str = response.choices[0].message.content
-            
-
             except (APITimeoutError, APIConnectionError) as e:
                 self.rate_limiter.degrade()
                 logger.warning(f"{log_id} (api_attempt={attempt}) Transient error: {e}")
                 continue
-            
-            except APIStatusError as e:
-                if "rate" in str(e).lower() or e.status_code in [429, 418]:
+            except Exception as e:
+                if self._is_rate_limit_error(e):
                     self.rate_limiter.degrade()
                     logger.warning(f"{log_id} (api_attempt={attempt}) Rate limit hit: {e}")
                     continue
-                else:
+                if isinstance(e, APIStatusError):
                     raise ScorerAPIError(f"{log_id} OpenAI API returned an error: {e}") from e
-
-            except Exception as e:
                 raise ScorerAPIError(f"{log_id} Unexpected exception during API call: {e}") from e
-            
-            # === Response parsing ===
 
             if response_str is None:
                 logger.warning(f"{log_id} (api_attempt={attempt}) Empty response content (None).")
                 continue
-            
+
             try:
                 return parser(response_str), response_str
             except Exception as e:
@@ -171,6 +175,107 @@ class Scorer:
             await asyncio.sleep(self.api_retry_interval)
 
         raise ScorerAPIError(f"{log_id} Max retries ({self.api_max_retries}) exceeded.")
+
+
+class OpenAIScorer(BaseScorer):
+    def __init__(
+        self,
+        api_max_retries: int,
+        api_retry_interval: float,
+        max_workers: int,
+        qps: float,
+        timeout: float,
+        model_name: str = MODEL_NAME,
+    ):
+        if not (os.environ.get("OPENAI_API_KEY") or "").strip():
+            raise ValueError(
+                "Environment variable OPENAI_API_KEY is not set. Please export it before running."
+            )
+        super().__init__(
+            api_max_retries=api_max_retries,
+            api_retry_interval=api_retry_interval,
+            max_workers=max_workers,
+            qps=qps,
+            timeout=timeout,
+            model_name=model_name,
+        )
+        self.client = AsyncOpenAI()
+
+    async def _complete(
+        self, system_prompt: str, user_prompt: str, **kwargs
+    ) -> Optional[str]:
+        del kwargs
+        response = await self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            seed=SEED,
+            timeout=self.timeout,
+        )
+        return response.choices[0].message.content
+
+
+class AnthropicScorer(BaseScorer):
+    def __init__(
+        self,
+        api_max_retries: int,
+        api_retry_interval: float,
+        max_workers: int,
+        qps: float,
+        timeout: float,
+        model_name: str = ANTHROPIC_MODEL_NAME,
+        max_tokens: int = 4096,
+    ):
+        if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            raise ValueError(
+                "Environment variable ANTHROPIC_API_KEY is not set. Please export it before running."
+            )
+        super().__init__(
+            api_max_retries=api_max_retries,
+            api_retry_interval=api_retry_interval,
+            max_workers=max_workers,
+            qps=qps,
+            timeout=timeout,
+            model_name=model_name,
+        )
+        import anthropic
+
+        self._anthropic = anthropic
+        self.client = anthropic.AsyncAnthropic()
+        self.max_tokens = max_tokens
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        if super()._is_rate_limit_error(exc):
+            return True
+        rate_limit = getattr(self._anthropic, "RateLimitError", None)
+        return bool(rate_limit and isinstance(exc, rate_limit))
+
+    async def _complete(
+        self, system_prompt: str, user_prompt: str, **kwargs
+    ) -> Optional[str]:
+        del kwargs
+        response = await self.client.messages.create(
+            model=self.model_name,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            temperature=0.0,
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+        )
+        parts = []
+        for block in response.content or []:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+        return "\n".join(parts) if parts else None
+
+
+# Back-compat alias used by StreamingRubricGrader / CLI.
+class Scorer(OpenAIScorer):
+    pass
 
 
 def clean(string: str):
@@ -197,7 +302,7 @@ def create_evaluation_user_prompt(
     It provides all necessary context, the model's submission, the evaluation rubric,
     and a strict JSON output format for the LLM to follow.
     """
-    formatted_cues = ", ".join(cue) # Not used
+    formatted_cues = ", ".join(cue)  # Not used
 
     rubric_sections = []
     for item in rubric:
@@ -254,7 +359,7 @@ def create_evaluation_user_prompt(
 
 
 def parse_evaluator_response(log_id, raw_response, rubric):
-    """Parse a judge response and return per-criterion scores plus the normalized total."""
+    """Parse a judge response and return (normalized total, per-criterion details)."""
     match = re.search(r'\[\s*\{.*\}\s*\]', raw_response, re.DOTALL)
     content = match.group(0) if match else raw_response
 
@@ -271,7 +376,7 @@ def parse_evaluator_response(log_id, raw_response, rubric):
             f"{log_id} Rubric length mismatch: expected {len(rubric)} items, got {len(eval_result)}."
         )
 
-    criterion_scores = []
+    criteria = []
     total_prediction_score = 0
     total_max_score = 0
 
@@ -300,14 +405,20 @@ def parse_evaluator_response(log_id, raw_response, rubric):
                 f"Allowed choices are: {allowed_choices}."
             )
 
-        criterion_scores.append(score)
+        criteria.append(
+            {
+                "name": expected_name,
+                "score": score,
+                "justification": str(res_item.get("justification") or ""),
+            }
+        )
         total_prediction_score += score
         total_max_score += max(allowed_choices)
 
     if total_max_score == 0:
-        return 0.0, criterion_scores
+        return 0.0, criteria
 
-    return total_prediction_score / total_max_score, criterion_scores
+    return total_prediction_score / total_max_score, criteria
 
 
 def validate_and_score(log_id, raw_response, rubric):
@@ -323,6 +434,8 @@ def build_failed_rubric_results(rubric):
     return [
         {
             "name": item["name"],
+            "score": 0,
+            "justification": "",
             "pass": False,
             "rater_scores": [],
             "rater_passes": [],
@@ -331,11 +444,30 @@ def build_failed_rubric_results(rubric):
     ]
 
 
-def aggregate_rubric_results(rubric, rater_criterion_scores):
+def build_single_rater_rubric_results(rubric, criteria: List[Dict[str, Any]]):
+    """Per-criterion results for a single judge decision (no multi-rater vote)."""
+    results = []
+    for rub_item, crit in zip(rubric, criteria):
+        score = crit["score"]
+        results.append(
+            {
+                "name": rub_item["name"],
+                "score": score,
+                "justification": crit.get("justification") or "",
+                "pass": criterion_passed(score, rub_item),
+            }
+        )
+    return results
+
+
+def aggregate_rubric_results(rubric, rater_criterion_details):
     """Aggregate per-rater criterion scores into pass/fail booleans per rubric point."""
     results = []
     for index, rub_item in enumerate(rubric):
-        scores = [rater_scores[index] for rater_scores in rater_criterion_scores]
+        scores = []
+        for rater_details in rater_criterion_details:
+            entry = rater_details[index]
+            scores.append(entry["score"] if isinstance(entry, dict) else entry)
         rater_passes = [criterion_passed(score, rub_item) for score in scores]
         pass_count = sum(rater_passes)
         results.append(
@@ -347,59 +479,91 @@ def aggregate_rubric_results(rubric, rater_criterion_scores):
             }
         )
     return results
-    
+
 
 def string_match(answer, prediction, choices):
     # Function to normalize and tokenize text
     def tokenize(text):
         # Convert to lowercase and find all word tokens
         return set(re.findall(r'\b\w+\b', text.lower()))
-    
+
     # Tokenize prediction and answer
     prediction_tokens = tokenize(prediction)
     answer_tokens = tokenize(answer)
-    
+
     if not prediction_tokens:
         return False
-    
+
     # Tokenize incorrect choices and exclude tokens present in the answer
     incorrect_tokens = set()
     for choice in choices:
         choice_tokens = tokenize(choice)
         if choice_tokens != answer_tokens:
             incorrect_tokens.update(choice_tokens - answer_tokens)
-    
+
     # Condition 1: All tokens of the answer are in the prediction
     cond1 = answer_tokens.issubset(prediction_tokens)
-    
+
     # Condition 2: Prediction does not contain any tokens from incorrect choices (excluding shared words)
     cond2 = prediction_tokens.isdisjoint(incorrect_tokens)
-    
+
     return cond1 and cond2
 
 
-async def evaluate_one_record(
-    scorer: Scorer,
-    semaphore, 
+def evaluation_result_from_raw(
     record_id: str,
-    question: str, 
-    answer: str, 
+    rubric: List[Dict[str, Any]],
+    raw_response: str,
+    *,
+    correct: Optional[bool] = None,
+) -> EvaluationResult:
+    """Parse one judge reply into an EvaluationResult (single-rater).
+
+    ``correct`` records answer string-match status when provided; it does not
+    gate whether the rubric judge ran.
+    """
+    log_id = f"(record_id={record_id})"
+    score, criteria = parse_evaluator_response(log_id, raw_response, rubric)
+    return EvaluationResult(
+        record_id,
+        score=score,
+        correct=bool(correct) if correct is not None else True,
+        raw_responses=[raw_response],
+        rubric_results=build_single_rater_rubric_results(rubric, criteria),
+    )
+
+
+def failed_string_match_result(
+    record_id: str,
+    rubric: List[Dict[str, Any]],
+) -> EvaluationResult:
+    """Legacy helper: zero score without an LLM call (no longer used by default)."""
+    return EvaluationResult(
+        record_id,
+        score=0.0,
+        correct=False,
+        rubric_results=build_failed_rubric_results(rubric),
+    )
+
+
+async def evaluate_one_record(
+    scorer: BaseScorer,
+    semaphore,
+    record_id: str,
+    question: str,
+    answer: str,
     thinking: str,
     cue: List[str],
     choices: List[str],
     rubric: List[Dict[str, Any]],
-    thinking_prediction: str, 
+    thinking_prediction: str,
     answer_prediction: str,
+    *,
+    num_raters: int = NUM_RATERS,
 ) -> EvaluationResult:
     async with semaphore:
-        if not string_match(answer, answer_prediction, choices):
-            return EvaluationResult(
-                record_id,
-                score=0.0,
-                correct=False,
-                rubric_results=build_failed_rubric_results(rubric),
-            )
-        
+        answer_correct = string_match(answer, answer_prediction, choices)
+
         if len(answer_prediction) >= LENGTH_LIMIT:
             logger.warning(f"(record_id={record_id}) 'answer_prediction' is too long (length={len(answer_prediction)} limit={LENGTH_LIMIT}). Skipped.")
 
@@ -413,13 +577,13 @@ async def evaluate_one_record(
 
         scores = []
         raw_responses = []
-        rater_criterion_scores = []
-        for rater_id in range(NUM_RATERS):
+        rater_criterion_details = []
+        for rater_id in range(num_raters):
             log_id = f"(record_id={record_id} rater_id={rater_id})"
 
             try:
                 parser_func = lambda res, log_id=log_id: parse_evaluator_response(log_id, res, rubric)
-                (score, criterion_scores), raw_response = await scorer.call(
+                (score, criteria), raw_response = await scorer.call(
                     log_id, parser_func, user_prompt, EVALUATE_SYS_PROMPT
                 )
             except Exception as e:
@@ -431,7 +595,18 @@ async def evaluate_one_record(
 
             scores.append(score)
             raw_responses.append(raw_response)
-            rater_criterion_scores.append(criterion_scores)
+            rater_criterion_details.append(criteria)
+
+        if num_raters == 1:
+            return EvaluationResult(
+                record_id,
+                score=scores[0],
+                correct=answer_correct,
+                raw_responses=raw_responses,
+                rubric_results=build_single_rater_rubric_results(
+                    rubric, rater_criterion_details[0]
+                ),
+            )
 
         sorted_scores = sorted(scores)
         if len(sorted_scores) >= 3:
@@ -443,13 +618,19 @@ async def evaluate_one_record(
         return EvaluationResult(
             record_id,
             score=avg_score,
-            correct=True,
+            correct=answer_correct,
             raw_responses=raw_responses,
-            rubric_results=aggregate_rubric_results(rubric, rater_criterion_scores),
+            rubric_results=aggregate_rubric_results(rubric, rater_criterion_details),
         )
 
 
-async def run_evaluation(input_data: List[InputItem], existing_output_data: List[EvaluatedItem], scorer: Scorer) -> AsyncGenerator[EvaluatedItem, None]:
+async def run_evaluation(
+    input_data: List[InputItem],
+    existing_output_data: List[EvaluatedItem],
+    scorer: BaseScorer,
+    *,
+    num_raters: int = NUM_RATERS,
+) -> AsyncGenerator[EvaluatedItem, None]:
     semaphore = asyncio.Semaphore(scorer.max_workers)
 
     existing_ids = set()
@@ -458,7 +639,7 @@ async def run_evaluation(input_data: List[InputItem], existing_output_data: List
         if not EvaluatedItem.__required_keys__ <= keys:
             logger.error(f"Existing output data item is missing required keys: Got {keys}, expected {EvaluatedItem.__required_keys__}")
             continue
-            
+
         existing_record_id = existing_output_item["id"]
 
         if existing_record_id in existing_ids:
@@ -468,7 +649,7 @@ async def run_evaluation(input_data: List[InputItem], existing_output_data: List
         existing_ids.add(existing_record_id)
         existing_output_item["new"] = False
         yield existing_output_item
-    
+
     tasks: List[asyncio.Task[EvaluationResult]] = []
     record_id_to_item: Mapping[str, InputItem] = {}
     for input_item in input_data:
@@ -483,8 +664,9 @@ async def run_evaluation(input_data: List[InputItem], existing_output_data: List
         tasks.append(asyncio.create_task(evaluate_one_record(
             scorer, semaphore, input_item["id"],
             input_item["question"], input_item["answer"], input_item["thinking"],
-            input_item["cue"], input_item["choices"], input_item["rubric"], 
+            input_item["cue"], input_item["choices"], input_item["rubric"],
             input_item["thinking_prediction"], input_item["answer_prediction"],
+            num_raters=num_raters,
         )))
         record_id_to_item[input_item["id"]] = input_item
 
@@ -512,7 +694,7 @@ def load_jsonl_or_json(file_path: str):
     if file_path.endswith(".json"):
         with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    
+
     with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if line.strip():
@@ -551,6 +733,8 @@ async def main():
     api.add_argument("--retry-interval", type=float, default=DEFAULT_API_RETRY_INTERVAL, help="Sleep between retries (seconds).")
     api.add_argument("--qps", type=float, default=DEFAULT_QPS, help="Target queries per second (rate limiter).")
     api.add_argument("--max-workers", "-j", type=int, default=DEFAULT_MAX_WORKERS, help="Max concurrent evaluation tasks.")
+    api.add_argument("--num-raters", type=int, default=NUM_RATERS, help="LLM raters per sample (official default 5).")
+    api.add_argument("--model", default=MODEL_NAME, help="OpenAI judge model name.")
 
     args = p.parse_args()
 
@@ -562,11 +746,13 @@ async def main():
         api_retry_interval=args.retry_interval,
         max_workers=args.max_workers,
         qps=args.qps,
-        timeout=args.timeout
+        timeout=args.timeout,
+        model_name=args.model,
     )
 
     out_dir = os.path.dirname(output_file)
-    if out_dir: os.makedirs(out_dir, exist_ok=True)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     input_data = load_jsonl_or_json(input_file)
     existing_output_data = []
@@ -613,7 +799,12 @@ async def main():
 
     try:
         with open(output_file, "a", encoding="utf-8") as fout:
-            async for evaluated_item in run_evaluation(input_data, existing_output_data, scorer):
+            async for evaluated_item in run_evaluation(
+                input_data,
+                existing_output_data,
+                scorer,
+                num_raters=args.num_raters,
+            ):
                 modality = evaluated_item['modality']
                 category = evaluated_item['category']
                 subcat = evaluated_item.get('sub-category', None)
@@ -645,7 +836,7 @@ async def main():
             acc = (m.correct / m.total) * 100 if m.total > 0 else 0
             avg_score = (m.accum_score / m.total) * 100 if m.total > 0 else 0
             print(f"{modality:<25}  score={avg_score:3.2f}, acc={acc:3.2f}% over {m.total:>3} samples")
-        
+
         print("*"*30)
         print("Category-wise Score & Accuracy:")
         for category in category_metrics:
@@ -653,7 +844,7 @@ async def main():
             acc = (m.correct / m.total) * 100 if m.total > 0 else 0
             avg_score = (m.accum_score / m.total) * 100 if m.total > 0 else 0
             print(f"{category:<18}  score={avg_score:3.2f}, acc={acc:3.2f}% over {m.total:>3} samples")
-        
+
         print("*"*30)
         print("Sub-category-wise Score & Accuracy:")
         for subcat in subcat_metrics:

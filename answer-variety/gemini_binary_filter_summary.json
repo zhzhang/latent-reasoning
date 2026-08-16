@@ -1,0 +1,13 @@
+{
+  "judge_model_id": "gemini-3.7-flash",
+  "scoring": "binary_question_text",
+  "n_skipped_yes_no": 159,
+  "n_candidates": 841,
+  "n_judged": 841,
+  "n_binary": 57,
+  "n_open_ended": 784,
+  "n_unparsed": 0,
+  "judgments_path": "/Users/jordan/tinkering/latent-reasoning/answer-variety/gemini_binary_judgments.jsonl",
+  "binary_ids_path": "/Users/jordan/tinkering/latent-reasoning/answer-variety/gemini_binary_question_ids.csv",
+  "open_ended_ids_path": "/Users/jordan/tinkering/latent-reasoning/answer-variety/open_ended_question_ids.csv"
+}

@@ -15,7 +15,14 @@ MODEL_LABELS = (
     "voxtral-small-24b",
 )
 # Preferred display / discovery order; extras append after known labels.
-MODEL_LABEL_ORDER = MODEL_LABELS + ("step-audio-2-mini",)
+MODEL_LABEL_ORDER = MODEL_LABELS + (
+    "step-audio-2-mini",
+    "qwen2.5-omni-7b",
+    "phi-4-multimodal",
+    "gemma-4-e4b",
+    "qwen3-omni-instruct",
+    "nemotron-3-nano-omni",
+)
 
 
 def load_jsonl(path: Path) -> list[dict]:

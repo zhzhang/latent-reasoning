@@ -181,6 +181,145 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
+    # Dense 7B thinker-only; HF generation_config.json has no sampler.
+    # Official eval is greedy; T=0.2 keeps n-shot variance.
+    "qwen2.5-omni-7b": {
+        "model_id": "Qwen/Qwen2.5-Omni-7B",
+        "gpu": "L40S",
+        "backend": "vllm",
+        "engine": {
+            "dtype": "bfloat16",
+            "max_model_len": 8192,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": False,
+            "trust_remote_code": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
+            "attention_backend": "flashinfer",
+            "async_scheduling": True,
+        },
+        "sampling": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 2048,
+            "repetition_penalty": 1.0,
+        },
+    },
+    # 5.6B; speech LoRA lives next to the checkpoint. Card uses
+    # GenerationConfig.from_pretrained + max_new_tokens=1000 (greedy).
+    "phi-4-multimodal": {
+        "model_id": "microsoft/Phi-4-multimodal-instruct",
+        "gpu": "L40S",
+        "backend": "vllm",
+        "engine": {
+            "dtype": "bfloat16",
+            "max_model_len": 8192,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": False,
+            "trust_remote_code": True,
+            "enable_lora": True,
+            "max_lora_rank": 320,
+            "max_loras": 1,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
+            "attention_backend": "flashinfer",
+            "async_scheduling": True,
+        },
+        "sampling": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 1000,
+            "repetition_penalty": 1.0,
+        },
+    },
+    # Effective 4B; native audio. Card Best Practices: T=1.0, top_p=0.95, top_k=64.
+    "gemma-4-e4b": {
+        "model_id": "google/gemma-4-E4B-it",
+        "gpu": "L40S",
+        "backend": "vllm_chat",
+        "engine": {
+            "dtype": "bfloat16",
+            "max_model_len": 8192,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": False,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
+            # Gemma-4 head_size is unsupported by FLASH_ATTN; FlashInfer JIT
+            # on L40S (sm89) requests sm100+ kernels. Triton handles both.
+            "attention_backend": "TRITON_ATTN",
+            "async_scheduling": True,
+            "allowed_local_media_path": "/",
+        },
+        "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_tokens": 1024,
+            "repetition_penalty": 1.0,
+        },
+    },
+    # Same MoE thinker path as qwen3-omni Thinking; official Instruct eval is greedy.
+    "qwen3-omni-instruct": {
+        "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "gpu": "A100-80GB",
+        "backend": "vllm",
+        "engine": {
+            "dtype": "bfloat16",
+            "max_model_len": 4096,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
+            "attention_backend": "flashinfer",
+            "async_scheduling": True,
+        },
+        "sampling": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 2048,
+            "repetition_penalty": 1.0,
+        },
+    },
+    # Native FP8 MoE; thinking-mode card: T=0.6, top_p=0.95. Cap max_tokens for MMAR.
+    "nemotron-3-nano-omni": {
+        "model_id": "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+        "gpu": "H100",
+        "backend": "vllm_chat",
+        "engine": {
+            "dtype": "auto",
+            "max_model_len": 4096,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": False,
+            "trust_remote_code": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
+            "attention_backend": "flashinfer",
+            "async_scheduling": True,
+            "allowed_local_media_path": "/",
+        },
+        "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "max_tokens": 2048,
+            "repetition_penalty": 1.0,
+        },
+    },
 }
 
 ALL_MODEL_LABELS = tuple(MODEL_SPECS.keys())
@@ -422,13 +561,52 @@ def _interactive_omni_messages(sample: dict, args: SimpleNamespace | None = None
 
 def _qwen3_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     # Qwen3-Omni Thinking primary examples omit a system turn; the chat
-    # template only emits one when messages[0].role == "system".
+    # template only emits one when messages[0].role == "system". Instruct
+    # eval notes also say no system prompt.
     question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     return (
         "<|im_start|>user\n"
         f"<|audio_start|><|audio_pad|><|audio_end|>{question}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
+
+
+QWEN25_OMNI_SYSTEM = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
+
+
+def _qwen25_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
+    return (
+        f"<|im_start|>system\n{QWEN25_OMNI_SYSTEM}<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"<|audio_bos|><|AUDIO|><|audio_eos|>{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
+def _phi4_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
+    return f"<|user|><|audio_1|>{question}<|end|><|assistant|>"
+
+
+def _audio_text_messages(sample: dict, args: SimpleNamespace | None = None) -> list[dict]:
+    prompt = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": f"file://{sample['audio_path']}"},
+                },
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -722,22 +900,104 @@ def _apply_engine_overrides(engine: dict, args: SimpleNamespace) -> dict:
         out["max_num_seqs"] = int(args.max_num_seqs)
     if getattr(args, "gpu_memory_utilization", None):
         out["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
+    if getattr(args, "max_model_len", None):
+        out["max_model_len"] = int(args.max_model_len)
     return out
 
 
 def load_qwen3_omni(args: SimpleNamespace):
     """Qwen3-Omni Thinking via plain vLLM thinker-only path."""
+    return _load_qwen3_family(args, label="qwen3-omni", parse_fn=parse_think_tagged_output)
+
+
+def load_qwen3_omni_instruct(args: SimpleNamespace):
+    """Qwen3-Omni Instruct via the same thinker-only vLLM path."""
+    return _load_qwen3_family(
+        args, label="qwen3-omni-instruct", parse_fn=parse_choice_output
+    )
+
+
+def _load_qwen3_family(args: SimpleNamespace, *, label: str, parse_fn: Callable):
     from vllm import LLM
 
-    spec = MODEL_SPECS["qwen3-omni"]
+    spec = MODEL_SPECS[label]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
     engine = _apply_engine_overrides(spec["engine"], args)
     llm = LLM(model=local_id, **engine)
-    print(f"Qwen3-Omni vLLM thinker ready from {local_id} engine={engine}")
+    print(f"{label} vLLM thinker ready from {local_id} engine={engine}")
     return {
         "backend": "vllm",
         "llm": llm,
+        "parse_fn": parse_fn,
+    }
+
+
+def load_qwen25_omni(args: SimpleNamespace):
+    from vllm import LLM
+
+    spec = MODEL_SPECS["qwen2.5-omni-7b"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+    llm = LLM(model=local_id, **engine)
+    print(f"Qwen2.5-Omni vLLM thinker ready from {local_id} engine={engine}")
+    return {
+        "backend": "vllm",
+        "llm": llm,
+        "parse_fn": parse_choice_output,
+    }
+
+
+def load_phi4_multimodal(args: SimpleNamespace):
+    from vllm import LLM
+    from vllm.lora.request import LoRARequest
+
+    spec = MODEL_SPECS["phi-4-multimodal"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+    speech_lora = Path(local_id) / "speech-lora"
+    if not speech_lora.is_dir():
+        raise SystemExit(f"Phi-4 speech-lora not found at {speech_lora}")
+    llm = LLM(model=local_id, **engine)
+    print(f"Phi-4-multimodal vLLM ready from {local_id} speech_lora={speech_lora}")
+    return {
+        "backend": "vllm",
+        "llm": llm,
+        "parse_fn": parse_choice_output,
+        "lora_request": LoRARequest("speech", 1, str(speech_lora)),
+    }
+
+
+def load_gemma_4_e4b(args: SimpleNamespace):
+    from vllm import LLM
+
+    spec = MODEL_SPECS["gemma-4-e4b"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+    llm = LLM(model=local_id, **engine)
+    print(f"Gemma-4-E4B vLLM chat ready from {local_id} engine={engine}")
+    return {
+        "backend": "vllm_chat",
+        "llm": llm,
+        "parse_fn": parse_choice_output,
+        "messages_fn": "audio_text",
+        "chat_kwargs": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+
+
+def load_nemotron_omni(args: SimpleNamespace):
+    from vllm import LLM
+
+    spec = MODEL_SPECS["nemotron-3-nano-omni"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+    llm = LLM(model=local_id, **engine)
+    print(f"Nemotron-3-Nano-Omni vLLM chat ready from {local_id} engine={engine}")
+    return {
+        "backend": "vllm_chat",
+        "llm": llm,
         "parse_fn": parse_think_tagged_output,
+        "messages_fn": "audio_text",
+        "chat_kwargs": {"chat_template_kwargs": {"enable_thinking": True}},
     }
 
 
@@ -872,8 +1132,12 @@ def generate_batch(
     if backend == "vllm":
         if label == "af-next-think":
             prompt_fn = lambda s: _af_next_prompt(s, args)  # noqa: E731
-        elif label == "qwen3-omni":
+        elif label in {"qwen3-omni", "qwen3-omni-instruct"}:
             prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
+        elif label == "qwen2.5-omni-7b":
+            prompt_fn = lambda s: _qwen25_omni_prompt(s, args)  # noqa: E731
+        elif label == "phi-4-multimodal":
+            prompt_fn = lambda s: _phi4_prompt(s, args)  # noqa: E731
         else:
             prompt_fn = lambda s: _build_prompt(s, args)  # noqa: E731
         prompts, sampling = _build_vllm_audio_inputs(
@@ -885,7 +1149,12 @@ def generate_batch(
             seeds=seeds,
             n_completions=n_completions,
         )
-        outputs = handle["llm"].generate(prompts, sampling_params=sampling)
+        generate_kwargs: dict[str, Any] = {}
+        if handle.get("lora_request") is not None:
+            generate_kwargs["lora_request"] = handle["lora_request"]
+        outputs = handle["llm"].generate(
+            prompts, sampling_params=sampling, **generate_kwargs
+        )
         return _expand_n_outputs(
             samples, outputs, n_completions=n_completions, parse_fn=parse_fn
         )
@@ -974,12 +1243,27 @@ def generate_batch(
         ]
 
     if backend == "vllm_chat":
-        messages = [_interactive_omni_messages(sample, args) for sample in samples]
+        if handle.get("messages_fn") == "audio_text":
+            messages = [_audio_text_messages(sample, args) for sample in samples]
+        else:
+            messages = [_interactive_omni_messages(sample, args) for sample in samples]
         sampling = [
             _sampling_params_for_request(label, args, seed, n=n_completions)
             for seed in seeds
         ]
-        outputs = handle["llm"].chat(messages, sampling_params=sampling)
+        chat_kwargs = dict(handle.get("chat_kwargs") or {})
+        # Gemma-4's audio encoder treats mixed-length batches as a Python list
+        # and then calls .squeeze(); one conversation at a time (n=shots) is safe.
+        if label in {"gemma-4-e4b", "nemotron-3-nano-omni"}:
+            outputs = []
+            for msgs, sp in zip(messages, sampling):
+                outputs.extend(
+                    handle["llm"].chat([msgs], sampling_params=sp, **chat_kwargs)
+                )
+        else:
+            outputs = handle["llm"].chat(
+                messages, sampling_params=sampling, **chat_kwargs
+            )
         return _expand_n_outputs(
             samples, outputs, n_completions=n_completions, parse_fn=parse_fn
         )
@@ -1250,6 +1534,11 @@ _LOADERS = {
     "mimo-audio-7b": load_mimo_audio,
     "interactive-omni-8b": load_interactive_omni,
     "qwen3-omni": load_qwen3_omni,
+    "qwen3-omni-instruct": load_qwen3_omni_instruct,
+    "qwen2.5-omni-7b": load_qwen25_omni,
+    "phi-4-multimodal": load_phi4_multimodal,
+    "gemma-4-e4b": load_gemma_4_e4b,
+    "nemotron-3-nano-omni": load_nemotron_omni,
     "voxtral-small-24b": load_voxtral,
 }
 

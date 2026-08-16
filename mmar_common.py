@@ -68,6 +68,27 @@ def write_json(path: Path, payload: dict) -> Path:
     return path
 
 
+def load_question_ids_csv(path: Path | str) -> list[str]:
+    """Load an ``id`` column (or a single-column file) of question ids."""
+    csv_path = Path(path).expanduser()
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"question-ids csv not found: {csv_path}")
+    ids: list[str] = []
+    with open(csv_path, encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            text = line.strip().strip("\ufeff")
+            if not text:
+                continue
+            first = text.split(",", 1)[0].strip().strip('"')
+            if not first:
+                continue
+            if index == 0 and first.lower() in {"id", "ids", "question_id", "qid"}:
+                continue
+            ids.append(first)
+    # Preserve order, drop duplicates.
+    return list(dict.fromkeys(ids))
+
+
 def resolve_path(data_root, value):
     path = Path(value)
     if path.is_absolute():
@@ -501,16 +522,16 @@ def recompute_multi_judge_scores(
             n_correct += int(bool(entry.get("correct")))
         if n_scored == 0:
             per_judge[label] = {
-                "n_shots": n_shots,
+                "n_shots": 0,
                 "n_shot_correct": None,
                 "shot_success_rate": None,
                 "correct": None,
             }
         else:
             per_judge[label] = {
-                "n_shots": n_shots,
+                "n_shots": n_scored,
                 "n_shot_correct": n_correct,
-                "shot_success_rate": (n_correct / n_shots) if n_shots else 0.0,
+                "shot_success_rate": n_correct / n_scored,
                 "correct": n_correct > 0,
             }
 
