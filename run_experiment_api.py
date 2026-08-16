@@ -1,7 +1,9 @@
-"""Local MMAR freeform test-taker via OpenAI / Gemini audio APIs.
+"""Local MMAR freeform test-taker via OpenAI / Gemini audio **Batch** APIs.
 
 Writes under ``outputs/exp-mmar-question-difficulty-api/<run_id>/`` so Modal
 downloads into ``outputs/exp-mmar-question-difficulty/`` cannot overwrite them.
+
+Both providers run at ~50% of interactive pricing with a 24h completion window.
 
 Usage::
 
@@ -18,17 +20,25 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import asyncio
 import base64
 import hashlib
 import json
 import logging
 import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from api_batch import (
+    gemini_generate_request,
+    gemini_inline_audio_part,
+    gemini_text_part,
+    gemini_user_contents,
+    openai_batch_chat_text,
+    openai_chat_request,
+    run_gemini_generate_batch,
+    run_openai_chat_batch,
+)
 from mmar_common import (
     aggregate_n_shot_record,
     build_mmar_freeform_prompt,
@@ -41,7 +51,6 @@ from mmar_common import (
     write_json,
     write_jsonl,
 )
-from mmar_groundedness import gemini_response_text
 from view_difficulty import DEFAULT_AUDIO_DIR, DEFAULT_DATA_DIR, ensure_mmar_audio
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -125,191 +134,217 @@ def _output_from_text(raw: str) -> dict:
     }
 
 
-class OpenAIAudioTaker:
-    def __init__(
-        self,
-        *,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        qps: float,
-        timeout: float,
-        retries: int,
-        retry_interval: float,
-    ):
-        from openai import AsyncOpenAI
-
-        if not (os.environ.get("OPENAI_API_KEY") or "").strip():
-            raise SystemExit("Set OPENAI_API_KEY to call gpt-audio-mini.")
-        self.client = AsyncOpenAI()
-        self.model_id = model_id
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.retries = retries
-        self.retry_interval = retry_interval
-        self._interval = 1.0 / max(float(qps), 0.1)
-        self._next_time = 0.0
-        self._lock = asyncio.Lock()
-
-    async def _throttle(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            if now < self._next_time:
-                await asyncio.sleep(self._next_time - now)
-                now = time.monotonic()
-            self._next_time = now + self._interval
-
-    async def complete(self, prompt: str, audio_path: str, seed: int) -> str:
-        audio_b64 = base64.b64encode(Path(audio_path).read_bytes()).decode("ascii")
-        last_exc: Exception | None = None
-        for attempt in range(1, self.retries + 1):
-            try:
-                await self._throttle()
-                response = await asyncio.wait_for(
-                    self.client.chat.completions.create(
-                        model=self.model_id,
-                        modalities=["text"],
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                        seed=int(seed),
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {
-                                        "type": "input_audio",
-                                        "input_audio": {
-                                            "data": audio_b64,
-                                            "format": "wav",
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
-                    ),
-                    timeout=self.timeout,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                logger.warning("openai attempt %s failed: %s", attempt, exc)
-                await asyncio.sleep(self.retry_interval * attempt)
-                continue
-            choice = (response.choices or [None])[0]
-            text = ""
-            if choice is not None and choice.message is not None:
-                text = str(choice.message.content or "").strip()
-            if text:
-                return text
-            logger.warning("openai attempt %s empty response", attempt)
-            await asyncio.sleep(self.retry_interval)
-        raise RuntimeError(f"OpenAI retries exhausted: {last_exc}")
+def _shot_custom_id(question_id: str, shot_index: int) -> str:
+    return f"{question_id}__shot{shot_index}"
 
 
-class GeminiAudioTaker:
-    def __init__(
-        self,
-        *,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        qps: float,
-        timeout: float,
-        retries: int,
-        retry_interval: float,
-    ):
-        from google import genai
-        from google.genai import types
-
-        api_key = (
-            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-        ).strip()
-        if not api_key:
-            raise SystemExit("Set GEMINI_API_KEY or GOOGLE_API_KEY to call Gemini.")
-        self.types = types
-        self.client = genai.Client(api_key=api_key)
-        self.model_id = model_id
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.retries = retries
-        self.retry_interval = retry_interval
-        self._interval = 1.0 / max(float(qps), 0.1)
-        self._next_time = 0.0
-        self._lock = asyncio.Lock()
-
-    async def _throttle(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            if now < self._next_time:
-                await asyncio.sleep(self._next_time - now)
-                now = time.monotonic()
-            self._next_time = now + self._interval
-
-    async def complete(self, prompt: str, audio_path: str, seed: int) -> str:
-        del seed  # Gemini generate_content has no per-request seed here.
-        audio_bytes = Path(audio_path).read_bytes()
-        config = self.types.GenerateContentConfig(
-            temperature=self.temperature,
-            max_output_tokens=int(self.max_tokens),
-        )
-        last_exc: Exception | None = None
-        for attempt in range(1, self.retries + 1):
-            try:
-                await self._throttle()
-                response = await asyncio.wait_for(
-                    self.client.aio.models.generate_content(
-                        model=self.model_id,
-                        contents=[
-                            self.types.Part.from_bytes(
-                                data=audio_bytes, mime_type="audio/wav"
-                            ),
-                            prompt,
-                        ],
-                        config=config,
-                    ),
-                    timeout=self.timeout,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                logger.warning("gemini attempt %s failed: %s", attempt, exc)
-                await asyncio.sleep(self.retry_interval * attempt)
-                continue
-            text = gemini_response_text(response)
-            if text:
-                return text
-            logger.warning("gemini attempt %s empty response", attempt)
-            await asyncio.sleep(self.retry_interval)
-        raise RuntimeError(f"Gemini retries exhausted: {last_exc}")
-
-
-def _make_taker(label: str, args: argparse.Namespace):
+def _run_openai_batch_label(
+    *,
+    label: str,
+    pending: list[dict],
+    predictions_path: Path,
+    work_dir: Path,
+    args: argparse.Namespace,
+    question_ids: list[str],
+) -> dict:
+    if not (os.environ.get("OPENAI_API_KEY") or "").strip():
+        raise SystemExit("Set OPENAI_API_KEY to call gpt-audio-mini.")
     spec = API_SPECS[label]
-    sampling = spec["sampling"]
-    kwargs = dict(
-        model_id=spec["model_id"],
-        temperature=float(
-            args.temperature if args.temperature is not None else sampling["temperature"]
-        ),
-        max_tokens=int(
-            args.max_new_tokens
-            if args.max_new_tokens is not None
-            else sampling["max_tokens"]
-        ),
-        qps=args.qps,
-        timeout=args.timeout,
-        retries=args.retries,
-        retry_interval=args.retry_interval,
+    temperature = float(
+        args.temperature
+        if args.temperature is not None
+        else spec["sampling"]["temperature"]
     )
-    if spec["backend"] == "openai":
-        return OpenAIAudioTaker(**kwargs)
-    if spec["backend"] == "gemini":
-        return GeminiAudioTaker(**kwargs)
-    raise SystemExit(f"Unknown backend for {label}")
+    max_tokens = int(
+        args.max_new_tokens
+        if args.max_new_tokens is not None
+        else spec["sampling"]["max_tokens"]
+    )
+    requests: list[dict[str, Any]] = []
+    owners: dict[str, tuple[str, int]] = {}
+    for item in pending:
+        prompt = build_mmar_freeform_prompt(item)
+        audio_b64 = base64.b64encode(Path(item["audio_path"]).read_bytes()).decode(
+            "ascii"
+        )
+        for shot_index in range(args.n_shots):
+            custom_id = _shot_custom_id(str(item["id"]), shot_index)
+            owners[custom_id] = (str(item["id"]), shot_index)
+            seed = _shot_seed(args.seed, str(item["id"]), shot_index)
+            requests.append(
+                openai_chat_request(
+                    custom_id=custom_id,
+                    model=spec["model_id"],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    seed=seed,
+                    modalities=["text"],
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": audio_b64,
+                                        "format": "wav",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                )
+            )
+    print(f"[{label}] submitting OpenAI batch with {len(requests)} requests")
+    results = run_openai_chat_batch(
+        requests,
+        work_dir=work_dir,
+        display_name=f"{label}-generate",
+        poll_interval_s=args.poll_interval,
+    )
+    by_qid: dict[str, dict[int, str]] = {}
+    n_fail = 0
+    for custom_id, (qid, shot_index) in owners.items():
+        text = openai_batch_chat_text(results.get(custom_id) or {})
+        if not text:
+            n_fail += 1
+            print(f"[{label}] missing/empty result for {custom_id}")
+            continue
+        by_qid.setdefault(qid, {})[shot_index] = text
+
+    written = 0
+    for item in pending:
+        qid = str(item["id"])
+        shot_map = by_qid.get(qid) or {}
+        if len(shot_map) < args.n_shots:
+            print(
+                f"[{label}] skipping write for {qid}: "
+                f"{len(shot_map)}/{args.n_shots} shots"
+            )
+            continue
+        shot_outputs = [
+            _output_from_text(shot_map[shot_index])
+            for shot_index in range(args.n_shots)
+        ]
+        record = aggregate_n_shot_record(item, shot_outputs, pending_grade=True)
+        write_jsonl(predictions_path, [record], mode="a")
+        written += 1
+        if written % args.print_every == 0 or written == len(pending):
+            print(
+                f"[{label}] {written}/{len(pending)} id={item['id']} "
+                f"answer={record.get('answer_prediction')!r}"
+            )
+    total = len(load_completed_ids(predictions_path) & set(question_ids))
+    return {
+        "status": "ok",
+        "model_label": label,
+        "n_written": written,
+        "n_fail": n_fail,
+        "n_predictions": total,
+        "predictions_path": str(predictions_path),
+        "backend": "openai-batch",
+        "mode": "freeform",
+    }
 
 
-async def _run_label(
+def _run_gemini_batch_label(
+    *,
+    label: str,
+    pending: list[dict],
+    predictions_path: Path,
+    work_dir: Path,
+    args: argparse.Namespace,
+    question_ids: list[str],
+) -> dict:
+    api_key = (
+        os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    ).strip()
+    if not api_key:
+        raise SystemExit("Set GEMINI_API_KEY or GOOGLE_API_KEY to call Gemini.")
+    spec = API_SPECS[label]
+    temperature = float(
+        args.temperature
+        if args.temperature is not None
+        else spec["sampling"]["temperature"]
+    )
+    max_tokens = int(
+        args.max_new_tokens
+        if args.max_new_tokens is not None
+        else spec["sampling"]["max_tokens"]
+    )
+    requests: list[dict[str, Any]] = []
+    owners: dict[str, tuple[str, int]] = {}
+    for item in pending:
+        prompt = build_mmar_freeform_prompt(item)
+        audio_bytes = Path(item["audio_path"]).read_bytes()
+        audio_part = gemini_inline_audio_part(audio_bytes)
+        text_part = gemini_text_part(prompt)
+        for shot_index in range(args.n_shots):
+            custom_id = _shot_custom_id(str(item["id"]), shot_index)
+            owners[custom_id] = (str(item["id"]), shot_index)
+            requests.append(
+                gemini_generate_request(
+                    key=custom_id,
+                    contents=gemini_user_contents(audio_part, text_part),
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                )
+            )
+    print(f"[{label}] submitting Gemini batch with {len(requests)} requests")
+    texts = run_gemini_generate_batch(
+        requests,
+        model=spec["model_id"],
+        work_dir=work_dir,
+        display_name=f"{label}-generate",
+        poll_interval_s=args.poll_interval,
+    )
+    by_qid: dict[str, dict[int, str]] = {}
+    n_fail = 0
+    for custom_id, (qid, shot_index) in owners.items():
+        text = (texts.get(custom_id) or "").strip()
+        if not text:
+            n_fail += 1
+            print(f"[{label}] missing/empty result for {custom_id}")
+            continue
+        by_qid.setdefault(qid, {})[shot_index] = text
+
+    written = 0
+    for item in pending:
+        qid = str(item["id"])
+        shot_map = by_qid.get(qid) or {}
+        if len(shot_map) < args.n_shots:
+            print(
+                f"[{label}] skipping write for {qid}: "
+                f"{len(shot_map)}/{args.n_shots} shots"
+            )
+            continue
+        shot_outputs = [
+            _output_from_text(shot_map[shot_index])
+            for shot_index in range(args.n_shots)
+        ]
+        record = aggregate_n_shot_record(item, shot_outputs, pending_grade=True)
+        write_jsonl(predictions_path, [record], mode="a")
+        written += 1
+        if written % args.print_every == 0 or written == len(pending):
+            print(
+                f"[{label}] {written}/{len(pending)} id={item['id']} "
+                f"answer={record.get('answer_prediction')!r}"
+            )
+    total = len(load_completed_ids(predictions_path) & set(question_ids))
+    return {
+        "status": "ok",
+        "model_label": label,
+        "n_written": written,
+        "n_fail": n_fail,
+        "n_predictions": total,
+        "predictions_path": str(predictions_path),
+        "backend": "gemini-batch",
+        "mode": "freeform",
+    }
+
+
+def _run_label(
     *,
     label: str,
     items: list[dict],
@@ -321,10 +356,11 @@ async def _run_label(
     model_dir = run_dir / "models" / label
     model_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = model_dir / "predictions.jsonl"
+    work_dir = model_dir / "batch"
     completed = {str(x) for x in load_completed_ids(predictions_path)}
     pending = [item for item in items if str(item["id"]) not in completed]
     print(
-        f"[{label}] model={spec['model_id']} "
+        f"[{label}] model={spec['model_id']} backend={spec['backend']}-batch "
         f"{len(items)} selected, {len(completed)} done, {len(pending)} pending "
         f"(n_shots={args.n_shots})"
     )
@@ -335,45 +371,28 @@ async def _run_label(
             "n_predictions": len(completed),
             "predictions_path": str(predictions_path),
         }
-
-    taker = _make_taker(label, args)
-    semaphore = asyncio.Semaphore(args.max_workers)
-    write_lock = asyncio.Lock()
-    written = 0
-
-    async def _one(item: dict) -> None:
-        nonlocal written
-        prompt = build_mmar_freeform_prompt(item)
-        shot_outputs: list[dict] = []
-        for shot_index in range(args.n_shots):
-            seed = _shot_seed(args.seed, str(item["id"]), shot_index)
-            async with semaphore:
-                text = await taker.complete(prompt, item["audio_path"], seed)
-            shot_outputs.append(_output_from_text(text))
-        record = aggregate_n_shot_record(item, shot_outputs, pending_grade=True)
-        async with write_lock:
-            write_jsonl(predictions_path, [record], mode="a")
-            written += 1
-            if written % args.print_every == 0 or written == len(pending):
-                print(
-                    f"[{label}] {written}/{len(pending)} id={item['id']} "
-                    f"answer={record.get('answer_prediction')!r}"
-                )
-
-    await asyncio.gather(*(_one(item) for item in pending))
-    total = len(load_completed_ids(predictions_path) & set(question_ids))
-    return {
-        "status": "ok",
-        "model_label": label,
-        "n_written": written,
-        "n_predictions": total,
-        "predictions_path": str(predictions_path),
-        "backend": spec["backend"],
-        "mode": "freeform",
-    }
+    if spec["backend"] == "openai":
+        return _run_openai_batch_label(
+            label=label,
+            pending=pending,
+            predictions_path=predictions_path,
+            work_dir=work_dir,
+            args=args,
+            question_ids=question_ids,
+        )
+    if spec["backend"] == "gemini":
+        return _run_gemini_batch_label(
+            label=label,
+            pending=pending,
+            predictions_path=predictions_path,
+            work_dir=work_dir,
+            args=args,
+            question_ids=question_ids,
+        )
+    raise SystemExit(f"Unknown backend for {label}")
 
 
-async def async_main(args: argparse.Namespace) -> dict:
+def main_sync(args: argparse.Namespace) -> dict:
     prompt_mode = _normalize_mode(args.mode)
     labels = parse_api_model_list(args.models)
     run_id = args.run_id or make_run_id()
@@ -401,9 +420,7 @@ async def async_main(args: argparse.Namespace) -> dict:
         },
     )
 
-    sampling = {
-        label: dict(API_SPECS[label]["sampling"]) for label in labels
-    }
+    sampling = {label: dict(API_SPECS[label]["sampling"]) for label in labels}
     if args.temperature is not None:
         for spec in sampling.values():
             spec["temperature"] = float(args.temperature)
@@ -432,7 +449,7 @@ async def async_main(args: argparse.Namespace) -> dict:
             "seed": args.seed,
             "model_sampling": sampling,
             "scoring": "pending_local_api",
-            "inference": "api",
+            "inference": "api-batch",
             "n_questions": len(question_ids),
             "question_ids_csv": str(csv_path),
             "model_specs": {
@@ -451,7 +468,7 @@ async def async_main(args: argparse.Namespace) -> dict:
     results = []
     for label in labels:
         results.append(
-            await _run_label(
+            _run_label(
                 label=label,
                 items=items,
                 run_dir=run_dir,
@@ -481,11 +498,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--audio-dir", type=Path, default=DEFAULT_AUDIO_DIR)
     parser.add_argument("--question-ids-csv", type=Path, default=DEFAULT_IDS_CSV)
-    parser.add_argument("--qps", type=float, default=4.0)
-    parser.add_argument("--max-workers", type=int, default=8)
-    parser.add_argument("--timeout", type=float, default=180.0)
-    parser.add_argument("--retries", type=int, default=20)
-    parser.add_argument("--retry-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between Batch API status polls",
+    )
     parser.add_argument("--print-every", type=int, default=5)
     parser.add_argument("--skip-audio-download", action="store_true")
     return parser.parse_args()
@@ -494,7 +512,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
-    asyncio.run(async_main(args))
+    main_sync(args)
 
 
 if __name__ == "__main__":

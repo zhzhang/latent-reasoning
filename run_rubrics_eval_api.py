@@ -46,8 +46,8 @@ from evaluation_rubrics import (
     DEFAULT_TIMEOUT,
     MODEL_NAME,
     AnthropicScorer,
-    OpenAIScorer,
     evaluate_one_record,
+    evaluate_records_openai_batch,
 )
 from mmar_rubrics import (
     DEFAULT_LIMIT,
@@ -94,15 +94,8 @@ async def _run_provider(
 ) -> dict:
     if provider == "openai":
         judge_model_id = openai_model
-        scorer = OpenAIScorer(
-            api_max_retries=retries,
-            api_retry_interval=retry_interval,
-            max_workers=max_workers,
-            qps=qps,
-            timeout=timeout,
-            model_name=openai_model,
-        )
-        backend = "openai"
+        scorer = None
+        backend = "openai-batch"
     elif provider == "anthropic":
         judge_model_id = anthropic_model
         scorer = AnthropicScorer(
@@ -155,38 +148,64 @@ async def _run_provider(
         )
         return {"provider": provider, "status": "already_done", "scores": summary}
 
-    semaphore = asyncio.Semaphore(max_workers)
-    write_lock = asyncio.Lock()
     n_ok = 0
     n_fail = 0
 
-    async def _one(item: dict) -> None:
-        nonlocal n_ok, n_fail
-        result = await evaluate_one_record(
-            scorer,
-            semaphore,
-            item["id"],
-            item["question"],
-            item["answer"],
-            item["thinking"],
-            item["cue"],
-            item["choices"],
-            item["rubric"],
-            item["thinking_prediction"],
-            item["answer_prediction"],
+    if provider == "openai":
+        batch_results = evaluate_records_openai_batch(
+            pending,
+            model_name=openai_model,
             num_raters=1,
+            work_dir=str(model_dir / "openai-batch"),
         )
-        if result.exception is not None:
-            n_fail += 1
-            print(f"[{provider}] failed {item['id']}: {result.exception}")
-            return
-        async with write_lock:
-            append_evaluated(evaluated_path, [evaluated_record_from_result(item, result)])
+        for item in pending:
+            result = batch_results.get(item["id"])
+            if result is None or result.exception is not None:
+                n_fail += 1
+                print(
+                    f"[{provider}] failed {item['id']}: "
+                    f"{None if result is None else result.exception}"
+                )
+                continue
+            append_evaluated(
+                evaluated_path, [evaluated_record_from_result(item, result)]
+            )
             n_ok += 1
             if n_ok % 10 == 0 or n_ok == len(pending):
                 print(f"[{provider}] scored {n_ok}/{len(pending)}")
+    else:
+        semaphore = asyncio.Semaphore(max_workers)
+        write_lock = asyncio.Lock()
 
-    await asyncio.gather(*[_one(item) for item in pending])
+        async def _one(item: dict) -> None:
+            nonlocal n_ok, n_fail
+            result = await evaluate_one_record(
+                scorer,
+                semaphore,
+                item["id"],
+                item["question"],
+                item["answer"],
+                item["thinking"],
+                item["cue"],
+                item["choices"],
+                item["rubric"],
+                item["thinking_prediction"],
+                item["answer_prediction"],
+                num_raters=1,
+            )
+            if result.exception is not None:
+                n_fail += 1
+                print(f"[{provider}] failed {item['id']}: {result.exception}")
+                return
+            async with write_lock:
+                append_evaluated(
+                    evaluated_path, [evaluated_record_from_result(item, result)]
+                )
+                n_ok += 1
+                if n_ok % 10 == 0 or n_ok == len(pending):
+                    print(f"[{provider}] scored {n_ok}/{len(pending)}")
+
+        await asyncio.gather(*[_one(item) for item in pending])
 
     summary = write_judge_scores(
         model_dir,

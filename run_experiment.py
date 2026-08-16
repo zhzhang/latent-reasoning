@@ -1311,7 +1311,7 @@ def _run_freeform_grade_body(
 
 
 _GRADE_FN_KW = dict(
-    timeout=6 * 60 * 60,
+    timeout=12 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
     secrets=[hf_secret],
 )

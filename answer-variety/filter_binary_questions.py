@@ -39,7 +39,6 @@ from answer_variety import (  # noqa: E402
     DEFAULT_SOURCE_RUN_ID,
     GEMINI_BINARY_IDS_PATH,
     OPEN_ENDED_IDS_PATH,
-    GeminiUniformityScorer,
     build_uniformity_items,
     extract_reason,
     is_yes_no_question,
@@ -171,7 +170,16 @@ async def classify_with_gemini(
     retry_interval: float,
     max_output_tokens: int,
     thinking_level: str,
+    poll_interval_s: float = 30.0,
 ) -> dict[str, Any]:
+    del max_workers, qps, timeout, retries, retry_interval
+    from api_batch import (
+        gemini_generate_request,
+        gemini_text_part,
+        gemini_user_contents,
+        run_gemini_generate_batch,
+    )
+
     judgments_path.parent.mkdir(parents=True, exist_ok=True)
     removed = prune_incomplete_evaluations(judgments_path)
     if removed:
@@ -179,53 +187,54 @@ async def classify_with_gemini(
     completed = load_completed_ids(judgments_path)
     pending = [item for item in items if item["id"] not in completed]
     print(
-        f"[gemini] judge={model_id} pending={len(pending)} "
+        f"[gemini-batch] judge={model_id} pending={len(pending)} "
         f"completed={len(completed)} -> {judgments_path}"
     )
     if not pending:
         return {"status": "already_done", "n_ok": 0, "n_fail": 0, "n_pending": 0}
 
-    scorer = GeminiUniformityScorer(
-        model_name=model_id,
-        api_max_retries=retries,
-        api_retry_interval=retry_interval,
-        qps=qps,
-        timeout=timeout,
-        max_output_tokens=max_output_tokens,
-        thinking_level=thinking_level,
-        system_instruction=BINARY_SYSTEM_PROMPT,
+    requests = [
+        gemini_generate_request(
+            key=str(item["id"]),
+            contents=gemini_user_contents(
+                gemini_text_part(create_binary_user_prompt(item.get("question") or ""))
+            ),
+            system_instruction=BINARY_SYSTEM_PROMPT,
+            max_output_tokens=max_output_tokens,
+            thinking_level=thinking_level,
+        )
+        for item in pending
+    ]
+    texts = run_gemini_generate_batch(
+        requests,
+        model=model_id,
+        work_dir=judgments_path.parent / "gemini-batch",
+        display_name="binary-filter",
+        poll_interval_s=poll_interval_s,
     )
-    semaphore = asyncio.Semaphore(max_workers)
-    write_lock = asyncio.Lock()
+
     n_ok = 0
     n_fail = 0
     n_unparsed = 0
-
-    async def _one(item: dict) -> None:
-        nonlocal n_ok, n_fail, n_unparsed
-        user_prompt = create_binary_user_prompt(item.get("question") or "")
-        try:
-            async with semaphore:
-                raw = await scorer.call(item["id"], user_prompt)
-        except Exception as exc:  # noqa: BLE001
+    for item in pending:
+        raw = texts.get(str(item["id"]))
+        if not raw:
             n_fail += 1
-            print(f"[gemini] failed {item['id']}: {exc}")
-            return
+            print(f"[gemini] failed {item['id']}: missing batch result")
+            continue
         verdict = parse_uniformity_verdict(raw)
         if verdict is None:
             n_unparsed += 1
             print(f"[gemini] unparsed verdict for {item['id']}: {raw[:180]!r}")
-        async with write_lock:
-            write_jsonl(
-                judgments_path,
-                [judgment_record(item, raw_response=raw, verdict=verdict)],
-                mode="a",
-            )
-            n_ok += 1
-            if n_ok % 10 == 0 or n_ok == len(pending):
-                print(f"[gemini] scored {n_ok}/{len(pending)}")
+        write_jsonl(
+            judgments_path,
+            [judgment_record(item, raw_response=raw, verdict=verdict)],
+            mode="a",
+        )
+        n_ok += 1
+        if n_ok % 10 == 0 or n_ok == len(pending):
+            print(f"[gemini] scored {n_ok}/{len(pending)}")
 
-    await asyncio.gather(*[_one(item) for item in pending])
     return {
         "status": "ok",
         "n_ok": n_ok,

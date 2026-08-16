@@ -29,6 +29,7 @@ def mmar_eval_image(*extra_python_sources: str) -> modal.Image:
     """Debian image with AF audio deps + local modules for MMAR eval scripts."""
     sources = (
         "evaluation_rubrics",
+        "api_batch",
         "modal_cache",
         "mmar_common",
         "audio_flamingo_runtime",

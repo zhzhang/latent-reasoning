@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import random
@@ -12,7 +11,6 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -736,10 +734,10 @@ def run_rubrics_scoring(
 
 
 class StreamingRubricGrader:
-    """Grade predictions on a background asyncio loop while generation continues.
+    """Buffer predictions during generation, then grade via OpenAI Batch API.
 
-    Spreads OpenAI calls across the generation window (fewer burst rate-limit
-    hits) and overlaps GPU work with API latency.
+    Records are queued with ``submit``; ``drain`` submits one Batch job for
+    all pending items (~50% cheaper than interactive calls).
     """
 
     def __init__(
@@ -748,13 +746,15 @@ class StreamingRubricGrader:
         *,
         qps: float | None = None,
         max_workers: int | None = None,
+        poll_interval_s: float = 30.0,
     ):
-        # Import only when scoring: evaluation_rubrics requires OPENAI_API_KEY.
+        del qps, max_workers  # Batch API does not use interactive rate limits.
         import evaluation_rubrics as rubrics
 
         self._rubrics = rubrics
         self.evaluated_path = Path(evaluated_path)
         self.evaluated_path.parent.mkdir(parents=True, exist_ok=True)
+        self.poll_interval_s = float(poll_interval_s)
 
         self._completed_ids: set[str] = set()
         if self.evaluated_path.exists() and self.evaluated_path.stat().st_size > 0:
@@ -762,48 +762,21 @@ class StreamingRubricGrader:
                 if item.get("id") and "score" in item:
                     self._completed_ids.add(item["id"])
 
-        self._inflight: set[str] = set()
-        self._futures: list[Future] = []
+        self._pending: dict[str, dict] = {}
         self._submit_lock = threading.Lock()
-        self._write_lock = threading.Lock()
         self._errors: list[dict] = []
         self._graded = 0
-
-        self._scorer = rubrics.Scorer(
-            api_max_retries=rubrics.DEFAULT_API_MAX_RETRIES,
-            api_retry_interval=rubrics.DEFAULT_API_RETRY_INTERVAL,
-            max_workers=max_workers
-            if max_workers is not None
-            else rubrics.DEFAULT_MAX_WORKERS,
-            qps=qps if qps is not None else rubrics.DEFAULT_QPS,
-            timeout=rubrics.DEFAULT_TIMEOUT,
-        )
-        self._semaphore: asyncio.Semaphore | None = None
-        self._loop = asyncio.new_event_loop()
-        self._ready = threading.Event()
-        self._thread = threading.Thread(
-            target=self._thread_main,
-            name="streaming-rubric-grader",
-            daemon=True,
-        )
-
-    def _thread_main(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._semaphore = asyncio.Semaphore(self._scorer.max_workers)
-        self._ready.set()
-        self._loop.run_forever()
+        self._started = False
 
     def start(self) -> None:
         print(
-            f"Starting pipelined MMAR-Rubrics grader "
-            f"(qps={self._scorer.qps}, max_workers={self._scorer.max_workers}) ..."
+            "Starting pipelined MMAR-Rubrics grader "
+            f"(OpenAI Batch API, poll_interval={self.poll_interval_s}s) ..."
         )
-        self._thread.start()
-        if not self._ready.wait(timeout=30):
-            raise RuntimeError("Streaming rubric grader failed to start")
+        self._started = True
 
     def submit(self, records: list[dict]) -> int:
-        """Enqueue records for grading. Returns how many were newly submitted."""
+        """Queue records for batch grading. Returns how many were newly queued."""
         required = self._rubrics.InputItem.__required_keys__
         submitted = 0
         for record in records:
@@ -811,7 +784,7 @@ class StreamingRubricGrader:
             if not record_id:
                 continue
             with self._submit_lock:
-                if record_id in self._completed_ids or record_id in self._inflight:
+                if record_id in self._completed_ids or record_id in self._pending:
                     continue
                 if not required <= set(record.keys()):
                     missing = sorted(required - set(record.keys()))
@@ -820,41 +793,38 @@ class StreamingRubricGrader:
                         f"missing required keys {missing}"
                     )
                     continue
-                self._inflight.add(record_id)
-
-            future = asyncio.run_coroutine_threadsafe(
-                self._evaluate_and_write(record),
-                self._loop,
-            )
-            with self._submit_lock:
-                self._futures.append(future)
+                self._pending[record_id] = record
             submitted += 1
         return submitted
 
-    async def _evaluate_and_write(self, record: dict) -> None:
-        record_id = record["id"]
-        assert self._semaphore is not None
-        try:
-            result = await self._rubrics.evaluate_one_record(
-                self._scorer,
-                self._semaphore,
-                record_id,
-                record["question"],
-                record["answer"],
-                record["thinking"],
-                record["cue"],
-                record["choices"],
-                record["rubric"],
-                record["thinking_prediction"],
-                record["answer_prediction"],
-            )
-            if result.exception is not None:
-                with self._submit_lock:
-                    self._inflight.discard(record_id)
-                    self._errors.append({"id": record_id, "error": result.exception})
-                print(f"Rubric grade failed for {record_id}: {result.exception}")
-                return
+    def drain(self) -> dict:
+        """Submit the OpenAI Batch for all queued records and write results."""
+        with self._submit_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        if not pending:
+            return {
+                "graded": self._graded,
+                "errors": len(self._errors),
+                "completed_ids": len(self._completed_ids),
+            }
 
+        work_dir = self.evaluated_path.parent / "openai-batch"
+        results = self._rubrics.evaluate_records_openai_batch(
+            pending,
+            model_name=self._rubrics.MODEL_NAME,
+            num_raters=self._rubrics.NUM_RATERS,
+            work_dir=str(work_dir),
+            poll_interval_s=self.poll_interval_s,
+        )
+        for record in pending:
+            record_id = record["id"]
+            result = results.get(record_id)
+            if result is None or result.exception is not None:
+                err = None if result is None else result.exception
+                self._errors.append({"id": record_id, "error": err or "missing"})
+                print(f"Rubric grade failed for {record_id}: {err}")
+                continue
             evaluated = {
                 **record,
                 "new": True,
@@ -863,41 +833,18 @@ class StreamingRubricGrader:
                 "raw_responses": result.raw_responses,
                 "rubric_results": result.rubric_results,
             }
-            with self._write_lock:
-                write_jsonl(self.evaluated_path, [evaluated], mode="a")
-            with self._submit_lock:
-                self._inflight.discard(record_id)
-                self._completed_ids.add(record_id)
-                self._graded += 1
-        except Exception as exc:
-            with self._submit_lock:
-                self._inflight.discard(record_id)
-                self._errors.append({"id": record_id, "error": str(exc)})
-            print(f"Rubric grade failed for {record_id}: {exc}")
+            write_jsonl(self.evaluated_path, [evaluated], mode="a")
+            self._completed_ids.add(record_id)
+            self._graded += 1
 
-    def drain(self) -> dict:
-        """Wait for all submitted grades to finish. Returns summary stats."""
-        with self._submit_lock:
-            futures = list(self._futures)
-            self._futures.clear()
-
-        for future in futures:
-            try:
-                future.result()
-            except Exception as exc:
-                print(f"Rubric grade future error: {exc}")
-
-        with self._submit_lock:
-            return {
-                "graded": self._graded,
-                "errors": len(self._errors),
-                "completed_ids": len(self._completed_ids),
-            }
+        return {
+            "graded": self._graded,
+            "errors": len(self._errors),
+            "completed_ids": len(self._completed_ids),
+        }
 
     def close(self) -> None:
-        if self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=60)
+        self.drain()
 
 
 def _finalize_group_stats(bucket: dict, *, include_score: bool) -> dict:

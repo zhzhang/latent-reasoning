@@ -87,6 +87,7 @@ def _mount_sources(image: modal.Image) -> modal.Image:
         "mmar_common",
         "mmar_rubrics",
         "evaluation_rubrics",
+        "api_batch",
         "audio_flamingo_runtime",
         "grader",
     )
