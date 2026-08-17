@@ -5,7 +5,7 @@ import re
 import logging
 import time
 import asyncio
-from typing import List, Dict, Any, Tuple, Optional, Callable, TypedDict, AsyncGenerator
+from typing import List, Dict, Any, Tuple, Optional, Callable, TypedDict, AsyncGenerator, Mapping
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -178,8 +178,6 @@ class BaseScorer:
 
 
 class OpenAIScorer(BaseScorer):
-    """OpenAI judge. Interactive ``_complete`` is unused; batch via ``evaluate_records_openai_batch``."""
-
     def __init__(
         self,
         api_max_retries: int,
@@ -207,10 +205,18 @@ class OpenAIScorer(BaseScorer):
         self, system_prompt: str, user_prompt: str, **kwargs
     ) -> Optional[str]:
         del kwargs
-        raise RuntimeError(
-            "OpenAI interactive scoring is disabled; use evaluate_records_openai_batch "
-            "(Batch API, ~50% cheaper)."
+        response = await self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            seed=SEED,
+            timeout=self.timeout,
         )
+        return response.choices[0].message.content
+
 
 class AnthropicScorer(BaseScorer):
     def __init__(
@@ -618,145 +624,15 @@ async def evaluate_one_record(
         )
 
 
-def _rater_custom_id(record_id: str, rater_id: int) -> str:
-    return f"{record_id}__rater{rater_id}"
-
-
-def evaluate_records_openai_batch(
-    pending: List[InputItem],
-    *,
-    model_name: str = MODEL_NAME,
-    num_raters: int = NUM_RATERS,
-    work_dir: Optional[str] = None,
-    poll_interval_s: float = 30.0,
-) -> Dict[str, EvaluationResult]:
-    """Score pending rubric items via the OpenAI Batch API (50% cheaper)."""
-    from pathlib import Path
-
-    from api_batch import openai_batch_chat_text, openai_chat_request, run_openai_chat_batch
-
-    if not pending:
-        return {}
-
-    requests = []
-    owners: Dict[str, Tuple[str, int]] = {}
-    for item in pending:
-        user_prompt = create_evaluation_user_prompt(
-            item["question"],
-            item["answer"],
-            item["thinking"],
-            item["cue"],
-            item["thinking_prediction"],
-            item["answer_prediction"],
-            item["rubric"],
-        )
-        for rater_id in range(num_raters):
-            custom_id = _rater_custom_id(item["id"], rater_id)
-            owners[custom_id] = (item["id"], rater_id)
-            requests.append(
-                openai_chat_request(
-                    custom_id=custom_id,
-                    model=model_name,
-                    temperature=0.0,
-                    seed=SEED,
-                    messages=[
-                        {"role": "system", "content": EVALUATE_SYS_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                )
-            )
-
-    batch_dir = Path(work_dir) if work_dir else Path("outputs") / "openai-rubrics-batch"
-    print(
-        f"[openai-batch] rubric scoring {len(pending)} items "
-        f"× {num_raters} raters = {len(requests)} requests -> {batch_dir}"
-    )
-    raw_by_id = run_openai_chat_batch(
-        requests,
-        work_dir=batch_dir,
-        display_name="rubrics",
-        poll_interval_s=poll_interval_s,
-    )
-
-    by_record: Dict[str, Dict[int, str]] = {}
-    for custom_id, (record_id, rater_id) in owners.items():
-        text = openai_batch_chat_text(raw_by_id.get(custom_id) or {})
-        if text:
-            by_record.setdefault(record_id, {})[rater_id] = text
-
-    results: Dict[str, EvaluationResult] = {}
-    for item in pending:
-        record_id = item["id"]
-        answer_correct = string_match(
-            item["answer"], item["answer_prediction"], item["choices"]
-        )
-        rater_map = by_record.get(record_id) or {}
-        scores = []
-        raw_responses = []
-        rater_criterion_details = []
-        failed = False
-        for rater_id in range(num_raters):
-            raw = rater_map.get(rater_id)
-            if not raw:
-                failed = True
-                results[record_id] = EvaluationResult(
-                    record_id,
-                    exception=f"missing batch result for rater {rater_id}",
-                    raw_responses=raw_responses,
-                )
-                break
-            log_id = f"(record_id={record_id} rater_id={rater_id})"
-            try:
-                score, criteria = parse_evaluator_response(log_id, raw, item["rubric"])
-            except Exception as exc:  # noqa: BLE001
-                failed = True
-                results[record_id] = EvaluationResult(
-                    record_id,
-                    exception=str(exc),
-                    raw_responses=raw_responses + [raw],
-                )
-                break
-            scores.append(score)
-            raw_responses.append(raw)
-            rater_criterion_details.append(criteria)
-        if failed:
-            continue
-        if num_raters == 1:
-            results[record_id] = EvaluationResult(
-                record_id,
-                score=scores[0],
-                correct=answer_correct,
-                raw_responses=raw_responses,
-                rubric_results=build_single_rater_rubric_results(
-                    item["rubric"], rater_criterion_details[0]
-                ),
-            )
-        else:
-            sorted_scores = sorted(scores)
-            trimmed = (
-                sorted_scores[1:-1] if len(sorted_scores) >= 3 else sorted_scores
-            )
-            results[record_id] = EvaluationResult(
-                record_id,
-                score=sum(trimmed) / len(trimmed),
-                correct=answer_correct,
-                raw_responses=raw_responses,
-                rubric_results=aggregate_rubric_results(
-                    item["rubric"], rater_criterion_details
-                ),
-            )
-    return results
-
-
 async def run_evaluation(
     input_data: List[InputItem],
     existing_output_data: List[EvaluatedItem],
     scorer: BaseScorer,
     *,
     num_raters: int = NUM_RATERS,
-    batch_work_dir: Optional[str] = None,
-    poll_interval_s: float = 30.0,
 ) -> AsyncGenerator[EvaluatedItem, None]:
+    semaphore = asyncio.Semaphore(scorer.max_workers)
+
     existing_ids = set()
     for existing_output_item in existing_output_data:
         keys = set(existing_output_item.keys())
@@ -774,8 +650,8 @@ async def run_evaluation(
         existing_output_item["new"] = False
         yield existing_output_item
 
-    pending: List[InputItem] = []
-    record_id_to_item: Dict[str, InputItem] = {}
+    tasks: List[asyncio.Task[EvaluationResult]] = []
+    record_id_to_item: Mapping[str, InputItem] = {}
     for input_item in input_data:
         keys = set(input_item.keys())
         if not InputItem.__required_keys__ <= keys:
@@ -784,38 +660,7 @@ async def run_evaluation(
 
         if input_item["id"] in existing_ids:
             continue
-        pending.append(input_item)
-        record_id_to_item[input_item["id"]] = input_item
 
-    if not pending:
-        return
-
-    # OpenAI always uses Batch API; Anthropic stays interactive.
-    if isinstance(scorer, OpenAIScorer):
-        batch_results = evaluate_records_openai_batch(
-            pending,
-            model_name=scorer.model_name,
-            num_raters=num_raters,
-            work_dir=batch_work_dir,
-            poll_interval_s=poll_interval_s,
-        )
-        for item in pending:
-            evaluation_result = batch_results.get(item["id"])
-            if evaluation_result is None or evaluation_result.exception is not None:
-                continue
-            yield {
-                **record_id_to_item[evaluation_result.record_id],
-                "new": True,
-                "score": evaluation_result.score,
-                "correct": evaluation_result.correct,
-                "raw_responses": evaluation_result.raw_responses,
-                "rubric_results": evaluation_result.rubric_results,
-            }
-        return
-
-    semaphore = asyncio.Semaphore(scorer.max_workers)
-    tasks: List[asyncio.Task[EvaluationResult]] = []
-    for input_item in pending:
         tasks.append(asyncio.create_task(evaluate_one_record(
             scorer, semaphore, input_item["id"],
             input_item["question"], input_item["answer"], input_item["thinking"],
@@ -823,6 +668,7 @@ async def run_evaluation(
             input_item["thinking_prediction"], input_item["answer_prediction"],
             num_raters=num_raters,
         )))
+        record_id_to_item[input_item["id"]] = input_item
 
     pbar = tqdm(total=len(tasks), ncols=80)
     for coro in asyncio.as_completed(tasks):
@@ -867,8 +713,7 @@ async def main():
             "Please refer to https://audio-reasoning-challenge.github.io/"
         ),
         epilog=(
-            f"Please set `OPENAI_API_KEY` in the environment variables first; "
-            f"OpenAI scoring uses the Batch API (~50% cheaper, up to 24h).\n"
+            f"Please set `OPENAI_API_KEY` in the environment variables first; approximately 5,000 {MODEL_NAME} calls are expected.\n"
             "Input: JSON/JSONL records containing question/answer/rubric and model predictions.\n"
             "Output: JSONL with appended fields: new, score, correct, raw_responses, rubric_results.\n"
             "Examples:\n"
@@ -883,19 +728,13 @@ async def main():
     io.add_argument("--meta", default=None, help="Optional meta JSON/JSONL to fill missing fields by id.")
 
     api = p.add_argument_group("API / Scoring")
-    api.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout in seconds (Anthropic only).")
-    api.add_argument("--retries", type=int, default=DEFAULT_API_MAX_RETRIES, help="Max retries for transient API errors (Anthropic only).")
+    api.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout in seconds.")
+    api.add_argument("--retries", type=int, default=DEFAULT_API_MAX_RETRIES, help="Max retries for transient API errors.")
     api.add_argument("--retry-interval", type=float, default=DEFAULT_API_RETRY_INTERVAL, help="Sleep between retries (seconds).")
-    api.add_argument("--qps", type=float, default=DEFAULT_QPS, help="Target queries per second (Anthropic only).")
-    api.add_argument("--max-workers", "-j", type=int, default=DEFAULT_MAX_WORKERS, help="Max concurrent evaluation tasks (Anthropic only).")
+    api.add_argument("--qps", type=float, default=DEFAULT_QPS, help="Target queries per second (rate limiter).")
+    api.add_argument("--max-workers", "-j", type=int, default=DEFAULT_MAX_WORKERS, help="Max concurrent evaluation tasks.")
     api.add_argument("--num-raters", type=int, default=NUM_RATERS, help="LLM raters per sample (official default 5).")
     api.add_argument("--model", default=MODEL_NAME, help="OpenAI judge model name.")
-    api.add_argument(
-        "--poll-interval",
-        type=float,
-        default=30.0,
-        help="Seconds between OpenAI Batch status polls.",
-    )
 
     args = p.parse_args()
 
@@ -957,7 +796,6 @@ async def main():
     modality_metrics = defaultdict(lambda: Metrics())
     category_metrics = defaultdict(lambda: Metrics())
     subcat_metrics = defaultdict(lambda: Metrics())
-    batch_work_dir = os.path.join(out_dir or ".", "openai-batch") if out_dir else "openai-batch"
 
     try:
         with open(output_file, "a", encoding="utf-8") as fout:
@@ -966,8 +804,6 @@ async def main():
                 existing_output_data,
                 scorer,
                 num_raters=args.num_raters,
-                batch_work_dir=batch_work_dir,
-                poll_interval_s=args.poll_interval,
             ):
                 modality = evaluated_item['modality']
                 category = evaluated_item['category']

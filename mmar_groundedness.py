@@ -516,18 +516,8 @@ async def grade_items_with_gemini(
     retry_interval: float = 1.0,
     max_output_tokens: int = 4096,
     thinking_level: str = "medium",
-    poll_interval_s: float = 30.0,
 ) -> dict[str, Any]:
-    """Score pending groundedness items with Gemini Batch API (wav + trace)."""
-    del max_workers, qps, timeout, retries, retry_interval  # Batch replaces interactive.
-    from api_batch import (
-        gemini_generate_request,
-        gemini_inline_audio_part,
-        gemini_text_part,
-        gemini_user_contents,
-        run_gemini_generate_batch,
-    )
-
+    """Score pending groundedness items with Gemini 3.1 Pro (wav + trace)."""
     model_id = resolve_gemini_model_id(model_id)
     evaluated_path.parent.mkdir(parents=True, exist_ok=True)
     removed = prune_incomplete_evaluations(evaluated_path)
@@ -536,80 +526,72 @@ async def grade_items_with_gemini(
     completed = load_completed_ids(evaluated_path)
     pending = [item for item in items if item["id"] not in completed]
     print(
-        f"[gemini-batch] judge={model_id} pending={len(pending)} "
+        f"[gemini] judge={model_id} pending={len(pending)} "
         f"completed={len(completed)} -> {evaluated_path}"
     )
     if not pending:
         return {"status": "already_done", "n_ok": 0, "n_fail": 0, "n_pending": 0}
 
-    length_limit = 10000
-    requests: list[dict[str, Any]] = []
-    eligible: list[dict[str, Any]] = []
+    scorer = GeminiAudioScorer(
+        model_name=model_id,
+        api_max_retries=retries,
+        api_retry_interval=retry_interval,
+        qps=qps,
+        timeout=timeout,
+        max_output_tokens=max_output_tokens,
+        thinking_level=thinking_level,
+    )
+    semaphore = asyncio.Semaphore(max_workers)
+    write_lock = asyncio.Lock()
+    n_ok = 0
     n_fail = 0
-    for item in pending:
+    n_unparsed = 0
+    length_limit = 10000
+
+    async def _one(item: dict) -> None:
+        nonlocal n_ok, n_fail, n_unparsed
         output = student_output_from_item(item)
         if len(output) >= length_limit:
             n_fail += 1
             print(f"[gemini] skipping overlong trace {item['id']}")
-            continue
+            return
         audio_path = Path(item["audio_path"])
         if not audio_path.is_file():
             n_fail += 1
             print(f"[gemini] missing audio {item['id']}: {audio_path}")
-            continue
+            return
         audio_bytes = audio_path.read_bytes()
         if len(audio_bytes) > GEMINI_INLINE_AUDIO_MAX_BYTES:
             n_fail += 1
             print(
-                f"[gemini] audio too large for batch request {item['id']}: "
+                f"[gemini] audio too large for inline request {item['id']}: "
                 f"{len(audio_bytes)} bytes"
             )
-            continue
+            return
         user_prompt = create_groundedness_user_prompt(
             output, include_instructions=False
         )
-        requests.append(
-            gemini_generate_request(
-                key=str(item["id"]),
-                contents=gemini_user_contents(
-                    gemini_inline_audio_part(audio_bytes, mime_type=GEMINI_AUDIO_MIME),
-                    gemini_text_part(user_prompt),
-                ),
-                system_instruction=GROUNDEDNESS_JUDGE_PROMPT,
-                max_output_tokens=max_output_tokens,
-                thinking_level=thinking_level,
-            )
-        )
-        eligible.append(item)
-
-    texts = run_gemini_generate_batch(
-        requests,
-        model=model_id,
-        work_dir=evaluated_path.parent / "gemini-batch",
-        display_name="groundedness",
-        poll_interval_s=poll_interval_s,
-    )
-
-    n_ok = 0
-    n_unparsed = 0
-    for item in eligible:
-        raw = texts.get(str(item["id"]))
-        if not raw:
+        try:
+            async with semaphore:
+                raw = await scorer.call(item["id"], user_prompt, audio_bytes)
+        except Exception as exc:  # noqa: BLE001
             n_fail += 1
-            print(f"[gemini] failed {item['id']}: missing batch result")
-            continue
+            print(f"[gemini] failed {item['id']}: {exc}")
+            return
         verdict = parse_groundedness_verdict(raw)
         if verdict is None:
             n_unparsed += 1
             print(f"[gemini] unparsed verdict for {item['id']}: {raw[:180]!r}")
-        append_evaluated(
-            evaluated_path,
-            [evaluated_record_from_verdict(item, raw_response=raw, verdict=verdict)],
-        )
-        n_ok += 1
-        if n_ok % 10 == 0 or n_ok == len(eligible):
-            print(f"[gemini] scored {n_ok}/{len(eligible)}")
+        async with write_lock:
+            append_evaluated(
+                evaluated_path,
+                [evaluated_record_from_verdict(item, raw_response=raw, verdict=verdict)],
+            )
+            n_ok += 1
+            if n_ok % 10 == 0 or n_ok == len(pending):
+                print(f"[gemini] scored {n_ok}/{len(pending)}")
 
+    await asyncio.gather(*[_one(item) for item in pending])
     return {
         "status": "ok",
         "n_ok": n_ok,

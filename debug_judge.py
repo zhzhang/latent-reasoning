@@ -110,6 +110,8 @@ def _load_cases(
     model_label: str,
     max_cases: int,
 ) -> list[dict]:
+    from grader import select_grade_question_ids
+
     pred_path = run_dir / "models" / model_label / "predictions.jsonl"
     if not pred_path.is_file():
         raise SystemExit(f"predictions.jsonl not found: {pred_path}")
@@ -143,11 +145,23 @@ def _load_cases(
                     "stored_correct": judge_entry.get("correct"),
                 }
             )
-            if len(cases) >= max_cases:
-                break
     if not cases:
         raise SystemExit(f"No usable shots under {pred_path}")
-    return cases
+    selected = select_grade_question_ids(
+        [str(case.get("id") or "") for case in cases],
+        max_cases,
+    )
+    if selected is None:
+        return cases
+    by_id: dict[str, dict] = {}
+    for case in cases:
+        qid = str(case.get("id") or "")
+        if qid and qid not in by_id:
+            by_id[qid] = case
+    sampled = [by_id[qid] for qid in selected if qid in by_id]
+    if not sampled:
+        raise SystemExit(f"No sampled shots under {pred_path}")
+    return sampled
 
 
 @app.function(
@@ -164,6 +178,7 @@ def probe_judge(
     model_label: str = DEFAULT_MODEL_LABEL,
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     max_cases: int = 4,
+    include_gold: bool = True,
 ) -> dict:
     from grader import (
         build_grade_prompt,
@@ -175,6 +190,12 @@ def probe_judge(
     volume.reload()
     results_volume.reload()
 
+    if not include_gold:
+        raise SystemExit(
+            "debug_judge.py probes text chat templates and does not send audio. "
+            "NO_GOLD grading needs an audio suite judge via run_judges.py "
+            "--no-include-gold."
+        )
     model_id = resolve_judge_model_id(model_id)
     run_dir = Path(output_dir).expanduser().resolve() / run_id
     cases = _load_cases(run_dir=run_dir, model_label=model_label, max_cases=max_cases)
@@ -223,6 +244,7 @@ def probe_judge(
         question=str(cases[0]["question"]),
         answer=str(cases[0]["answer"]),
         prediction=str(cases[0]["prediction"]),
+        include_gold=include_gold,
     )
     template_probe: dict[str, str] = {}
     for flag in (None, True, False):
@@ -238,6 +260,7 @@ def probe_judge(
             question=str(case["question"]),
             answer=str(case["answer"]),
             prediction=str(case["prediction"]),
+            include_gold=include_gold,
         )
         case_row: dict[str, Any] = {
             "id": case["id"],
@@ -308,6 +331,7 @@ def probe_judge(
         "run_id": run_id,
         "model_label": model_label,
         "n_cases": len(results),
+        "include_gold": include_gold,
         "template_probe_tails": template_probe,
         "cases": results,
     }
@@ -323,12 +347,20 @@ def main(
     run_id: str = DEFAULT_RUN_ID,
     model_label: str = DEFAULT_MODEL_LABEL,
     max_cases: int = 4,
+    include_gold: bool = True,
 ):
+    if not include_gold:
+        raise SystemExit(
+            "debug_judge.py probes text chat templates and does not send audio. "
+            "NO_GOLD grading needs an audio suite judge via run_judges.py "
+            "--no-include-gold."
+        )
     summary = probe_judge.remote(
         model_id=model_id,
         run_id=run_id,
         model_label=model_label,
         max_cases=max_cases,
+        include_gold=include_gold,
     )
     # Compact local echo of generations for the caller.
     print("\n=== local echo: generations ===")

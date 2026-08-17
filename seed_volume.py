@@ -23,7 +23,7 @@ Usage:
 
     uv run modal run seed_volume.py
     uv run modal run seed_volume.py --datasets mmar --models af3
-    uv run modal run seed_volume.py --datasets mmar --models af-next-think
+    uv run modal run seed_volume.py --datasets mmar --models eval
     uv run modal run seed_volume.py --datasets mmar --models none
     uv run modal run seed_volume.py --datasets none --models af3,af2 --force
     uv run modal run seed_volume.py --repo-id nvidia/audio-flamingo-3-hf --datasets none
@@ -124,6 +124,20 @@ ALL_MODELS = (
     "mimo-audio-7b",
     "interactive-omni-8b",
     "voxtral-small-24b",
+)
+
+# Checkpoints used by ``run_experiment.py --models all`` (no judges / unused AF2/AF3).
+EVAL_MODELS = (
+    "af-next-think",
+    "mimo-audio-7b",
+    "interactive-omni-8b",
+    "qwen3-omni",
+    "voxtral-small-24b",
+    "qwen2.5-omni-7b",
+    "phi-4-multimodal",
+    "gemma-4-e4b",
+    "qwen3-omni-instruct",
+    "nemotron-3-nano-omni",
 )
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -523,6 +537,7 @@ def main(
         datasets: ``mmar`` or ``all``. Pass ``none`` to skip datasets.
         models: Comma-separated aliases (af3, af-next-think, af2, qwen3-omni, ...)
             or Hub repo ids.
+            Pass ``eval`` / ``mmar-eval`` for the ``run_experiment.py`` suite.
             Pass ``none`` to skip models. Ignored when ``repo_id`` is set.
         repo_id: Optional single Hub repo id (overrides --models when set).
         force: Re-download / overwrite even if data already exists.
@@ -566,6 +581,8 @@ def main(
                 raise SystemExit("Pass at least one model via --models or --repo-id (or none to skip)")
             if any(item.lower() == "all" for item in raw):
                 targets = expand_seed_targets(list(ALL_MODELS))
+            elif any(item.lower() in {"eval", "mmar-eval"} for item in raw):
+                targets = expand_seed_targets(list(EVAL_MODELS))
             else:
                 targets = expand_seed_targets(raw)
 

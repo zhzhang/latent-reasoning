@@ -62,6 +62,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         # HF generation_config.json: max_new_tokens=2048 + README repetition_penalty
         # 1.2 (card omits do_sample ⇒ greedy). We use T=0.2 like Voxtral so
         # n-shot difficulty runs keep mild sample variance.
+        "native_thinking": True,
         "sampling": {
             "temperature": 0.2,
             "top_p": 1.0,
@@ -142,6 +143,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
+        "native_thinking": True,
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
@@ -313,6 +315,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "async_scheduling": True,
             "allowed_local_media_path": "/",
         },
+        "native_thinking": True,
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
@@ -323,6 +326,14 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
 }
 
 ALL_MODEL_LABELS = tuple(MODEL_SPECS.keys())
+NATIVE_THINKING_LABELS = frozenset(
+    label for label, spec in MODEL_SPECS.items() if spec.get("native_thinking")
+)
+
+
+def has_native_thinking(label: str) -> bool:
+    """True when the checkpoint emits native ``<think>`` / reasoning traces."""
+    return label in NATIVE_THINKING_LABELS
 
 
 def parse_model_list(value: str) -> list[str]:
@@ -387,6 +398,9 @@ def resolve_sampling(
 
     Optional CLI overrides on ``args`` (``temperature``, ``top_p``,
     ``max_new_tokens``) replace the model values when not ``None``.
+    ``greedy_non_thinking`` forces ``temperature=0`` on models without native
+    ``<think>`` / reasoning mode; thinking models keep their card sampling
+    unless ``temperature`` is also set.
     """
     spec = MODEL_SPECS.get(label)
     if not spec or "sampling" not in spec:
@@ -394,6 +408,8 @@ def resolve_sampling(
     out = dict(spec["sampling"])
     if args is None:
         return out
+    if getattr(args, "greedy_non_thinking", False) and not spec.get("native_thinking"):
+        out["temperature"] = 0.0
     if getattr(args, "temperature", None) is not None:
         out["temperature"] = float(args.temperature)
     if getattr(args, "top_p", None) is not None:

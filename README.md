@@ -158,35 +158,31 @@ with a freeform run on the same question ids, sorts by
 Δ = MCQ avg − freeform avg, and shows both modes’ per-model shots when a
 question is selected.
 
-## Re-judge a past freeform run
+## Judge the freeform 5-shot pack
 
-Add (or replace) a judge on an existing freeform run without regenerating
-answers. Errors if the run is MCQ:
+`run_judges.py` grades `outputs/mmar-freeform-5-shot` (from
+`collate_mmar_freeform.py`). Shots that already have a verdict for the same
+judge key (model + prompt + gold/nongold) are skipped. Pass `--force` to
+replace existing verdicts.
 
 ```bash
-# Seed the new judge weights first if needed
+# Seed the judge weights first if needed
 uv run modal run seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
-# Add a judge; keep the existing primary for difficulty ranking
-uv run modal run --detach rejudge_run.py \
-  --run-id 20260807T145000Z \
+# Add a text judge; keep the existing primary for difficulty ranking
+uv run modal run --detach run_judges.py \
   --judge-model-id qwen3.6-35b-a3b-fp8
 
 # Promote the new judge to primary
-uv run modal run --detach rejudge_run.py \
-  --run-id 20260807T145000Z \
+uv run modal run --detach run_judges.py \
   --judge-model-id Qwen/Qwen3.6-35B-A3B-FP8 \
   --make-primary
 
-# Re-run a judge to replace its previous verdicts (default)
-uv run modal run --detach rejudge_run.py \
-  --run-id 20260807T145000Z \
-  --judge-model-id qwen3.6-35b-a3b-fp8
+# Replace existing verdicts for this judge
+uv run modal run --detach run_judges.py \
+  --judge-model-id qwen3.6-35b-a3b-fp8 \
+  --force
 ```
-
-Re-running a judge label always replaces prior `shots[].judges[<label>]`
-entries (full `generation` included). Pass `--no-force` only when adding a
-brand-new judge and you want to skip shots that somehow already have it.
 
 ## Tune a judge engine
 
@@ -281,8 +277,8 @@ Freeform shot records store per-judge verdicts under `shots[].judges`:
 
 `generation` is the full judge reply (up to 4096 tokens); `output` /
 `verdict` are the parsed final `Pass`/`Fail`. Re-running the same judge
-(via `rejudge_run.py` or `--force-grade`) replaces prior entries for that
-label.
+(via `run_judges.py --force` or `--force-grade`) replaces prior entries for
+that label.
 
 Record / manifest fields: `judges` (ordered labels, `[0]` = primary),
 `primary_judge`, `per_judge`, plus legacy `grader` / `scoring:

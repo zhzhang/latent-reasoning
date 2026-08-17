@@ -88,7 +88,6 @@ _SHARED_SOURCES = (
     "mmar_models",
     "audio_flamingo_runtime",
     "evaluation_rubrics",
-    "api_batch",
     "grader",
 )
 

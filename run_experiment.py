@@ -6,7 +6,7 @@ model (per-model SamplingParams), then aggregates mean success rates.
 Modes:
   - ``mc`` (default): multiple-choice prompts + string-match scoring
   - ``freeform``: question-only prompts; Qwen3.6-35B-A3B-FP8 grades each shot
-    against the gold answer
+    (gold in the judge prompt by default; ``--no-include-gold`` omits it)
 
 Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
@@ -39,6 +39,12 @@ Usage:
     # Free-form + Qwen judge on the same 200 ids as a prior MC run:
     uv run modal run --detach run_experiment.py \\
       --mode freeform --source-run-id 20260727T154400Z
+    # Full-MMAR native MCQ sanity check (1 greedy pass; thinking models keep
+    # card sampling). Seed eval weights first if needed.
+    uv run modal run --detach seed_volume.py --datasets mmar --models eval
+    uv run modal run --detach run_experiment.py \\
+      --models all --mode mc --num-samples -1 --n-shots 1 \\
+      --greedy-non-thinking --source-run-id none
     uv run modal run run_experiment.py \\
       --models af-next-think --num-samples 8 --n-shots 2
     # Open-ended freeform (seed the new checkpoints first):
@@ -54,6 +60,13 @@ Usage:
       --run-id <run_id>
     uv run modal run run_experiment.py \\
       --aggregate-only --run-id <run_id>
+    # Re-grade without gold: audio judge hears the clip (text judges cannot)
+    uv run modal run --detach run_experiment.py \\
+      --grade-only --run-id <run_id> --no-include-gold \\
+      --judge-model-ids qwen3-omni-instruct
+    # Grade a fixed random sample (larger N continues the same shuffle):
+    uv run modal run --detach run_experiment.py \\
+      --grade-only --run-id <run_id> --n-questions 32
 """
 
 from __future__ import annotations
@@ -629,6 +642,7 @@ def _run_model_eval(
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
+    greedy_non_thinking: bool = False,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
     model_id: str | None = None,
@@ -659,6 +673,7 @@ def _run_model_eval(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        greedy_non_thinking=greedy_non_thinking,
         seed=seed,
         torch_dtype="bfloat16",
         print_every=print_every,
@@ -989,6 +1004,7 @@ def prepare_run(
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
+    greedy_non_thinking: bool = False,
     mode: str = DEFAULT_MODE,
     source_run_id: str | None = None,
     question_ids_csv: str | None = None,
@@ -1062,6 +1078,7 @@ def prepare_run(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        greedy_non_thinking=greedy_non_thinking,
     )
     model_sampling = {
         label: resolve_sampling(label, override_ns) for label in merged_models
@@ -1098,6 +1115,7 @@ def prepare_run(
             "temperature": temperature,
             "top_p": top_p,
             "max_new_tokens": max_new_tokens,
+            "greedy_non_thinking": greedy_non_thinking,
         },
         "scoring": existing.get("scoring") or _scoring_label(prompt_mode),
         "grader_model_id": (
@@ -1124,6 +1142,7 @@ def prepare_run(
                 "backend": MODEL_SPECS[label].get("backend"),
                 "gpu": MODEL_SPECS[label].get("gpu"),
                 "sampling": MODEL_SPECS[label].get("sampling"),
+                "native_thinking": bool(MODEL_SPECS[label].get("native_thinking")),
             }
             for label in ALL_MODEL_LABELS
         },
@@ -1191,6 +1210,7 @@ def _run_freeform_grade_body(
     include_gold: bool = True,
     first_shot_only: bool = False,
     make_primary: bool = False,
+    n_questions: int | None = None,
 ) -> dict:
     """Grade free-form predictions with one local vLLM judge model."""
     from grader import (
@@ -1241,7 +1261,8 @@ def _run_freeform_grade_body(
             predictions_path = run_dir / "models" / label / "predictions.jsonl"
             print(
                 f"[grader] grading {label} with {key} "
-                f"(primary={use_primary}, batch_size={effective_batch_size}) "
+                f"(primary={use_primary}, batch_size={effective_batch_size}"
+                f"{f', n_questions={n_questions}' if n_questions is not None else ''}) "
                 f"-> {predictions_path}"
             )
             per_model[f"{label}/{key}"] = grade_predictions_file(
@@ -1255,6 +1276,7 @@ def _run_freeform_grade_body(
                 include_gold=include_gold,
                 shot_indices=shot_indices,
                 make_primary=make_primary,
+                n_questions=n_questions,
             )
             results_volume.commit()
             print(f"[grader] {label}:", per_model[f"{label}/{key}"])
@@ -1307,6 +1329,7 @@ def _run_freeform_grade_body(
         "by_model": per_model,
         "prompt": prompts[-1] if prompts else "permissive",
         "include_gold": include_gold,
+        "n_questions": n_questions,
     }
 
 
@@ -1376,6 +1399,7 @@ def run_pipeline(
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
+    greedy_non_thinking: bool = False,
     seed: int = DEFAULT_SEED,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
@@ -1400,6 +1424,7 @@ def run_pipeline(
     include_gold: bool = True,
     first_shot_only: bool = False,
     make_primary: bool = False,
+    n_questions: int | None = None,
 ) -> dict:
     """Remote orchestrator for prepare → models → grade → aggregate.
 
@@ -1422,7 +1447,12 @@ def run_pipeline(
     primary_judge = judge_label(judge_ids[0]) if judge_ids else None
 
     def _grade_all_judges() -> list[dict]:
-        from grader import _suite_label_for, parse_grade_prompt_list, resolve_grade_judge_key
+        from grader import (
+            _suite_label_for,
+            parse_grade_prompt_list,
+            require_audio_nongold_judge,
+            resolve_grade_judge_key,
+        )
 
         # Re-running a judge label replaces prior verdicts for that label.
         existing_labels: set[str] = set()
@@ -1444,6 +1474,7 @@ def run_pipeline(
         results: list[dict] = []
         first_prompt = parse_grade_prompt_list(grade_prompt)[0]
         for model_id in judge_ids:
+            require_audio_nongold_judge(model_id, include_gold=include_gold)
             worker = _grade_worker_for(model_id)
             suite = _suite_label_for(model_id)
             fake_handle = {
@@ -1468,6 +1499,7 @@ def run_pipeline(
                 include_gold=include_gold,
                 first_shot_only=first_shot_only,
                 make_primary=make_primary,
+                n_questions=n_questions,
             )
             print(f"Graded (replace={replace}):", grade)
             results.append(grade)
@@ -1510,6 +1542,7 @@ def run_pipeline(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        greedy_non_thinking=greedy_non_thinking,
         seed=seed,
         print_every=print_every,
         max_num_seqs=max_num_seqs,
@@ -1525,7 +1558,7 @@ def run_pipeline(
         f"parallel_models={parallel_models} inference=vllm "
         f"source_run_id={effective_source} "
         f"sampling_overrides={{temperature={temperature}, top_p={top_p}, "
-        f"max_new_tokens={max_new_tokens}}}"
+        f"max_new_tokens={max_new_tokens}, greedy_non_thinking={greedy_non_thinking}}}"
     )
 
     prep = prepare_run.remote(
@@ -1540,6 +1573,7 @@ def run_pipeline(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        greedy_non_thinking=greedy_non_thinking,
         mode=prompt_mode,
         source_run_id=effective_source,
         question_ids_csv=question_ids_csv,
@@ -1632,6 +1666,7 @@ def main(
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
+    greedy_non_thinking: bool = False,
     seed: int = DEFAULT_SEED,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
@@ -1656,6 +1691,7 @@ def main(
     include_gold: bool = True,
     first_shot_only: bool = False,
     make_primary: bool = False,
+    n_questions: int | None = None,
 ):
     """Launch the MMAR question-difficulty experiment.
 
@@ -1669,6 +1705,9 @@ def main(
         temperature: Optional override of each model's sampling temperature.
         top_p: Optional override of each model's top_p.
         max_new_tokens: Optional override of each model's max_tokens.
+        greedy_non_thinking: Force temperature=0 on models without native
+            ``<think>`` / reasoning mode. Thinking models keep card sampling
+            unless ``temperature`` is also set.
         seed: RNG seed for question sampling and per-question sample seeds.
         max_num_seqs: Optional vLLM override (escape hatch; prefer defaults).
         gpu_memory_utilization: Optional vLLM GPU memory fraction override.
@@ -1699,9 +1738,15 @@ def main(
             spec — 128 for qwen2.5-3b-instruct, 512 for qwen3.6-35b-a3b-fp8).
         skip_grade: Freeform generation without the grading pass.
         grade_prompt: ``permissive``, ``neutral``, or a comma list.
-        include_gold: Include MCQ gold in the grade prompt (default True).
+        include_gold: Include the benchmark gold in the grade prompt (default
+            True). Pass ``--no-include-gold`` so an audio judge hears the clip
+            and decides without gold. Text-only judges cannot run NO_GOLD.
         first_shot_only: Grade ``shot_index == 0`` only.
         make_primary: Promote this judge to primary (default keeps existing).
+        n_questions: Grade only the first N questions in the fixed shuffled
+            order (seed is hardcoded in ``grader.GRADE_SAMPLE_SEED``). Omit
+            or pass a negative value to grade all. Larger N continues down
+            the same list.
     """
     # One remote spawn owns the full prepare→infer→grade→aggregate chain so
     # ``--detach`` does not stop the ephemeral app between phases.
@@ -1713,6 +1758,7 @@ def main(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        greedy_non_thinking=greedy_non_thinking,
         seed=seed,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
@@ -1737,6 +1783,7 @@ def main(
         include_gold=include_gold,
         first_shot_only=first_shot_only,
         make_primary=make_primary,
+        n_questions=n_questions,
     ).get()
 
     print("Done:", out)

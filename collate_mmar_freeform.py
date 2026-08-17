@@ -2,7 +2,8 @@
 
 Merges the full-MMAR vLLM run, the open-ended vLLM run, and any local API
 runs. Keeps only the IDs in ``answer-variety/open_ended_question_ids.csv``
-that have ``n_shots`` independent samples.
+that have ``n_shots`` independent samples. Judge payloads and scores are
+stripped so the pack can be re-graded from scratch.
 
 Writes::
 
@@ -16,7 +17,6 @@ Zip that folder when you are ready to upload.
 Usage::
 
     uv run python collate_mmar_freeform.py
-    uv run python collate_mmar_freeform.py --keep-judges
     uv run python collate_mmar_freeform.py \\
       --out /tmp/mmar-freeform-5-shot
 """
@@ -55,8 +55,19 @@ DROP_RECORD_KEYS = (
     "grader_output",
     "per_judge",
     "primary_judge",
+    "pending_grade",
+    "scoring",
+    "correct",
+    "n_shot_correct",
+    "shot_success_rate",
 )
-DROP_SHOT_KEYS = ("judges", "grader", "grader_output")
+DROP_SHOT_KEYS = (
+    "judges",
+    "grader",
+    "grader_output",
+    "pending_grade",
+    "correct",
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -77,10 +88,11 @@ def _shot_index(shot: dict[str, Any]) -> int:
         return 0
 
 
-def _compact_shot(shot: dict[str, Any], *, keep_judges: bool) -> dict[str, Any]:
-    if keep_judges:
-        return dict(shot)
-    return {key: value for key, value in shot.items() if key not in DROP_SHOT_KEYS}
+def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
+    out = {key: value for key, value in shot.items() if key not in DROP_SHOT_KEYS}
+    out["correct"] = None
+    out["pending_grade"] = True
+    return out
 
 
 def compact_record(
@@ -89,26 +101,26 @@ def compact_record(
     model: str,
     source_run_id: str,
     n_shots: int,
-    keep_judges: bool,
 ) -> dict[str, Any] | None:
     """Return a 5-shot record, or None if this row is short."""
     shots = list(record.get("shots") or [])
     shots.sort(key=_shot_index)
     if len(shots) < n_shots:
         return None
-    shots = [_compact_shot(shot, keep_judges=keep_judges) for shot in shots[:n_shots]]
+    shots = [_compact_shot(shot) for shot in shots[:n_shots]]
     for index, shot in enumerate(shots):
         shot["shot_index"] = index
 
-    if keep_judges:
-        out = dict(record)
-    else:
-        out = {key: value for key, value in record.items() if key not in DROP_RECORD_KEYS}
+    out = {key: value for key, value in record.items() if key not in DROP_RECORD_KEYS}
     out["id"] = str(record.get("id") or "")
     out["model"] = model
     out["source_run_id"] = source_run_id
     out["n_shots"] = n_shots
     out["shots"] = shots
+    out["correct"] = None
+    out["n_shot_correct"] = None
+    out["shot_success_rate"] = None
+    out["pending_grade"] = True
     primary = shots[0] if shots else {}
     out.setdefault("model_output", primary.get("model_output"))
     out.setdefault("thinking_prediction", primary.get("thinking_prediction"))
@@ -124,7 +136,6 @@ def iter_wanted_records(
     model: str,
     source_run_id: str,
     n_shots: int,
-    keep_judges: bool,
 ) -> dict[str, dict[str, Any]]:
     """Stream ``predictions.jsonl`` and keep complete open-ended rows."""
     found: dict[str, dict[str, Any]] = {}
@@ -147,7 +158,6 @@ def iter_wanted_records(
                 model=model,
                 source_run_id=source_run_id,
                 n_shots=n_shots,
-                keep_judges=keep_judges,
             )
             if compact is None:
                 continue
@@ -196,7 +206,6 @@ def collate(
     ids_csv: Path,
     out_dir: Path,
     n_shots: int,
-    keep_judges: bool,
 ) -> dict[str, Any]:
     question_ids = load_question_ids_csv(ids_csv)
     wanted = set(question_ids)
@@ -226,7 +235,6 @@ def collate(
                 model=label,
                 source_run_id=run_id,
                 n_shots=n_shots,
-                keep_judges=keep_judges,
             )
             if not rows:
                 continue
@@ -273,7 +281,6 @@ def collate(
         "question_ids_csv": str(ids_csv),
         "models": labels,
         "sources": source_meta,
-        "keep_judges": keep_judges,
         "progress": progress,
         "created_at": now,
         "updated_at": now,
@@ -338,11 +345,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_N_SHOTS,
         help="Required shots per question (default: 5)",
     )
-    parser.add_argument(
-        "--keep-judges",
-        action="store_true",
-        help="Keep freeform judge payloads (dropped by default to shrink the pack)",
-    )
     return parser.parse_args()
 
 
@@ -354,7 +356,6 @@ def main() -> None:
         ids_csv=Path(args.question_ids_csv).expanduser().resolve(),
         out_dir=Path(args.out).expanduser().resolve(),
         n_shots=n_shots,
-        keep_judges=bool(args.keep_judges),
     )
     _print_summary(manifest, Path(args.out).expanduser().resolve())
 

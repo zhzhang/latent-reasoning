@@ -8,6 +8,7 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       scores.json
       manifest.json
       models/<label>/predictions.jsonl
+    mmar-freeform-5-shot/                    # run_judges.py (collated pack)
     exp-mmar-rubrics/<run_id>/               # run_rubrics_eval.py (Modal Qwen)
       question_ids.json
       manifest.json

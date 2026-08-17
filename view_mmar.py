@@ -1,0 +1,1662 @@
+"""Local viewer for the collated MMAR 5-shot freeform pack.
+
+Shows every question in ``outputs/mmar-freeform-5-shot`` with audio, gold
+reference, and all stored shots from every model.
+
+Usage::
+
+    uv run python view_mmar.py
+    uv run python view_mmar.py --port 7860
+    uv run python view_mmar.py --pack-dir ./outputs/mmar-freeform-5-shot
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import shutil
+import tarfile
+import tempfile
+from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+from aggregate import MODEL_LABEL_ORDER
+from collate_mmar_freeform import ALL_API_LABELS, DEFAULT_OUT_DIR
+from mmar_common import (
+    AF_NEXT_THINK_SUFFIX,
+    build_mmar_freeform_prompt,
+    count_wavs,
+    load_jsonl,
+)
+from mmar_models import MODEL_SPECS
+
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
+DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
+MMAR_REPO = "BoJack/MMAR"
+MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
+MIN_MMAR_WAVS = 1000
+LABEL_ORDER = MODEL_LABEL_ORDER + ALL_API_LABELS
+
+# API models are not in MODEL_SPECS (run_experiment_api.API_SPECS).
+API_SAMPLING: dict[str, dict[str, Any]] = {
+    "gpt-audio-mini": {
+        "model_id": "gpt-audio-mini",
+        "sampling": {"temperature": 1.0, "max_tokens": 1024},
+    },
+    "gemini-3.7-flash": {
+        "model_id": "gemini-3.7-flash",
+        "sampling": {"temperature": 1.0, "max_tokens": 1024},
+    },
+    "gpt-4o-mini": {
+        "model_id": "gpt-4o-mini",
+        "sampling": {"temperature": 1.0, "max_tokens": 1024},
+    },
+}
+
+# Where the sampling values were taken from (HF card, GitHub, vendor docs).
+SAMPLING_SOURCES: dict[str, dict[str, str]] = {
+    "af-next-think": {
+        "url": "https://huggingface.co/nvidia/audio-flamingo-next-think-hf",
+        "label": "Hugging Face model card",
+        "note": (
+            "Card generate() example uses repetition_penalty=1.2. "
+            "max_tokens=2048 matches generation_config; T=0.2 added for n-shot variance."
+        ),
+    },
+    "mimo-audio-7b": {
+        "url": (
+            "https://github.com/XiaomiMiMo/MiMo-Audio/blob/main/"
+            "src/mimo_audio/mimo_audio.py#L131-L133"
+        ),
+        "label": "MiMo-Audio GitHub sampler",
+        "note": (
+            "Official audio_understanding global sampler: T=0.3, top_p=0.95. "
+            "repetition_penalty=1.1 matches vLLM-Omni deploy defaults."
+        ),
+    },
+    "interactive-omni-8b": {
+        "url": "https://huggingface.co/sensenova/InteractiveOmni-8B",
+        "label": "Hugging Face model card",
+        "note": (
+            "README: generation_config = dict(max_new_tokens=1024, do_sample=True). "
+            "Transformers defaults fill in T=1.0, top_p=1.0."
+        ),
+    },
+    "qwen3-omni": {
+        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Thinking",
+        "label": "Hugging Face model card",
+        "note": (
+            "Thinking-mode card / generation_config: T=0.6, top_p=0.95, top_k=20. "
+            "max_tokens capped at 2048 for MMAR (card example uses 16384)."
+        ),
+    },
+    "voxtral-small-24b": {
+        "url": "https://huggingface.co/mistralai/Voxtral-Small-24B-2507",
+        "label": "Hugging Face model card",
+        "note": "Card recommends temperature=0.2 and top_p=0.95 for audio-understanding chat.",
+    },
+    "qwen2.5-omni-7b": {
+        "url": "https://huggingface.co/Qwen/Qwen2.5-Omni-7B",
+        "label": "Hugging Face model card",
+        "note": (
+            "Official eval is greedy (generation_config has no sampler). "
+            "T=0.2 added for n-shot variance."
+        ),
+    },
+    "phi-4-multimodal": {
+        "url": "https://huggingface.co/microsoft/Phi-4-multimodal-instruct",
+        "label": "Hugging Face model card",
+        "note": (
+            "Card uses GenerationConfig.from_pretrained + max_new_tokens=1000 (greedy). "
+            "T=0.2 added for n-shot variance."
+        ),
+    },
+    "gemma-4-e4b": {
+        "url": "https://huggingface.co/google/gemma-4-E4B-it#best-practices",
+        "label": "Hugging Face Best Practices",
+        "note": "Card Best Practices: temperature=1.0, top_p=0.95, top_k=64.",
+    },
+    "qwen3-omni-instruct": {
+        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "label": "Hugging Face model card",
+        "note": (
+            "Qwen3-Omni eval protocol: Instruct models decode greedily. "
+            "T=0.2 added for n-shot variance."
+        ),
+    },
+    "nemotron-3-nano-omni": {
+        "url": (
+            "https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8"
+            "#best-practices"
+        ),
+        "label": "Hugging Face Best Practices",
+        "note": (
+            "Thinking-mode card: T=0.6, top_p=0.95. "
+            "max_tokens capped at 2048 for MMAR (card recommends 20480)."
+        ),
+    },
+    "gpt-audio-mini": {
+        "url": "https://platform.openai.com/docs/models/gpt-audio-mini",
+        "label": "OpenAI model docs",
+        "note": "OpenAI Chat Completions default temperature is 1.0.",
+    },
+    "gemini-3.7-flash": {
+        "url": "https://ai.google.dev/api/generate-content",
+        "label": "Gemini API docs",
+        "note": "Gemini generateContent default temperature is 1.0.",
+    },
+    "gpt-4o-mini": {
+        "url": "https://platform.openai.com/docs/models/gpt-4o-mini",
+        "label": "OpenAI model docs",
+        "note": "OpenAI Chat Completions default temperature is 1.0.",
+    },
+}
+
+SAMPLING_KEY_ORDER = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "repetition_penalty",
+)
+
+# Official reported MMAR / MMAU averages. ``score`` is accuracy (%). Missing
+# keys or ``score: None`` render as none. Only first-party cards/papers or the
+# official MMAR leaderboard; no third-party re-evals, and MMAU* speech-synth
+# (Voxtral) is not MMAU.
+BENCHMARK_SCORES: dict[str, dict[str, dict[str, Any]]] = {
+    "af-next-think": {
+        "mmar": {
+            "score": 61.0,
+            "split": "overall",
+            "url": "https://huggingface.co/nvidia/audio-flamingo-next-think-hf",
+            "label": "Hugging Face model card",
+        },
+        "mmau": {
+            "score": 75.01,
+            "split": "v05.15.25 avg",
+            "url": "https://huggingface.co/nvidia/audio-flamingo-next-think-hf",
+            "label": "Hugging Face model card",
+        },
+    },
+    "mimo-audio-7b": {
+        "mmar": {
+            "score": 63.60,
+            "split": "overall",
+            "url": "https://arxiv.org/abs/2512.23808",
+            "label": "MiMo-Audio paper",
+        },
+        "mmau": {
+            "score": 74.90,
+            "split": "overall",
+            "url": "https://arxiv.org/abs/2512.23808",
+            "label": "MiMo-Audio paper",
+        },
+    },
+    "interactive-omni-8b": {
+        "mmau": {
+            "score": 67.39,
+            "split": "overall",
+            "url": "https://huggingface.co/sensenova/InteractiveOmni-8B",
+            "label": "Hugging Face model card",
+        },
+    },
+    "qwen3-omni": {
+        "mmar": {
+            "score": 66.4,
+            "split": "overall",
+            "url": "https://github.com/ddlBoJack/MMAR",
+            "label": "MMAR leaderboard",
+        },
+        "mmau": {
+            "score": 75.4,
+            "split": "v05.15.25",
+            "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Thinking",
+            "label": "Hugging Face model card",
+        },
+    },
+    "qwen3-omni-instruct": {
+        "mmau": {
+            "score": 77.5,
+            "split": "v05.15.25",
+            "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "label": "Hugging Face model card",
+        },
+    },
+    "qwen2.5-omni-7b": {
+        "mmar": {
+            "score": 56.7,
+            "split": "overall",
+            "url": "https://github.com/ddlBoJack/MMAR",
+            "label": "MMAR leaderboard",
+        },
+        "mmau": {
+            "score": 65.60,
+            "split": "avg",
+            "url": "https://huggingface.co/Qwen/Qwen2.5-Omni-7B",
+            "label": "Hugging Face model card",
+        },
+    },
+    "phi-4-multimodal": {
+        "mmau": {
+            "score": 55.56,
+            "split": "overall",
+            "url": "https://arxiv.org/abs/2503.01743",
+            "label": "Phi-4-Mini technical report",
+        },
+    },
+    "nemotron-3-nano-omni": {
+        "mmau": {
+            "score": 74.56,
+            "split": "FP8, reasoning off",
+            "url": "https://arxiv.org/abs/2604.24954",
+            "label": "Nemotron 3 Nano Omni paper",
+        },
+    },
+}
+
+QUESTION_KEYS = (
+    "id",
+    "question",
+    "answer",
+    "choices",
+    "audio_path",
+    "modality",
+    "category",
+    "sub-category",
+    "language",
+    "thinking",
+    "rubric",
+    "cue",
+)
+SHOT_KEYS = (
+    "shot_index",
+    "answer_prediction",
+    "model_output",
+    "thinking_prediction",
+    "correct",
+)
+
+CONFIG: dict[str, Any] = {}
+
+AF_NEXT_SYSTEM = (
+    "You are Audio Flamingo-Next, a multimodal assistant for language and "
+    "audio. On each turn you receive an optional audio clip which may contain "
+    "speech, music, or ambient sounds and optional text, you will receive at "
+    "least one or both; use your world knowledge and reasoning to help the "
+    "user with any task. Interpret the entirety of the content of any input "
+    "audio—regardless of whether the user calls it audio, speech, music, or "
+    "sound."
+)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def ensure_mmar_audio(audio_dir: Path, *, force: bool = False) -> Path:
+    """Download and extract the MMAR wav archive into ``audio_dir`` if needed."""
+    audio_dir = audio_dir.expanduser().resolve()
+    wav_count = count_wavs(audio_dir)
+    if wav_count >= MIN_MMAR_WAVS and not force:
+        print(f"MMAR audio ready: {wav_count} wav files in {audio_dir}", flush=True)
+        return audio_dir
+
+    from huggingface_hub import hf_hub_download
+
+    cache_root = audio_dir.parent
+    archive_cache = cache_root / MMAR_AUDIO_ARCHIVE
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"MMAR audio missing or incomplete ({wav_count} wavs); "
+        f"downloading {MMAR_AUDIO_ARCHIVE} from {MMAR_REPO} ...",
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="mmar-audio-") as tmp:
+        tmp_root = Path(tmp)
+        archive_tmp = Path(
+            hf_hub_download(
+                repo_id=MMAR_REPO,
+                filename=MMAR_AUDIO_ARCHIVE,
+                repo_type="dataset",
+                local_dir=str(tmp_root / "download"),
+            )
+        )
+        print(f"Extracting {archive_tmp.name} ...", flush=True)
+        extract_dir = tmp_root / "extract"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_tmp, "r:gz") as tar:
+            tar.extractall(path=extract_dir)
+
+        candidate_audio = extract_dir / "audio"
+        if not candidate_audio.is_dir():
+            matches = [path for path in extract_dir.rglob("audio") if path.is_dir()]
+            if not matches:
+                raise SystemExit(
+                    f"No audio/ directory found after extracting {archive_tmp}"
+                )
+            candidate_audio = matches[0]
+
+        if audio_dir.exists():
+            shutil.rmtree(audio_dir)
+        shutil.copytree(candidate_audio, audio_dir)
+        shutil.copy2(archive_tmp, archive_cache)
+
+    wav_count = count_wavs(audio_dir)
+    if wav_count < MIN_MMAR_WAVS:
+        raise SystemExit(
+            f"Expected at least {MIN_MMAR_WAVS} wav files in {audio_dir}, "
+            f"found {wav_count}."
+        )
+    print(f"MMAR audio ready: {wav_count} wav files in {audio_dir}", flush=True)
+    return audio_dir
+
+
+def order_model_labels(labels: list[str]) -> list[str]:
+    found = list(dict.fromkeys(str(x) for x in labels if x))
+    known = [label for label in LABEL_ORDER if label in found]
+    rest = [label for label in found if label not in LABEL_ORDER]
+    return known + rest
+
+
+def _ordered_sampling(sampling: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in SAMPLING_KEY_ORDER:
+        if key in sampling:
+            out[key] = sampling[key]
+    for key, value in sampling.items():
+        if key not in out:
+            out[key] = value
+    return out
+
+
+def _benchmark_entry(raw: dict[str, Any] | None) -> dict[str, Any]:
+    raw = raw or {}
+    score = raw.get("score")
+    try:
+        score_f = float(score) if score is not None else None
+    except (TypeError, ValueError):
+        score_f = None
+    return {
+        "score": score_f,
+        "split": raw.get("split") or "",
+        "url": raw.get("url") or "",
+        "label": raw.get("label") or "",
+    }
+
+
+def sampling_entries(model_labels: list[str]) -> list[dict[str, Any]]:
+    """Sampling, MMAR/MMAU scores, and public source URLs for each pack model."""
+    entries: list[dict[str, Any]] = []
+    for label in model_labels:
+        spec = MODEL_SPECS.get(label) or API_SAMPLING.get(label) or {}
+        source = SAMPLING_SOURCES.get(label) or {}
+        benches = BENCHMARK_SCORES.get(label) or {}
+        model_id = str(spec.get("model_id") or label)
+        sampling = _ordered_sampling(dict(spec.get("sampling") or {}))
+        url = source.get("url") or ""
+        if not url and "/" in model_id and not model_id.startswith("gpt-"):
+            url = f"https://huggingface.co/{model_id}"
+        entries.append(
+            {
+                "label": label,
+                "model_id": model_id,
+                "sampling": sampling,
+                "source_url": url,
+                "source_label": source.get("label") or "Source",
+                "note": source.get("note") or "",
+                "mmar": _benchmark_entry(benches.get("mmar")),
+                "mmau": _benchmark_entry(benches.get("mmau")),
+            }
+        )
+    return entries
+
+
+def discover_model_labels(pack_dir: Path, manifest: dict[str, Any] | None = None) -> list[str]:
+    models_root = pack_dir / "models"
+    found: list[str] = []
+    if models_root.is_dir():
+        for child in sorted(models_root.iterdir()):
+            if child.is_dir() and (child / "predictions.jsonl").is_file():
+                found.append(child.name)
+    if not found and manifest:
+        found = [str(label) for label in (manifest.get("models") or []) if label]
+    return order_model_labels(found)
+
+
+def _shot_index(shot: dict[str, Any]) -> int:
+    raw = shot.get("shot_index")
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
+    out = {key: shot.get(key) for key in SHOT_KEYS if key in shot}
+    out["shot_index"] = _shot_index(shot)
+    return out
+
+
+def _shot_success(record: dict[str, Any]) -> tuple[float | None, int | None, int]:
+    shots = list(record.get("shots") or [])
+    n_shots = len(shots)
+    n_correct = record.get("n_shot_correct")
+    rate = record.get("shot_success_rate")
+    if n_correct is None and shots:
+        n_correct = sum(1 for shot in shots if shot.get("correct") is True)
+    if rate is None and n_shots:
+        n_correct_i = int(n_correct or 0)
+        rate = n_correct_i / n_shots
+    try:
+        rate_f = float(rate) if rate is not None else None
+    except (TypeError, ValueError):
+        rate_f = None
+    try:
+        n_correct_i = int(n_correct) if n_correct is not None else None
+    except (TypeError, ValueError):
+        n_correct_i = None
+    return rate_f, n_correct_i, n_shots
+
+
+def _question_fields(record: dict[str, Any]) -> dict[str, Any]:
+    return {key: record.get(key) for key in QUESTION_KEYS if key in record}
+
+
+def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
+    """Reconstruct the freeform text prompts sent to each model."""
+    base = build_mmar_freeform_prompt(item)
+    af_base = build_mmar_freeform_prompt(item, think_suffix=AF_NEXT_THINK_SUFFIX)
+    step_system = (
+        "You are an expert in audio analysis. "
+        "Listen carefully and answer the question accurately.\n"
+        f"{base}"
+    )
+    return {
+        "shared": base,
+        "af-next-think": (
+            f"<|im_start|>system\n{AF_NEXT_SYSTEM}<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"<sound>{af_base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "mimo-audio-7b": (
+            "<|im_start|>user\n"
+            f"<|sosp|><|empty|><|eosp|>{base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<think>\n\n</think>\n"
+        ),
+        "interactive-omni-8b": f"[audio attached]\n{base}",
+        "qwen3-omni": (
+            "<|im_start|>user\n"
+            f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "qwen3-omni-instruct": (
+            "<|im_start|>user\n"
+            f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "qwen2.5-omni-7b": (
+            "<|im_start|>user\n"
+            f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "voxtral-small-24b": f"[audio attached]\n{base}",
+        "step-audio-2-mini": (
+            f"<|im_start|>system\n{step_system}<|im_end|>\n"
+            "<|im_start|>user\n<audio_patch><|im_end|>\n"
+            "<|im_start|>assistant\n"
+        ),
+        "gpt-audio-mini": base,
+        "gemini-3.7-flash": base,
+        "gpt-4o-mini": base,
+    }
+
+
+def resolve_audio(audio_path: str | None) -> Path | None:
+    if not audio_path:
+        return None
+    path = Path(audio_path)
+    if path.is_file():
+        return path
+    name = path.name
+    candidates = [
+        Path(CONFIG["audio_dir"]) / name,
+        REPO_ROOT / "data" / "mmar" / "audio" / name,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+@lru_cache(maxsize=2)
+def load_pack(pack_dir_s: str) -> dict[str, Any]:
+    pack_dir = Path(pack_dir_s)
+    if not pack_dir.is_dir():
+        raise FileNotFoundError(pack_dir)
+    manifest = load_json(pack_dir / "manifest.json")
+    ids_payload = load_json(pack_dir / "question_ids.json")
+    model_labels = discover_model_labels(pack_dir, manifest)
+
+    predictions: dict[str, dict[str, dict[str, Any]]] = {}
+    for label in model_labels:
+        rows = load_jsonl(pack_dir / "models" / label / "predictions.jsonl")
+        by_id: dict[str, dict[str, Any]] = {}
+        for record in rows:
+            qid = str(record.get("id") or "")
+            if not qid:
+                continue
+            shots = [_compact_shot(shot) for shot in (record.get("shots") or [])]
+            shots.sort(key=_shot_index)
+            rate, n_correct, n_shots = _shot_success({**record, "shots": shots})
+            by_id[qid] = {
+                **_question_fields(record),
+                "model": label,
+                "source_run_id": record.get("source_run_id"),
+                "n_shots": n_shots or record.get("n_shots") or len(shots),
+                "n_shot_correct": n_correct,
+                "shot_success_rate": rate,
+                "shots": shots,
+            }
+        predictions[label] = by_id
+
+    preferred_ids = [str(qid) for qid in (ids_payload.get("ids") or []) if qid]
+    seen: set[str] = set(preferred_ids)
+    all_ids = list(preferred_ids)
+    for label in model_labels:
+        for qid in predictions[label]:
+            if qid not in seen:
+                seen.add(qid)
+                all_ids.append(qid)
+
+    questions: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    modalities: set[str] = set()
+    n_complete = 0
+    for qid in all_ids:
+        sample: dict[str, Any] | None = None
+        per_model: dict[str, dict[str, Any]] = {}
+        rates: list[float] = []
+        n_present = 0
+        for label in model_labels:
+            record = predictions[label].get(qid)
+            if record is None:
+                per_model[label] = {"present": False}
+                continue
+            n_present += 1
+            if sample is None:
+                sample = record
+            rate = record.get("shot_success_rate")
+            if rate is not None:
+                rates.append(float(rate))
+            per_model[label] = {
+                "present": True,
+                "shot_success_rate": rate,
+                "n_shot_correct": record.get("n_shot_correct"),
+                "n_shots": record.get("n_shots"),
+            }
+        if sample is None:
+            continue
+        avg = sum(rates) / len(rates) if rates else None
+        complete = n_present >= len(model_labels) and len(model_labels) > 0
+        if complete:
+            n_complete += 1
+        modality = str(sample.get("modality") or "")
+        if modality:
+            modalities.add(modality)
+        row = {
+            "id": qid,
+            "question": sample.get("question") or "",
+            "answer": sample.get("answer") or "",
+            "choices": sample.get("choices") or [],
+            "audio_path": sample.get("audio_path"),
+            "modality": modality,
+            "category": sample.get("category") or "",
+            "sub-category": sample.get("sub-category") or "",
+            "language": sample.get("language") or "",
+            "thinking": sample.get("thinking") or "",
+            "rubric": sample.get("rubric") or "",
+            "cue": sample.get("cue") or "",
+            "avg_success_rate": avg,
+            "n_models": n_present,
+            "n_models_total": len(model_labels),
+            "complete": complete,
+            "per_model": per_model,
+        }
+        questions.append(
+            {
+                "id": qid,
+                "question": row["question"],
+                "modality": modality,
+                "category": row["category"],
+                "avg_success_rate": avg,
+                "n_models": n_present,
+                "n_models_total": len(model_labels),
+                "complete": complete,
+                "per_model": per_model,
+            }
+        )
+        by_id[qid] = row
+
+    questions.sort(
+        key=lambda row: (
+            row["avg_success_rate"] is None,
+            row["avg_success_rate"] if row["avg_success_rate"] is not None else 1.0,
+            str(row["id"]),
+        )
+    )
+
+    progress = manifest.get("progress") or {}
+    coverage = []
+    for label in model_labels:
+        n_done = len(predictions[label])
+        row = progress.get(label) or {}
+        coverage.append(
+            {
+                "model": label,
+                "n_done": n_done,
+                "n_total": int(row.get("n_total") or ids_payload.get("n") or len(questions)),
+                "complete": bool(row.get("complete")) if "complete" in row else n_done >= len(questions),
+                "source_run_id": row.get("source_run_id"),
+            }
+        )
+
+    return {
+        "pack_dir": str(pack_dir),
+        "manifest": manifest,
+        "model_labels": model_labels,
+        "predictions": predictions,
+        "questions": questions,
+        "by_id": by_id,
+        "modalities": sorted(modalities),
+        "n_shots": int(manifest.get("n_shots") or ids_payload.get("n_shots") or 5),
+        "coverage": coverage,
+        "n_complete": n_complete,
+        "n_questions": len(questions),
+    }
+
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MMAR Freeform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #e7eef3;
+    --ink: #14202a;
+    --muted: #5a6b78;
+    --line: #b7c7d2;
+    --card: #f7fafc;
+    --accent: #1f5f8b;
+    --good: #1f6b4a;
+    --bad: #9b3a3a;
+    --soft-good: #d7eee3;
+    --soft-bad: #f3dede;
+    --shadow: 0 1px 0 rgba(20,32,42,0.04), 0 10px 28px rgba(20,32,42,0.07);
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    color: var(--ink);
+    background:
+      linear-gradient(160deg, #dfeaf1 0%, transparent 42%),
+      linear-gradient(345deg, #cfdde6 0%, transparent 36%),
+      var(--bg);
+  }
+  header {
+    position: sticky; top: 0; z-index: 20;
+    backdrop-filter: blur(10px);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    border-bottom: 1px solid var(--line);
+    padding: 1rem 1.25rem;
+  }
+  .header-inner {
+    max-width: 1400px; margin: 0 auto;
+    display: flex; flex-wrap: wrap; gap: 1rem; align-items: end;
+    justify-content: space-between;
+  }
+  .brand h1 {
+    font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+    font-weight: 600; font-size: 1.4rem;
+    margin: 0 0 0.15rem; letter-spacing: -0.03em;
+  }
+  .brand p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end; }
+  label { font-size: 0.75rem; color: var(--muted); display: grid; gap: 0.25rem; }
+  select, input[type="search"], button {
+    font: inherit; color: var(--ink);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.45rem 0.65rem;
+  }
+  select, input[type="search"] { min-width: 12rem; }
+  button { cursor: pointer; }
+  button.active { background: #e2eef6; border-color: #8fb3c9; }
+  main {
+    max-width: 1400px; margin: 0 auto; padding: 1.25rem;
+    display: grid; grid-template-columns: 360px 1fr; gap: 1rem;
+  }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    min-height: 0;
+  }
+  .panel h2 {
+    margin: 0; padding: 0.85rem 1rem;
+    font-size: 0.85rem; letter-spacing: 0.04em;
+    text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line);
+  }
+  .stats {
+    display: flex; flex-wrap: wrap; gap: 0.5rem;
+    padding: 0.75rem 1rem; border-bottom: 1px solid var(--line);
+    font-size: 0.85rem; color: var(--muted);
+  }
+  .stats strong { color: var(--ink); }
+  #qlist {
+    list-style: none; margin: 0; padding: 0;
+    max-height: calc(100vh - 220px); overflow: auto;
+  }
+  #qlist li {
+    border-bottom: 1px solid var(--line);
+    padding: 0.75rem 1rem; cursor: pointer;
+  }
+  #qlist li:hover { background: #eef5fa; }
+  #qlist li.active { background: #e2eef6; }
+  .qid {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.75rem; color: var(--muted);
+  }
+  .rate {
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 500; font-size: 0.95rem;
+  }
+  .mini-rates {
+    display: flex; flex-wrap: wrap; gap: 0.35rem;
+    margin-top: 0.35rem;
+  }
+  .chip {
+    font-size: 0.7rem; font-family: "IBM Plex Mono", monospace;
+    padding: 0.15rem 0.4rem; border-radius: 999px;
+    background: #e8eef2; color: var(--muted);
+  }
+  .chip.missing { background: #f3e6cf; color: #5a3a12; }
+  .qtext {
+    margin: 0.35rem 0 0; font-size: 0.86rem;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  #detail { padding: 1rem 1.15rem; max-height: calc(100vh - 160px); overflow: auto; }
+  .muted { color: var(--muted); }
+  .answer-box, .choice-box, .model-block {
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 0.75rem 0.9rem; margin: 0.75rem 0; background: #fff;
+  }
+  .model-block h3 {
+    margin: 0 0 0.5rem; font-size: 1rem;
+    display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap;
+  }
+  .shot {
+    border-top: 1px dashed var(--line);
+    padding: 0.65rem 0;
+  }
+  .shot:first-of-type { border-top: none; }
+  .shot-head {
+    display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+    font-family: "IBM Plex Mono", monospace; font-size: 0.8rem;
+    margin-bottom: 0.35rem;
+  }
+  .pass { color: var(--good); background: var(--soft-good); padding: 0.1rem 0.4rem; border-radius: 999px; }
+  .fail { color: var(--bad); background: var(--soft-bad); padding: 0.1rem 0.4rem; border-radius: 999px; }
+  pre {
+    white-space: pre-wrap; word-break: break-word;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.8rem; margin: 0.25rem 0 0;
+    background: #f2f6f9; padding: 0.55rem 0.65rem; border-radius: 8px;
+  }
+  audio { width: 100%; margin-top: 0.5rem; }
+  .mode-badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem; font-weight: 500;
+    letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 0.2rem 0.55rem; border-radius: 999px;
+    border: 1px solid var(--line);
+    vertical-align: middle;
+    color: #5a3a12; background: #f3e6cf; border-color: #d4b88a;
+  }
+  .brand-row {
+    display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center;
+  }
+  .run-meta {
+    margin-top: 0.35rem; font-size: 0.82rem; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center;
+  }
+  details.accordion {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; margin: 0.75rem 0; overflow: hidden;
+  }
+  details.accordion > summary {
+    cursor: pointer; list-style: none;
+    padding: 0.75rem 0.9rem;
+    font-weight: 600; font-size: 0.92rem;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 0.75rem; user-select: none;
+  }
+  details.accordion > summary::-webkit-details-marker { display: none; }
+  details.accordion > summary::after {
+    content: "+";
+    font-family: "IBM Plex Mono", monospace;
+    color: var(--muted); font-weight: 500;
+  }
+  details.accordion[open] > summary {
+    border-bottom: 1px solid var(--line);
+    background: #f2f6f9;
+  }
+  details.accordion[open] > summary::after { content: "−"; }
+  .accordion-body { padding: 0.75rem 0.9rem; }
+  details.prompt-model {
+    border: 1px solid var(--line); border-radius: 8px;
+    margin: 0.5rem 0; background: #fbfcfd;
+  }
+  details.prompt-model > summary {
+    cursor: pointer; padding: 0.55rem 0.7rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.8rem; font-weight: 500;
+    list-style: none; display: flex; justify-content: space-between;
+  }
+  details.prompt-model > summary::-webkit-details-marker { display: none; }
+  details.prompt-model > summary::after {
+    content: "▸"; color: var(--muted);
+  }
+  details.prompt-model[open] > summary::after { content: "▾"; }
+  details.prompt-model pre {
+    margin: 0; border-radius: 0 0 8px 8px;
+    border-top: 1px solid var(--line);
+  }
+  .choice-box.hidden-from-model {
+    border-style: dashed; background: #faf7f2;
+  }
+  .choice-box .note {
+    font-size: 0.78rem; color: var(--muted); margin: 0.25rem 0 0.45rem;
+  }
+  .verdict-grid-wrap {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; margin: 0.75rem 0; overflow: auto;
+  }
+  .verdict-grid-wrap > .vg-title {
+    padding: 0.55rem 0.8rem; font-size: 0.78rem; font-weight: 600;
+    letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line); background: #f2f6f9;
+  }
+  .verdict-grid {
+    display: grid;
+    gap: 3px;
+    padding: 0.65rem 0.8rem 0.8rem;
+    align-items: center;
+    min-width: max-content;
+  }
+  .vg-corner { font-size: 0.72rem; color: var(--muted); }
+  .vg-shot {
+    text-align: center;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.68rem; color: var(--muted);
+  }
+  .vg-model {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.75rem; font-weight: 500;
+    padding-right: 0.5rem; white-space: nowrap;
+  }
+  .vg-cell {
+    width: 1.05rem; height: 1.05rem; border-radius: 3px;
+    justify-self: center;
+    border: 1px solid transparent;
+  }
+  .vg-cell.pass { background: var(--good); }
+  .vg-cell.fail { background: var(--bad); }
+  .vg-cell.pending { background: #d5dde3; border-color: var(--line); }
+  .vg-cell.missing { background: transparent; border: 1px dashed var(--line); }
+  .header-right {
+    display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end;
+  }
+  #sampling-btn {
+    font: inherit; color: var(--ink);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.45rem 0.75rem; cursor: pointer;
+    white-space: nowrap;
+  }
+  #sampling-btn:hover, #sampling-btn.active {
+    background: #e2eef6; border-color: #8fb3c9;
+  }
+  .modal {
+    position: fixed; inset: 0; z-index: 40;
+    display: none; align-items: start; justify-content: center;
+    padding: 4.5rem 1rem 1.5rem;
+  }
+  .modal.open { display: flex; }
+  .modal-backdrop {
+    position: absolute; inset: 0;
+    background: rgba(20, 32, 42, 0.38);
+    backdrop-filter: blur(4px);
+  }
+  .modal-card {
+    position: relative; z-index: 1;
+    width: min(760px, 100%);
+    max-height: calc(100vh - 6rem);
+    overflow: auto;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .modal-head {
+    position: sticky; top: 0;
+    display: flex; align-items: start; justify-content: space-between;
+    gap: 1rem; padding: 1rem 1.15rem;
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  .modal-head h2 {
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 1.15rem; font-weight: 600; letter-spacing: -0.03em;
+    margin: 0 0 0.2rem;
+  }
+  .modal-head p { margin: 0; color: var(--muted); font-size: 0.85rem; }
+  .modal-close {
+    font: inherit; cursor: pointer;
+    background: transparent; border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.25rem 0.55rem; color: var(--muted);
+  }
+  .sampling-list { list-style: none; margin: 0; padding: 0; }
+  .sampling-list li {
+    padding: 0.9rem 1.15rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .sampling-list li:last-child { border-bottom: none; }
+  .sampling-label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.88rem; font-weight: 500;
+  }
+  .sampling-id {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.75rem; color: var(--muted); margin: 0.15rem 0 0.45rem;
+  }
+  .sampling-params {
+    display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0 0 0.45rem;
+  }
+  .sampling-params .chip { background: #e2eef6; color: var(--ink); }
+  .sampling-note { margin: 0.35rem 0 0; font-size: 0.8rem; color: var(--muted); }
+  .sampling-source {
+    font-size: 0.82rem;
+    color: var(--accent);
+    word-break: break-all;
+  }
+  .bench-row {
+    display: flex; flex-direction: column; gap: 0.35rem;
+    margin: 0 0 0.55rem;
+  }
+  .bench-item {
+    display: grid; gap: 0.15rem;
+  }
+  .bench-head {
+    display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: baseline;
+  }
+  .chip.score { color: var(--accent); background: #d9e8f3; }
+  .chip.none { background: #e8eef2; }
+  .sampling-section {
+    font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--muted); margin: 0.15rem 0 0.3rem;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <div class="brand-row">
+        <h1>MMAR Freeform</h1>
+        <span class="mode-badge">Freeform</span>
+      </div>
+      <p>All models × all shots from the 5-shot freeform pack</p>
+      <div class="run-meta" id="run-meta"></div>
+    </div>
+    <div class="header-right">
+    <div class="controls">
+      <label>Search
+        <input id="search" type="search" placeholder="id / question text" />
+      </label>
+      <label>Modality
+        <select id="modality"><option value="">All</option></select>
+      </label>
+      <label>&nbsp;
+        <button id="filter-incomplete" type="button">Incomplete only</button>
+      </label>
+    </div>
+    <button id="sampling-btn" type="button">Model info</button>
+    </div>
+  </div>
+</header>
+<main>
+  <section class="panel">
+    <h2>Questions</h2>
+    <div class="stats" id="stats">Loading…</div>
+    <ul id="qlist"></ul>
+  </section>
+  <section class="panel">
+    <h2>Detail</h2>
+    <div id="detail"><p class="muted">Select a question.</p></div>
+  </section>
+</main>
+<div id="sampling-modal" class="modal" aria-hidden="true">
+  <div class="modal-backdrop" data-close-sampling></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="sampling-title">
+    <div class="modal-head">
+      <div>
+        <h2 id="sampling-title">Model info</h2>
+        <p>Reported MMAR / MMAU scores and the sampling parameters used in this pack, with source links.</p>
+      </div>
+      <button class="modal-close" type="button" data-close-sampling aria-label="Close">✕</button>
+    </div>
+    <ul class="sampling-list" id="sampling-list">
+      <li class="muted">Loading…</li>
+    </ul>
+  </div>
+</div>
+<script>
+const state = {
+  modelLabels: [],
+  questions: [],
+  modalities: [],
+  coverage: [],
+  nShots: 5,
+  nComplete: 0,
+  selectedId: null,
+  filterIncomplete: false,
+  sampling: null,
+};
+
+async function api(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => {
+    return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c];
+  });
+}
+
+function fmtParam(key, value) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return String(value);
+  }
+  return String(value);
+}
+
+function fmtScore(v) {
+  if (v === null || v === undefined) return "none";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "none";
+  return String(n);
+}
+
+function fmtRate(v) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return (100 * n).toFixed(1) + "%";
+}
+
+function sourceLink(href, label) {
+  if (!href) return `<span class="muted">none</span>`;
+  const text = label || href;
+  return `<a class="sampling-source" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(text)}</a>`;
+}
+
+function renderBench(name, entry) {
+  const row = entry || {};
+  if (row.score === null || row.score === undefined) {
+    return `<div class="bench-item">
+      <div class="bench-head"><span class="chip none">${escapeHtml(name)} none</span></div>
+    </div>`;
+  }
+  const split = row.split ? `<span class="muted">${escapeHtml(row.split)}</span>` : "";
+  return `<div class="bench-item">
+    <div class="bench-head">
+      <span class="chip score">${escapeHtml(name)} ${escapeHtml(fmtScore(row.score))}</span>
+      ${split}
+    </div>
+    ${sourceLink(row.url, row.label)}
+  </div>`;
+}
+
+function renderSamplingList(models) {
+  const list = document.getElementById("sampling-list");
+  if (!models || !models.length) {
+    list.innerHTML = `<li class="muted">No model metadata for this pack.</li>`;
+    return;
+  }
+  list.innerHTML = models.map(row => {
+    const params = Object.entries(row.sampling || {}).map(([key, value]) =>
+      `<span class="chip">${escapeHtml(key)}=${escapeHtml(fmtParam(key, value))}</span>`
+    ).join("");
+    const note = row.note ? `<p class="sampling-note">${escapeHtml(row.note)}</p>` : "";
+    return `<li>
+      <div class="sampling-label">${escapeHtml(row.label)}</div>
+      <div class="sampling-id">${escapeHtml(row.model_id || "")}</div>
+      <div class="sampling-section">Reported scores</div>
+      <div class="bench-row">
+        ${renderBench("MMAR", row.mmar)}
+        ${renderBench("MMAU", row.mmau)}
+      </div>
+      <div class="sampling-section">Sampling</div>
+      <div class="sampling-params">${params || `<span class="chip">—</span>`}</div>
+      ${sourceLink(row.source_url, row.source_label)}
+      ${note}
+    </li>`;
+  }).join("");
+}
+
+function setSamplingOpen(open) {
+  const modal = document.getElementById("sampling-modal");
+  const btn = document.getElementById("sampling-btn");
+  modal.classList.toggle("open", open);
+  modal.setAttribute("aria-hidden", open ? "false" : "true");
+  btn.classList.toggle("active", open);
+  document.body.style.overflow = open ? "hidden" : "";
+}
+
+async function openSampling() {
+  setSamplingOpen(true);
+  if (state.sampling) return;
+  try {
+    const data = await api("/api/sampling");
+    state.sampling = data.models || [];
+    renderSamplingList(state.sampling);
+  } catch (err) {
+    document.getElementById("sampling-list").innerHTML =
+      `<li class="muted">Failed to load model info: ${escapeHtml(String(err))}</li>`;
+  }
+}
+
+function bindSamplingModal() {
+  document.getElementById("sampling-btn").addEventListener("click", () => {
+    const open = document.getElementById("sampling-modal").classList.contains("open");
+    if (open) setSamplingOpen(false);
+    else openSampling();
+  });
+  document.querySelectorAll("[data-close-sampling]").forEach(el => {
+    el.addEventListener("click", () => setSamplingOpen(false));
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setSamplingOpen(false);
+  });
+}
+
+function shortLabel(label) {
+  const map = {
+    "af-next-think": "af-next",
+    "mimo-audio-7b": "mimo",
+    "interactive-omni-8b": "i-omni",
+    "qwen3-omni": "qwen3",
+    "qwen3-omni-instruct": "qwen3-i",
+    "qwen2.5-omni-7b": "qwen2.5",
+    "voxtral-small-24b": "voxtral",
+    "phi-4-multimodal": "phi-4",
+    "gemma-4-e4b": "gemma",
+    "nemotron-3-nano-omni": "nemotron",
+    "gpt-audio-mini": "gpt-mini",
+    "gemini-3.7-flash": "gemini",
+    "gpt-4o-mini": "4o-mini",
+    "step-audio-2-mini": "step",
+  };
+  return map[label] || label;
+}
+
+function filteredQuestions() {
+  const q = (document.getElementById("search").value || "").trim().toLowerCase();
+  const modality = document.getElementById("modality").value;
+  return state.questions.filter(row => {
+    if (state.filterIncomplete && row.complete) return false;
+    if (modality && row.modality !== modality) return false;
+    if (!q) return true;
+    return String(row.id).toLowerCase().includes(q)
+      || String(row.question || "").toLowerCase().includes(q);
+  });
+}
+
+function renderStats() {
+  const items = filteredQuestions();
+  const parts = [
+    `<span><strong>${items.length}</strong> shown</span>`,
+    `<span>${state.questions.length} total</span>`,
+    `<span>${state.nComplete} complete</span>`,
+    `<span>${state.nShots} shots</span>`,
+  ];
+  for (const row of state.coverage) {
+    parts.push(
+      `<span>${escapeHtml(shortLabel(row.model))}: <strong>${row.n_done}</strong>/${row.n_total}</span>`
+    );
+  }
+  document.getElementById("stats").innerHTML = parts.join(" · ");
+}
+
+function renderList() {
+  renderStats();
+  const list = document.getElementById("qlist");
+  const labels = state.modelLabels;
+  const items = filteredQuestions();
+  list.innerHTML = items.map(row => {
+    const chips = labels.map(label => {
+      const pm = (row.per_model || {})[label] || {};
+      if (!pm.present) {
+        return `<span class="chip missing" title="${escapeHtml(label)} missing">${escapeHtml(shortLabel(label))} —</span>`;
+      }
+      return `<span class="chip" title="${escapeHtml(label)}">${escapeHtml(shortLabel(label))} ${fmtRate(pm.shot_success_rate)}</span>`;
+    }).join("");
+    const active = row.id === state.selectedId ? "active" : "";
+    const cover = `${row.n_models}/${row.n_models_total}`;
+    return `<li class="${active}" data-id="${escapeHtml(row.id)}">
+      <div class="qid">${escapeHtml(row.id)}</div>
+      <div class="rate">${fmtRate(row.avg_success_rate)} avg · ${cover} models</div>
+      <div class="mini-rates">${chips}</div>
+      <p class="qtext">${escapeHtml(row.question || "")}</p>
+    </li>`;
+  }).join("");
+  list.querySelectorAll("li").forEach(li => {
+    li.addEventListener("click", () => selectQuestion(li.dataset.id));
+  });
+}
+
+function renderPromptAccordion(prompts) {
+  if (!prompts) return "";
+  const shared = prompts.shared || "";
+  const seen = new Set();
+  const modelBlocks = state.modelLabels
+    .filter(label => {
+      if (!prompts[label] || seen.has(label)) return false;
+      seen.add(label);
+      return true;
+    })
+    .map(label => `<details class="prompt-model">
+      <summary>${escapeHtml(label)}</summary>
+      <pre>${escapeHtml(prompts[label])}</pre>
+    </details>`)
+    .join("");
+  return `<details class="accordion" open>
+    <summary><span>Full prompt</span></summary>
+    <div class="accordion-body">
+      <p class="muted" style="margin:0 0 0.55rem">Question only — multiple-choice options were not shown to the model.</p>
+      <strong style="font-size:0.82rem;color:var(--muted)">Shared question text</strong>
+      <pre>${escapeHtml(shared)}</pre>
+      <strong style="display:block;margin-top:0.75rem;font-size:0.82rem;color:var(--muted)">Per-model chat wrappers</strong>
+      ${modelBlocks || `<p class="muted">No per-model wrappers stored.</p>`}
+    </div>
+  </details>`;
+}
+
+function goldAccordion(title, text) {
+  if (!text) return "";
+  return `<details class="accordion">
+    <summary><span>${escapeHtml(title)}</span></summary>
+    <div class="accordion-body"><pre>${escapeHtml(text)}</pre></div>
+  </details>`;
+}
+
+function renderVerdictGrid(modelLabels, predictions, nShots) {
+  const labels = modelLabels || [];
+  const shotsN = Math.max(1, nShots || 5);
+  if (!labels.length) return "";
+  const shotHeaders = Array.from({ length: shotsN }, (_, i) =>
+    `<div class="vg-shot">s${i}</div>`
+  ).join("");
+  const rows = labels.map(label => {
+    const pred = (predictions || {})[label] || null;
+    const shots = pred ? (pred.shots || []) : [];
+    const cells = Array.from({ length: shotsN }, (_, i) => {
+      if (!pred) {
+        return `<div class="vg-cell missing" title="${escapeHtml(label)} s${i}: missing"></div>`;
+      }
+      const shot = shots.find(s => Number(s.shot_index) === i) || shots[i];
+      if (!shot) {
+        return `<div class="vg-cell missing" title="${escapeHtml(label)} s${i}: missing"></div>`;
+      }
+      if (shot.correct === null || shot.correct === undefined) {
+        return `<div class="vg-cell pending" title="${escapeHtml(label)} s${i}: pending"></div>`;
+      }
+      const ok = !!shot.correct;
+      return `<div class="vg-cell ${ok ? "pass" : "fail"}" title="${escapeHtml(label)} s${i}: ${ok ? "pass" : "fail"}"></div>`;
+    }).join("");
+    return `<div class="vg-model">${escapeHtml(label)}</div>${cells}`;
+  }).join("");
+  return `<div class="verdict-grid-wrap">
+    <div class="vg-title">Verdict grid · model × shot</div>
+    <div class="verdict-grid" style="grid-template-columns: max-content repeat(${shotsN}, 1.15rem)">
+      <div class="vg-corner"></div>
+      ${shotHeaders}
+      ${rows}
+    </div>
+  </div>`;
+}
+
+function shotBlock(shot) {
+  const pending = shot.correct === null || shot.correct === undefined;
+  const verdict = pending
+    ? `<span class="chip">pending</span>`
+    : `<span class="${shot.correct ? "pass" : "fail"}">${shot.correct ? "pass" : "fail"}</span>`;
+  const think = shot.thinking_prediction && shot.thinking_prediction !== shot.model_output
+    ? `<details class="accordion"><summary><span>Thinking</span></summary>
+        <div class="accordion-body"><pre>${escapeHtml(shot.thinking_prediction)}</pre></div>
+       </details>`
+    : "";
+  return `<div class="shot">
+    <div class="shot-head">
+      <span>shot ${shot.shot_index ?? "—"}</span>
+      ${verdict}
+      <span class="muted">parsed: ${escapeHtml(shot.answer_prediction || "")}</span>
+    </div>
+    <pre>${escapeHtml(shot.model_output || "")}</pre>
+    ${think}
+  </div>`;
+}
+
+async function selectQuestion(id) {
+  state.selectedId = id;
+  renderList();
+  const detail = document.getElementById("detail");
+  detail.innerHTML = `<p class="muted">Loading…</p>`;
+  try {
+    const data = await api(`/api/question?id=${encodeURIComponent(id)}`);
+    const row = data.question || {};
+    const labels = (data.model_labels && data.model_labels.length)
+      ? data.model_labels
+      : state.modelLabels;
+    const nShots = data.n_shots || state.nShots;
+    const choices = (row.choices || []).map((c, i) =>
+      `<div>(${String.fromCharCode(65+i)}) ${escapeHtml(c)}</div>`
+    ).join("");
+    let modelsHtml = "";
+    for (const label of labels) {
+      const pred = (data.predictions || {})[label];
+      const pm = (row.per_model || {})[label] || {};
+      if (!pred) {
+        modelsHtml += `<div class="model-block"><h3>${escapeHtml(label)} <span class="muted">missing</span></h3></div>`;
+        continue;
+      }
+      const shots = (pred.shots || []).slice().sort((a, b) => (a.shot_index ?? 0) - (b.shot_index ?? 0));
+      const shotsHtml = shots.map(shotBlock).join("");
+      const rateChip = `<span class="chip">${fmtRate(pm.shot_success_rate)} (${pm.n_shot_correct ?? "—"}/${pm.n_shots ?? shots.length})</span>`;
+      modelsHtml += `<div class="model-block">
+        <h3>${escapeHtml(label)} ${rateChip}</h3>
+        ${shotsHtml || "<p class='muted'>No shots stored.</p>"}
+      </div>`;
+    }
+    const audio = data.audio_url
+      ? `<audio controls preload="none" src="${escapeHtml(data.audio_url)}"></audio>`
+      : `<p class="muted">Audio not found locally.</p>`;
+    const cover = `${row.n_models ?? "—"}/${row.n_models_total ?? labels.length} models`;
+    detail.innerHTML = `
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <div class="qid">${escapeHtml(row.id || id)}</div>
+        <span class="mode-badge">Freeform</span>
+        ${row.complete ? "" : `<span class="chip missing">${escapeHtml(cover)}</span>`}
+      </div>
+      <h3 style="margin:0.4rem 0 0.2rem;font-family:Space Grotesk,sans-serif">${escapeHtml(row.question || "")}</h3>
+      <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")} · avg ${fmtRate(row.avg_success_rate)} · ${escapeHtml(cover)}</p>
+      ${renderVerdictGrid(labels, data.predictions || {}, nShots)}
+      ${audio}
+      ${renderPromptAccordion(data.prompts)}
+      <div class="choice-box hidden-from-model">
+        <strong>Choices</strong>
+        <div class="note">Not shown to the model in freeform mode (gold answer reference only).</div>
+        ${choices || `<span class="muted">No choices stored.</span>`}
+      </div>
+      <div class="answer-box"><strong>Gold</strong><div>${escapeHtml(row.answer || "")}</div></div>
+      ${goldAccordion("Gold thinking", row.thinking)}
+      ${goldAccordion("Rubric", row.rubric)}
+      ${goldAccordion("Cue", row.cue)}
+      ${modelsHtml}
+    `;
+  } catch (err) {
+    detail.innerHTML = `<p class="muted">Failed to load question: ${escapeHtml(String(err))}</p>`;
+  }
+}
+
+async function init() {
+  const data = await api("/api/pack");
+  state.modelLabels = data.model_labels || [];
+  state.questions = data.questions || [];
+  state.modalities = data.modalities || [];
+  state.coverage = data.coverage || [];
+  state.nShots = data.n_shots || 5;
+  state.nComplete = data.n_complete || 0;
+  const metaBits = [];
+  if (data.n_shots) metaBits.push(`${data.n_shots} shots`);
+  metaBits.push(`${state.modelLabels.length} models`);
+  metaBits.push(`${state.questions.length} questions`);
+  if (data.n_complete != null) metaBits.push(`${data.n_complete} with every model`);
+  document.getElementById("run-meta").textContent = metaBits.join(" · ");
+  const sel = document.getElementById("modality");
+  sel.innerHTML = `<option value="">All</option>` + state.modalities.map(m =>
+    `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`
+  ).join("");
+  document.getElementById("search").addEventListener("input", renderList);
+  sel.addEventListener("change", renderList);
+  document.getElementById("filter-incomplete").addEventListener("click", () => {
+    state.filterIncomplete = !state.filterIncomplete;
+    document.getElementById("filter-incomplete").classList.toggle("active", state.filterIncomplete);
+    renderList();
+  });
+  bindSamplingModal();
+  if (!state.questions.length) {
+    document.getElementById("stats").textContent = "No questions in this pack.";
+    document.getElementById("detail").innerHTML = `<p class="muted">Pack is empty or missing predictions.</p>`;
+    return;
+  }
+  const preferred = new URLSearchParams(location.search).get("id");
+  const start = (preferred && state.questions.find(q => q.id === preferred))
+    ? preferred
+    : state.questions[0].id;
+  renderList();
+  await selectQuestion(start);
+}
+
+init().catch(err => {
+  document.getElementById("stats").textContent = String(err);
+});
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        print(f"[view_mmar] {self.address_string()} {fmt % args}")
+
+    def _send(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, payload: Any, code: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self._send(code, body, "application/json; charset=utf-8")
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        try:
+            if path in ("/", "/index.html"):
+                self._send(200, HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                return
+
+            if path == "/api/pack":
+                bundle = load_pack(str(CONFIG["pack_dir"]))
+                self._send_json(
+                    {
+                        "questions": bundle["questions"],
+                        "manifest": bundle["manifest"],
+                        "model_labels": bundle["model_labels"],
+                        "modalities": bundle["modalities"],
+                        "coverage": bundle["coverage"],
+                        "n_shots": bundle["n_shots"],
+                        "n_complete": bundle["n_complete"],
+                        "n_questions": bundle["n_questions"],
+                    }
+                )
+                return
+
+            if path == "/api/sampling":
+                bundle = load_pack(str(CONFIG["pack_dir"]))
+                self._send_json({"models": sampling_entries(bundle["model_labels"])})
+                return
+
+            if path == "/api/question":
+                qid = (qs.get("id") or [""])[0]
+                if not qid:
+                    self._send_json({"error": "missing id"}, 400)
+                    return
+                bundle = load_pack(str(CONFIG["pack_dir"]))
+                row = bundle["by_id"].get(qid)
+                if row is None:
+                    self._send_json({"error": "question not found"}, 404)
+                    return
+                model_labels = bundle["model_labels"]
+                preds = {
+                    label: bundle["predictions"].get(label, {}).get(qid)
+                    for label in model_labels
+                }
+                audio = resolve_audio(row.get("audio_path"))
+                audio_url = f"/audio/{audio.name}" if audio is not None else None
+                sample = next(
+                    (preds[label] for label in model_labels if preds.get(label)),
+                    row,
+                )
+                self._send_json(
+                    {
+                        "question": row,
+                        "predictions": preds,
+                        "audio_url": audio_url,
+                        "model_labels": model_labels,
+                        "n_shots": bundle["n_shots"],
+                        "prompts": build_model_prompts(sample),
+                    }
+                )
+                return
+
+            if path.startswith("/audio/"):
+                name = unquote(path[len("/audio/") :])
+                audio = Path(CONFIG["audio_dir"]) / name
+                if not audio.is_file():
+                    self.send_error(404, "audio not found")
+                    return
+                data = audio.read_bytes()
+                ctype = mimetypes.guess_type(str(audio))[0] or "audio/wav"
+                self._send(200, data, ctype)
+                return
+
+            self.send_error(404, "not found")
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, 404)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json({"error": str(exc)}, 500)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument(
+        "--pack-dir",
+        type=Path,
+        default=DEFAULT_OUT_DIR,
+        help="Collated freeform pack (default: outputs/mmar-freeform-5-shot)",
+    )
+    parser.add_argument(
+        "--audio-dir",
+        type=Path,
+        default=DEFAULT_AUDIO_DIR,
+        help="Local MMAR wav directory",
+    )
+    parser.add_argument(
+        "--skip-audio-download",
+        action="store_true",
+        help="Do not download MMAR wavs if the local audio cache is incomplete",
+    )
+    parser.add_argument(
+        "--force-audio-download",
+        action="store_true",
+        help="Re-download the MMAR wav archive even if wavs are present",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args()
+
+    pack_dir = args.pack_dir.expanduser().resolve()
+    CONFIG["pack_dir"] = pack_dir
+    audio_dir = args.audio_dir.expanduser().resolve()
+    if not args.skip_audio_download:
+        try:
+            audio_dir = ensure_mmar_audio(
+                audio_dir, force=args.force_audio_download
+            )
+        except SystemExit as exc:
+            print(f"Audio setup failed: {exc}", flush=True)
+            print("Continuing without local audio; pass --skip-audio-download to silence.")
+    CONFIG["audio_dir"] = audio_dir
+    load_pack.cache_clear()
+
+    print(f"Pack:  {pack_dir}")
+    print(f"Audio: {audio_dir}")
+    if not pack_dir.is_dir():
+        print("Pack directory not found. Run collate_mmar_freeform.py first.")
+    else:
+        bundle = load_pack(str(pack_dir))
+        print(
+            f"Loaded {bundle['n_questions']} questions, "
+            f"{len(bundle['model_labels'])} models, "
+            f"{bundle['n_shots']} shots"
+        )
+        for row in bundle["coverage"]:
+            status = "complete" if row["complete"] else "partial"
+            print(
+                f"  {row['model']:<24} {row['n_done']:>4}/{row['n_total']:<4} {status}"
+            )
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"Open http://{args.host}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down")
+
+
+if __name__ == "__main__":
+    main()

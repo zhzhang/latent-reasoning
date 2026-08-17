@@ -928,16 +928,7 @@ async def grade_items_with_gemini(
     retry_interval: float = 1.0,
     max_output_tokens: int = 2048,
     thinking_level: str = "medium",
-    poll_interval_s: float = 30.0,
 ) -> dict[str, Any]:
-    del max_workers, qps, timeout, retries, retry_interval
-    from api_batch import (
-        gemini_generate_request,
-        gemini_text_part,
-        gemini_user_contents,
-        run_gemini_generate_batch,
-    )
-
     evaluated_path.parent.mkdir(parents=True, exist_ok=True)
     removed = prune_incomplete_evaluations(evaluated_path)
     if removed:
@@ -945,19 +936,29 @@ async def grade_items_with_gemini(
     completed = load_completed_ids(evaluated_path)
     pending = [item for item in items if item["id"] not in completed]
     print(
-        f"[gemini-batch] judge={model_id} pending={len(pending)} "
+        f"[gemini] judge={model_id} pending={len(pending)} "
         f"completed={len(completed)} -> {evaluated_path}"
     )
     if not pending:
         return {"status": "already_done", "n_ok": 0, "n_fail": 0, "n_pending": 0}
 
-    requests: list[dict[str, Any]] = []
-    eligible: list[dict[str, Any]] = []
+    scorer = GeminiUniformityScorer(
+        model_name=model_id,
+        api_max_retries=retries,
+        api_retry_interval=retry_interval,
+        qps=qps,
+        timeout=timeout,
+        max_output_tokens=max_output_tokens,
+        thinking_level=thinking_level,
+    )
+    semaphore = asyncio.Semaphore(max_workers)
+    write_lock = asyncio.Lock()
     n_ok = 0
     n_fail = 0
     n_unparsed = 0
 
-    for item in pending:
+    async def _one(item: dict) -> None:
+        nonlocal n_ok, n_fail, n_unparsed
         answers = item.get("answers") or []
         if len(answers) <= 1:
             verdict = "Yes"
@@ -965,42 +966,26 @@ async def grade_items_with_gemini(
                 "Fewer than two extracted answer strings; treated as identical.\n"
                 "Yes"
             )
-            append_evaluated(
-                evaluated_path,
-                [evaluated_record_from_verdict(item, raw_response=raw, verdict=verdict)],
-            )
-            n_ok += 1
-            continue
+            async with write_lock:
+                append_evaluated(
+                    evaluated_path,
+                    [evaluated_record_from_verdict(item, raw_response=raw, verdict=verdict)],
+                )
+                n_ok += 1
+            return
         user_prompt = create_uniformity_user_prompt(answers)
-        requests.append(
-            gemini_generate_request(
-                key=str(item["id"]),
-                contents=gemini_user_contents(gemini_text_part(user_prompt)),
-                system_instruction=UNIFORMITY_SYSTEM_PROMPT,
-                max_output_tokens=max_output_tokens,
-                thinking_level=thinking_level,
-            )
-        )
-        eligible.append(item)
-
-    if requests:
-        texts = run_gemini_generate_batch(
-            requests,
-            model=model_id,
-            work_dir=evaluated_path.parent / "gemini-batch",
-            display_name="answer-variety",
-            poll_interval_s=poll_interval_s,
-        )
-        for item in eligible:
-            raw = texts.get(str(item["id"]))
-            if not raw:
-                n_fail += 1
-                print(f"[gemini] failed {item['id']}: missing batch result")
-                continue
-            verdict = parse_uniformity_verdict(raw)
-            if verdict is None:
-                n_unparsed += 1
-                print(f"[gemini] unparsed verdict for {item['id']}: {raw[:180]!r}")
+        try:
+            async with semaphore:
+                raw = await scorer.call(item["id"], user_prompt)
+        except Exception as exc:  # noqa: BLE001
+            n_fail += 1
+            print(f"[gemini] failed {item['id']}: {exc}")
+            return
+        verdict = parse_uniformity_verdict(raw)
+        if verdict is None:
+            n_unparsed += 1
+            print(f"[gemini] unparsed verdict for {item['id']}: {raw[:180]!r}")
+        async with write_lock:
             append_evaluated(
                 evaluated_path,
                 [evaluated_record_from_verdict(item, raw_response=raw, verdict=verdict)],
@@ -1009,6 +994,7 @@ async def grade_items_with_gemini(
             if n_ok % 10 == 0 or n_ok == len(pending):
                 print(f"[gemini] scored {n_ok}/{len(pending)}")
 
+    await asyncio.gather(*[_one(item) for item in pending])
     return {
         "status": "ok",
         "n_ok": n_ok,
