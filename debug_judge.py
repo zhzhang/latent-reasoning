@@ -110,7 +110,7 @@ def _load_cases(
     model_label: str,
     max_cases: int,
 ) -> list[dict]:
-    from grader import select_grade_question_ids
+    from mmar_common import select_grade_question_ids
 
     pred_path = run_dir / "models" / model_label / "predictions.jsonl"
     if not pred_path.is_file():

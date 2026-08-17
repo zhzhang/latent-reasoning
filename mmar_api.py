@@ -15,6 +15,7 @@ from typing import Any
 from mmar_common import (
     ensure_judge_schema,
     recompute_multi_judge_scores,
+    select_grade_question_ids,
     write_jsonl,
 )
 
@@ -506,7 +507,6 @@ async def grade_pack_with_api_judge(
         compose_judge_key,
         require_audio_nongold_judge,
         resolve_grade_audio_path,
-        select_grade_question_ids,
         _grade_reuse_key,
         _record_needs_grade,
         _shot_needs_grade,

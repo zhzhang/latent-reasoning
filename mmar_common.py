@@ -91,6 +91,55 @@ def load_question_ids_csv(path: Path | str) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+# Fixed shuffle for ``n_questions`` grading. Not a kwarg at call sites: larger
+# N continues down this same permutation (N=10 is a prefix of N=50).
+GRADE_SAMPLE_SEED = 0
+
+
+def shuffled_question_ids(
+    ids: list[str] | tuple[str, ...],
+    *,
+    seed: int = GRADE_SAMPLE_SEED,
+) -> list[str]:
+    """Unique ids, sorted then shuffled.
+
+    The permutation is keyed only by:
+    - the unique stripped non-empty id strings (input order is ignored)
+    - ``seed`` (default ``GRADE_SAMPLE_SEED`` = 0)
+
+    Sorting first makes the permutation independent of file order, so every
+    model that shares the same id set samples the same questions.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw in ids:
+        qid = str(raw or "").strip()
+        if not qid or qid in seen:
+            continue
+        seen.add(qid)
+        unique.append(qid)
+    unique.sort()
+    rng = random.Random(seed)
+    rng.shuffle(unique)
+    return unique
+
+
+def select_grade_question_ids(
+    ids: list[str] | tuple[str, ...],
+    n_questions: int | None,
+    *,
+    seed: int = GRADE_SAMPLE_SEED,
+) -> list[str] | None:
+    """First ``n_questions`` ids in the fixed shuffled order, or ``None`` for all.
+
+    ``n_questions`` None or < 0 grades every question. Larger N is a prefix of
+    the same shuffle.
+    """
+    if n_questions is None or int(n_questions) < 0:
+        return None
+    return shuffled_question_ids(ids, seed=seed)[: int(n_questions)]
+
+
 def resolve_path(data_root, value):
     path = Path(value)
     if path.is_absolute():

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import random
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ from mmar_common import (
     judge_label,
     parse_freeform_output,
     recompute_multi_judge_scores,
+    select_grade_question_ids,
     split_last_think_close,
     write_jsonl,
 )
@@ -117,9 +117,6 @@ ROUND_ROBIN_SUITE: tuple[str, ...] = (
 GRADE_PROMPT_NAMES = ("permissive", "neutral")
 DEFAULT_GRADE_PROMPT = "permissive"
 DEFAULT_INCLUDE_GOLD = True
-# Fixed shuffle for ``n_questions`` sampling. Not a kwarg: larger N continues
-# down this same permutation (N=10 is a prefix of N=50).
-GRADE_SAMPLE_SEED = 0
 
 _GRADE_MECHANICAL = (
     "You are grading a free-form answer to an audio understanding or reasoning question."
@@ -331,40 +328,6 @@ def resolve_grade_judge_key(
 
 def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
     return (0,) if first_shot_only else None
-
-
-def shuffled_question_ids(ids: list[str] | tuple[str, ...]) -> list[str]:
-    """Unique ids, sorted then shuffled with ``GRADE_SAMPLE_SEED``.
-
-    Sorting first makes the permutation independent of file order, so every
-    model in a run samples the same questions.
-    """
-    unique: list[str] = []
-    seen: set[str] = set()
-    for raw in ids:
-        qid = str(raw or "").strip()
-        if not qid or qid in seen:
-            continue
-        seen.add(qid)
-        unique.append(qid)
-    unique.sort()
-    rng = random.Random(GRADE_SAMPLE_SEED)
-    rng.shuffle(unique)
-    return unique
-
-
-def select_grade_question_ids(
-    ids: list[str] | tuple[str, ...],
-    n_questions: int | None,
-) -> list[str] | None:
-    """First ``n_questions`` ids in the fixed shuffled order, or ``None`` for all.
-
-    ``n_questions`` None or < 0 grades every question. Larger N is a prefix of
-    the same shuffle.
-    """
-    if n_questions is None or int(n_questions) < 0:
-        return None
-    return shuffled_question_ids(ids)[: int(n_questions)]
 
 
 def build_grade_instructions(
@@ -1168,7 +1131,7 @@ def grade_predictions_file(
     rewriting ``predictions.jsonl`` (safe for concurrent round-robin judges).
     ``make_primary`` False keeps each record's existing ``primary_judge``.
     ``n_questions`` grades a prefix of the fixed shuffled id list (see
-    ``GRADE_SAMPLE_SEED``); None or < 0 grades every question.
+    ``mmar_common.GRADE_SAMPLE_SEED``); None or < 0 grades every question.
     Duplicate model answers (lowercase, stripped) reuse an existing verdict
     for the same question and gold, including shots already graded for this
     judge when ``force`` is False.

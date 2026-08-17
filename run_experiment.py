@@ -1744,7 +1744,7 @@ def main(
         first_shot_only: Grade ``shot_index == 0`` only.
         make_primary: Promote this judge to primary (default keeps existing).
         n_questions: Grade only the first N questions in the fixed shuffled
-            order (seed is hardcoded in ``grader.GRADE_SAMPLE_SEED``). Omit
+            order (seed is hardcoded in ``mmar_common.GRADE_SAMPLE_SEED``). Omit
             or pass a negative value to grade all. Larger N continues down
             the same list.
     """
