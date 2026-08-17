@@ -161,28 +161,55 @@ question is selected.
 ## Judge the freeform 5-shot pack
 
 `run_judges.py` grades `outputs/mmar-freeform-5-shot` (from
-`collate_mmar_freeform.py`). Shots that already have a verdict for the same
-judge key (model + prompt + gold/nongold) are skipped. Pass `--force` to
-replace existing verdicts.
+`collate_mmar_freeform.py`). With no `--judge-model-id`, every suite model
+grades every other pack model's shots. Pass ids to run only those judges.
+Shots that already have a verdict for the same judge key are skipped. Pass
+`--force` to replace existing verdicts.
+
+vLLM suite / dedicated judges run on Modal (this script starts a detached
+App). API judges (`gpt-audio-mini`, `gemini-3.7-flash`; aliases
+`gemini-3.7-mini`, `gemini`, or `api` for both) run locally against the
+same pack and do not start Modal. Empty `--judge-model-id` stays
+suite-only so a bare run does not spend API quota. API judges skip their own pack label (round-robin).
+Audio is attached only with `--no-include-gold`; the gold path is text-only.
 
 ```bash
-# Seed the judge weights first if needed
+# Seed judge weights first if needed
 uv run modal run seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
-# Add a text judge; keep the existing primary for difficulty ranking
-uv run modal run --detach run_judges.py \
+# All suite judges
+uv run run_judges.py
+
+# Only these suite judges
+uv run run_judges.py \
+  --judge-model-id qwen3-omni-instruct,phi-4-multimodal
+
+# Dedicated text judge
+uv run run_judges.py \
   --judge-model-id qwen3.6-35b-a3b-fp8
 
-# Promote the new judge to primary
-uv run modal run --detach run_judges.py \
+# Promote the first selected judge to primary
+uv run run_judges.py \
   --judge-model-id Qwen/Qwen3.6-35B-A3B-FP8 \
   --make-primary
 
 # Replace existing verdicts for this judge
-uv run modal run --detach run_judges.py \
+uv run run_judges.py \
   --judge-model-id qwen3.6-35b-a3b-fp8 \
   --force
+
+# API judges (local; needs OPENAI_API_KEY / GEMINI_API_KEY)
+uv run run_judges.py \
+  --judge-model-id gpt-audio-mini,gemini-3.7-flash
+uv run run_judges.py --judge-model-id api --no-include-gold
+
+# Mixed: API locally while Modal vLLM runs detached
+uv run run_judges.py \
+  --judge-model-id gpt-audio-mini,qwen3-omni-instruct
 ```
+
+API path knobs: `--qps` (default 4), `--max-workers` (8), `--timeout`
+(180s), `--retries` (20).
 
 ## Tune a judge engine
 

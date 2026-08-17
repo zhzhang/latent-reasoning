@@ -266,6 +266,8 @@ QUESTION_KEYS = (
     "answer",
     "choices",
     "audio_path",
+    "url",
+    "source",
     "modality",
     "category",
     "sub-category",
@@ -280,6 +282,15 @@ SHOT_KEYS = (
     "model_output",
     "thinking_prediction",
     "correct",
+)
+JUDGE_ENTRY_KEYS = (
+    "correct",
+    "verdict",
+    "output",
+    "generation",
+    "model_id",
+    "prompt",
+    "include_gold",
 )
 
 CONFIG: dict[str, Any] = {}
@@ -445,19 +456,260 @@ def _shot_index(shot: dict[str, Any]) -> int:
         return 0
 
 
-def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
-    out = {key: shot.get(key) for key in SHOT_KEYS if key in shot}
-    out["shot_index"] = _shot_index(shot)
+def _compact_judge_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    out = {key: entry.get(key) for key in JUDGE_ENTRY_KEYS if key in entry}
+    if "correct" not in out and entry.get("correct") is not None:
+        out["correct"] = entry.get("correct")
+    if "verdict" not in out and out.get("correct") is not None:
+        out["verdict"] = "pass" if out.get("correct") else "fail"
     return out
 
 
-def _shot_success(record: dict[str, Any]) -> tuple[float | None, int | None, int]:
+def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
+    out = {key: shot.get(key) for key in SHOT_KEYS if key in shot}
+    out["shot_index"] = _shot_index(shot)
+    judges = shot.get("judges")
+    if isinstance(judges, dict) and judges:
+        compacted: dict[str, dict[str, Any]] = {}
+        for key, entry in judges.items():
+            compact = _compact_judge_entry(entry)
+            if compact is not None:
+                compacted[str(key)] = compact
+        if compacted:
+            out["judges"] = compacted
+    return out
+
+
+def _resolve_judge_key(
+    wanted: str | None,
+    available: list[str] | tuple[str, ...] | set[str],
+) -> str | None:
+    """Map a bare judge label onto a composite ``label__prompt__gold`` key.
+
+    Manifest ``primary_judge`` is sometimes the model slug (``gpt-audio-mini``)
+    while shot verdicts are stored under ``gpt-audio-mini__permissive__nongold``.
+    """
+    keys = [str(key) for key in available if key]
+    if not wanted:
+        return None
+    wanted_s = str(wanted)
+    if wanted_s in keys:
+        return wanted_s
+    prefix = wanted_s + "__"
+    matches = [key for key in keys if key.startswith(prefix)]
+    if matches:
+        return matches[0]
+    return wanted_s
+
+
+def _shot_judge_entry(shot: dict[str, Any], judge_key: str | None) -> dict[str, Any] | None:
+    judges = shot.get("judges") or {}
+    if not judge_key or not isinstance(judges, dict):
+        return None
+    entry = judges.get(judge_key)
+    if isinstance(entry, dict):
+        return entry
+    resolved = _resolve_judge_key(judge_key, judges.keys())
+    entry = judges.get(resolved) if resolved else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _shot_correct(shot: dict[str, Any], judge_key: str | None = None) -> bool | None:
+    if judge_key:
+        entry = _shot_judge_entry(shot, judge_key)
+        if isinstance(entry, dict) and "correct" in entry:
+            value = entry.get("correct")
+            if value is None:
+                return None
+            return bool(value)
+        return None
+    value = shot.get("correct")
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _shot_disagreement(shot: dict[str, Any]) -> float | None:
+    """1 - max(pass rate, fail rate) across judges on one generation.
+
+    Unanimous pass or fail is 0. A 50/50 split is 0.5. Shots with no
+    scored judges return None.
+    """
+    judges = shot.get("judges")
+    if not isinstance(judges, dict) or not judges:
+        return None
+    n_pass = 0
+    n = 0
+    for entry in judges.values():
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("correct")
+        if value is None:
+            continue
+        n += 1
+        if value:
+            n_pass += 1
+    if n == 0:
+        return None
+    pct_pass = n_pass / n
+    return 1.0 - max(pct_pass, 1.0 - pct_pass)
+
+
+def _mean_disagreement(records: list[dict[str, Any]]) -> float | None:
+    """Average ``_shot_disagreement`` over every graded generation."""
+    values: list[float] = []
+    for record in records:
+        for shot in record.get("shots") or []:
+            value = _shot_disagreement(shot)
+            if value is not None:
+                values.append(value)
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _judge_stats(
+    shots: list[dict[str, Any]],
+    judge_key: str,
+    stored: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    stored = stored or {}
+    shot_keys = [
+        key
+        for shot in shots
+        for key in (shot.get("judges") or {})
+    ]
+    resolved = _resolve_judge_key(judge_key, list(stored) + shot_keys) or judge_key
+    row = stored.get(resolved) or stored.get(judge_key) or {}
+    n_correct = row.get("n_shot_correct")
+    rate = row.get("shot_success_rate")
+    n_shots = row.get("n_shots")
+    if n_correct is None or rate is None:
+        scored = [_shot_correct(shot, resolved) for shot in shots]
+        present = [value for value in scored if value is not None]
+        n_shots = len(present)
+        n_correct = sum(1 for value in present if value) if present else None
+        rate = (n_correct / n_shots) if n_shots and n_correct is not None else None
+    try:
+        rate_f = float(rate) if rate is not None else None
+    except (TypeError, ValueError):
+        rate_f = None
+    try:
+        n_correct_i = int(n_correct) if n_correct is not None else None
+    except (TypeError, ValueError):
+        n_correct_i = None
+    try:
+        n_shots_i = int(n_shots) if n_shots is not None else len(shots)
+    except (TypeError, ValueError):
+        n_shots_i = len(shots)
+    return {
+        "shot_success_rate": rate_f,
+        "n_shot_correct": n_correct_i,
+        "n_shots": n_shots_i,
+    }
+
+
+def _pack_judge_entries(
+    manifest: dict[str, Any],
+    predictions: dict[str, dict[str, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    shot_keys: set[str] = set()
+    primary = manifest.get("primary_judge")
+    flagged_primary: str | None = None
+
+    def _add(
+        label: str,
+        *,
+        model_id: Any = None,
+        prompt: Any = None,
+        include_gold: Any = None,
+        is_primary: bool = False,
+    ) -> None:
+        key = str(label or "")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        entry = {
+            "label": key,
+            "model_id": model_id,
+            "prompt": prompt,
+            "include_gold": include_gold,
+            "primary": bool(is_primary) or key == primary,
+        }
+        entries.append(entry)
+
+    for raw in manifest.get("judges") or []:
+        if isinstance(raw, dict) and raw.get("label"):
+            label = str(raw["label"])
+            if raw.get("primary") and not flagged_primary:
+                flagged_primary = label
+            _add(
+                label,
+                model_id=raw.get("model_id"),
+                prompt=raw.get("prompt"),
+                include_gold=raw.get("include_gold"),
+                is_primary=bool(raw.get("primary")),
+            )
+        elif raw:
+            _add(str(raw))
+
+    for by_id in predictions.values():
+        for record in by_id.values():
+            for shot in record.get("shots") or []:
+                for label, entry in (shot.get("judges") or {}).items():
+                    shot_keys.add(str(label))
+                    extra = entry if isinstance(entry, dict) else {}
+                    _add(
+                        str(label),
+                        model_id=extra.get("model_id"),
+                        prompt=extra.get("prompt"),
+                        include_gold=extra.get("include_gold"),
+                    )
+
+    for by_id in predictions.values():
+        for record in by_id.values():
+            for label in record.get("judges") or []:
+                key = str(label)
+                # Skip record-level slugs that never appear on shots when a
+                # composite ``slug__prompt__gold`` key already exists.
+                if key not in shot_keys and any(
+                    existing.startswith(key + "__") for existing in shot_keys
+                ):
+                    continue
+                _add(key)
+
+    if str(primary or "") not in seen:
+        if flagged_primary and flagged_primary in seen:
+            primary = flagged_primary
+        else:
+            resolved = _resolve_judge_key(primary, seen)
+            primary = resolved if resolved in seen else (entries[0]["label"] if entries else None)
+    if not primary and entries:
+        primary = entries[0]["label"]
+    for entry in entries:
+        entry["primary"] = entry["label"] == primary
+    if primary:
+        entries.sort(key=lambda row: (0 if row["label"] == primary else 1, row["label"]))
+    return entries, str(primary) if primary else None
+
+
+def _shot_success(
+    record: dict[str, Any],
+    judge_key: str | None = None,
+) -> tuple[float | None, int | None, int]:
     shots = list(record.get("shots") or [])
     n_shots = len(shots)
+    if judge_key:
+        stats = _judge_stats(shots, judge_key, record.get("per_judge") or {})
+        return stats["shot_success_rate"], stats["n_shot_correct"], stats["n_shots"] or n_shots
     n_correct = record.get("n_shot_correct")
     rate = record.get("shot_success_rate")
     if n_correct is None and shots:
-        n_correct = sum(1 for shot in shots if shot.get("correct") is True)
+        n_correct = sum(1 for shot in shots if _shot_correct(shot) is True)
     if rate is None and n_shots:
         n_correct_i = int(n_correct or 0)
         rate = n_correct_i / n_shots
@@ -564,6 +816,19 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
             shots = [_compact_shot(shot) for shot in (record.get("shots") or [])]
             shots.sort(key=_shot_index)
             rate, n_correct, n_shots = _shot_success({**record, "shots": shots})
+            judge_keys = [
+                str(x)
+                for x in (record.get("judges") or [])
+                if x
+            ]
+            for shot in shots:
+                for key in (shot.get("judges") or {}):
+                    if key not in judge_keys:
+                        judge_keys.append(key)
+            stored_per_judge = record.get("per_judge") or {}
+            per_judge = {
+                key: _judge_stats(shots, key, stored_per_judge) for key in judge_keys
+            }
             by_id[qid] = {
                 **_question_fields(record),
                 "model": label,
@@ -571,9 +836,14 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "n_shots": n_shots or record.get("n_shots") or len(shots),
                 "n_shot_correct": n_correct,
                 "shot_success_rate": rate,
+                "judges": judge_keys,
+                "primary_judge": record.get("primary_judge"),
+                "per_judge": per_judge,
                 "shots": shots,
             }
         predictions[label] = by_id
+
+    judge_entries, primary_judge = _pack_judge_entries(manifest, predictions)
 
     preferred_ids = [str(qid) for qid in (ids_payload.get("ids") or []) if qid]
     seen: set[str] = set(preferred_ids)
@@ -609,13 +879,34 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "shot_success_rate": rate,
                 "n_shot_correct": record.get("n_shot_correct"),
                 "n_shots": record.get("n_shots"),
+                "per_judge": record.get("per_judge") or {},
             }
         if sample is None:
             continue
         avg = sum(rates) / len(rates) if rates else None
+        present_records = [
+            predictions[label][qid]
+            for label in model_labels
+            if predictions[label].get(qid) is not None
+        ]
+        avg_disagreement = _mean_disagreement(present_records)
         complete = n_present >= len(model_labels) and len(model_labels) > 0
         if complete:
             n_complete += 1
+        has_grades = False
+        for label in model_labels:
+            record = predictions[label].get(qid)
+            if record is None:
+                continue
+            for shot in record.get("shots") or []:
+                for entry in (shot.get("judges") or {}).values():
+                    if isinstance(entry, dict) and entry.get("correct") is not None:
+                        has_grades = True
+                        break
+                if has_grades:
+                    break
+            if has_grades:
+                break
         modality = str(sample.get("modality") or "")
         if modality:
             modalities.add(modality)
@@ -625,6 +916,8 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
             "answer": sample.get("answer") or "",
             "choices": sample.get("choices") or [],
             "audio_path": sample.get("audio_path"),
+            "url": sample.get("url") or "",
+            "source": sample.get("source") or "",
             "modality": modality,
             "category": sample.get("category") or "",
             "sub-category": sample.get("sub-category") or "",
@@ -633,9 +926,11 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
             "rubric": sample.get("rubric") or "",
             "cue": sample.get("cue") or "",
             "avg_success_rate": avg,
+            "avg_disagreement": avg_disagreement,
             "n_models": n_present,
             "n_models_total": len(model_labels),
             "complete": complete,
+            "has_grades": has_grades,
             "per_model": per_model,
         }
         questions.append(
@@ -645,9 +940,11 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "modality": modality,
                 "category": row["category"],
                 "avg_success_rate": avg,
+                "avg_disagreement": avg_disagreement,
                 "n_models": n_present,
                 "n_models_total": len(model_labels),
                 "complete": complete,
+                "has_grades": has_grades,
                 "per_model": per_model,
             }
         )
@@ -687,7 +984,10 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
         "n_shots": int(manifest.get("n_shots") or ids_payload.get("n_shots") or 5),
         "coverage": coverage,
         "n_complete": n_complete,
+        "n_graded": sum(1 for row in questions if row.get("has_grades")),
         "n_questions": len(questions),
+        "judges": judge_entries,
+        "primary_judge": primary_judge,
     }
 
 
@@ -837,6 +1137,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #f2f6f9; padding: 0.55rem 0.65rem; border-radius: 8px;
   }
   audio { width: 100%; margin-top: 0.5rem; }
+  .audio-source {
+    margin: 0.3rem 0 0;
+    font-size: 0.75rem;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .audio-source a { color: var(--accent); }
   .mode-badge {
     display: inline-flex; align-items: center; gap: 0.35rem;
     font-family: "IBM Plex Mono", monospace;
@@ -936,8 +1243,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .vg-cell.pass { background: var(--good); }
   .vg-cell.fail { background: var(--bad); }
+  .vg-cell.mixed {
+    background: linear-gradient(135deg, var(--good) 49%, var(--bad) 51%);
+  }
   .vg-cell.pending { background: #d5dde3; border-color: var(--line); }
   .vg-cell.missing { background: transparent; border: 1px dashed var(--line); }
+  .judge-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.25rem 0 0.15rem; }
+  .judge-rationale { margin-top: 0.35rem; }
   .header-right {
     display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end;
   }
@@ -1051,6 +1363,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <label>Modality
         <select id="modality"><option value="">All</option></select>
       </label>
+      <label>Sort
+        <select id="sort">
+          <option value="success">Success (low → high)</option>
+          <option value="disagreement">Disagreement (high → low)</option>
+        </select>
+      </label>
+      <label>&nbsp;
+        <button id="filter-graded" type="button">Graded only</button>
+      </label>
       <label>&nbsp;
         <button id="filter-incomplete" type="button">Incomplete only</button>
       </label>
@@ -1093,9 +1414,13 @@ const state = {
   coverage: [],
   nShots: 5,
   nComplete: 0,
+  nGraded: 0,
   selectedId: null,
   filterIncomplete: false,
+  filterGraded: false,
   sampling: null,
+  judges: [],
+  primaryJudge: null,
 };
 
 async function api(path) {
@@ -1130,6 +1455,119 @@ function fmtRate(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return "—";
   return (100 * n).toFixed(1) + "%";
+}
+
+function fmtDisagree(v) {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(2);
+}
+
+function questionDisagree(row) {
+  const v = row && row.avg_disagreement;
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function prettyJudge(key) {
+  if (!key) return "judge";
+  const parts = String(key).split("__");
+  if (parts.length >= 3) {
+    const gold = parts[parts.length - 1] === "nongold" ? "no gold" : parts[parts.length - 1];
+    const prompt = parts[parts.length - 2];
+    const label = parts.slice(0, -2).join("__");
+    return `${label} · ${prompt} · ${gold}`;
+  }
+  return String(key);
+}
+
+function judgeModelLabel(key) {
+  const parts = String(key || "").split("__");
+  return parts.length >= 3 ? parts.slice(0, -2).join("__") : String(key || "");
+}
+
+function shortJudge(key) {
+  return shortLabel(judgeModelLabel(key));
+}
+
+function modelJudgeStats(pm) {
+  const per = (pm && pm.per_judge) || {};
+  const rows = Object.values(per).filter(row =>
+    row && row.shot_success_rate !== null && row.shot_success_rate !== undefined
+      && Number.isFinite(Number(row.shot_success_rate))
+  );
+  if (!rows.length) return pm || {};
+  const rate = rows.reduce((sum, row) => sum + Number(row.shot_success_rate), 0) / rows.length;
+  return {
+    shot_success_rate: rate,
+    n_shot_correct: rows.reduce((sum, row) => sum + (Number(row.n_shot_correct) || 0), 0),
+    n_shots: rows.reduce((sum, row) => sum + (Number(row.n_shots) || 0), 0),
+  };
+}
+
+function questionAvg(row) {
+  const rates = (state.modelLabels || []).map(label => {
+    const pm = (row.per_model || {})[label] || {};
+    if (!pm.present) return null;
+    return modelJudgeStats(pm).shot_success_rate;
+  }).filter(v => v !== null && v !== undefined && Number.isFinite(Number(v)));
+  if (!rates.length) return null;
+  return rates.reduce((a, b) => a + Number(b), 0) / rates.length;
+}
+
+function questionHasGrades(row) {
+  if (row && row.has_grades) return true;
+  return (state.modelLabels || []).some(label => {
+    const per = ((row.per_model || {})[label] || {}).per_judge || {};
+    return Object.values(per).some(stats =>
+      stats && stats.n_shots > 0 && stats.n_shot_correct !== null && stats.n_shot_correct !== undefined
+    );
+  });
+}
+
+function shotJudgeKeys(shot) {
+  const onShot = Object.keys((shot && shot.judges) || {});
+  const ordered = (state.judges || [])
+    .map(j => j.label || j)
+    .filter(key => onShot.includes(key));
+  for (const key of onShot) {
+    if (!ordered.includes(key)) ordered.push(key);
+  }
+  return ordered;
+}
+
+function shotConsensus(shot) {
+  const keys = shotJudgeKeys(shot);
+  const verdicts = keys.map(key => {
+    const entry = (shot.judges || {})[key] || {};
+    if (entry.correct === undefined || entry.correct === null) return null;
+    return !!entry.correct;
+  }).filter(v => v !== null);
+  if (!verdicts.length) {
+    if (shot && shot.correct !== undefined && shot.correct !== null) {
+      return shot.correct ? "pass" : "fail";
+    }
+    return "pending";
+  }
+  const nPass = verdicts.filter(Boolean).length;
+  if (nPass === verdicts.length) return "pass";
+  if (nPass === 0) return "fail";
+  return "mixed";
+}
+
+function shotDisagreement(shot) {
+  const keys = shotJudgeKeys(shot);
+  const verdicts = keys.map(key => {
+    const entry = (shot.judges || {})[key] || {};
+    if (entry.correct === undefined || entry.correct === null) return null;
+    return !!entry.correct;
+  }).filter(v => v !== null);
+  if (!verdicts.length) return null;
+  const nPass = verdicts.filter(Boolean).length;
+  const pctPass = nPass / verdicts.length;
+  return 1 - Math.max(pctPass, 1 - pctPass);
 }
 
 function sourceLink(href, label) {
@@ -1241,12 +1679,32 @@ function shortLabel(label) {
 function filteredQuestions() {
   const q = (document.getElementById("search").value || "").trim().toLowerCase();
   const modality = document.getElementById("modality").value;
-  return state.questions.filter(row => {
+  const items = state.questions.filter(row => {
     if (state.filterIncomplete && row.complete) return false;
+    if (state.filterGraded && !questionHasGrades(row)) return false;
     if (modality && row.modality !== modality) return false;
     if (!q) return true;
     return String(row.id).toLowerCase().includes(q)
       || String(row.question || "").toLowerCase().includes(q);
+  });
+  const sort = (document.getElementById("sort") || {}).value || "success";
+  return items.slice().sort((a, b) => {
+    if (sort === "disagreement") {
+      const ad = questionDisagree(a);
+      const bd = questionDisagree(b);
+      if (ad === null && bd === null) return String(a.id).localeCompare(String(b.id));
+      if (ad === null) return 1;
+      if (bd === null) return -1;
+      if (ad !== bd) return bd - ad;
+      return String(a.id).localeCompare(String(b.id));
+    }
+    const ar = questionAvg(a);
+    const br = questionAvg(b);
+    if (ar === null && br === null) return String(a.id).localeCompare(String(b.id));
+    if (ar === null) return 1;
+    if (br === null) return -1;
+    if (ar !== br) return ar - br;
+    return String(a.id).localeCompare(String(b.id));
   });
 }
 
@@ -1256,6 +1714,7 @@ function renderStats() {
     `<span><strong>${items.length}</strong> shown</span>`,
     `<span>${state.questions.length} total</span>`,
     `<span>${state.nComplete} complete</span>`,
+    `<span>${state.nGraded} graded</span>`,
     `<span>${state.nShots} shots</span>`,
   ];
   for (const row of state.coverage) {
@@ -1277,13 +1736,15 @@ function renderList() {
       if (!pm.present) {
         return `<span class="chip missing" title="${escapeHtml(label)} missing">${escapeHtml(shortLabel(label))} —</span>`;
       }
-      return `<span class="chip" title="${escapeHtml(label)}">${escapeHtml(shortLabel(label))} ${fmtRate(pm.shot_success_rate)}</span>`;
+      const stats = modelJudgeStats(pm);
+      return `<span class="chip" title="${escapeHtml(label)}">${escapeHtml(shortLabel(label))} ${fmtRate(stats.shot_success_rate)}</span>`;
     }).join("");
     const active = row.id === state.selectedId ? "active" : "";
     const cover = `${row.n_models}/${row.n_models_total}`;
+    const disagreeTitle = "1 − max(percent pass, percent fail). 0 = unanimous, 0.50 = even split.";
     return `<li class="${active}" data-id="${escapeHtml(row.id)}">
       <div class="qid">${escapeHtml(row.id)}</div>
-      <div class="rate">${fmtRate(row.avg_success_rate)} avg · ${cover} models</div>
+      <div class="rate">${fmtRate(questionAvg(row))} avg · <span title="${escapeHtml(disagreeTitle)}">${fmtDisagree(questionDisagree(row))} disagree</span> · ${cover} models</div>
       <div class="mini-rates">${chips}</div>
       <p class="qtext">${escapeHtml(row.question || "")}</p>
     </li>`;
@@ -1346,16 +1807,18 @@ function renderVerdictGrid(modelLabels, predictions, nShots) {
       if (!shot) {
         return `<div class="vg-cell missing" title="${escapeHtml(label)} s${i}: missing"></div>`;
       }
-      if (shot.correct === null || shot.correct === undefined) {
+      const verdict = shotConsensus(shot);
+      if (verdict === "pending") {
         return `<div class="vg-cell pending" title="${escapeHtml(label)} s${i}: pending"></div>`;
       }
-      const ok = !!shot.correct;
-      return `<div class="vg-cell ${ok ? "pass" : "fail"}" title="${escapeHtml(label)} s${i}: ${ok ? "pass" : "fail"}"></div>`;
+      const disagree = shotDisagreement(shot);
+      const extra = disagree === null ? "" : ` · disagree ${fmtDisagree(disagree)}`;
+      return `<div class="vg-cell ${verdict}" title="${escapeHtml(label)} s${i}: ${verdict}${extra}"></div>`;
     }).join("");
     return `<div class="vg-model">${escapeHtml(label)}</div>${cells}`;
   }).join("");
   return `<div class="verdict-grid-wrap">
-    <div class="vg-title">Verdict grid · model × shot</div>
+    <div class="vg-title">Verdict grid · all judges · model × shot</div>
     <div class="verdict-grid" style="grid-template-columns: max-content repeat(${shotsN}, 1.15rem)">
       <div class="vg-corner"></div>
       ${shotHeaders}
@@ -1364,24 +1827,57 @@ function renderVerdictGrid(modelLabels, predictions, nShots) {
   </div>`;
 }
 
+function shotJudgeChips(shot) {
+  const keys = shotJudgeKeys(shot);
+  if (!keys.length) {
+    return `<div class="judge-chips"><span class="chip">pending</span></div>`;
+  }
+  return `<div class="judge-chips">${keys.map(key => {
+    const entry = (shot.judges || {})[key] || {};
+    const pending = entry.correct === null || entry.correct === undefined;
+    const klass = pending ? "chip" : (entry.correct ? "pass" : "fail");
+    const text = pending ? "pending" : (entry.correct ? "pass" : "fail");
+    return `<span class="${klass}" title="${escapeHtml(prettyJudge(key))}">${escapeHtml(shortJudge(key))}: ${text}</span>`;
+  }).join("")}</div>`;
+}
+
+function shotJudgeAccordions(shot) {
+  return shotJudgeKeys(shot).map(key => {
+    const entry = (shot.judges || {})[key] || {};
+    const text = entry.generation || entry.output || "";
+    if (!text) return "";
+    return `<details class="accordion judge-rationale">
+      <summary><span>Judge ${escapeHtml(prettyJudge(key))}</span></summary>
+      <div class="accordion-body"><pre>${escapeHtml(text)}</pre></div>
+    </details>`;
+  }).join("");
+}
+
 function shotBlock(shot) {
-  const pending = shot.correct === null || shot.correct === undefined;
-  const verdict = pending
-    ? `<span class="chip">pending</span>`
-    : `<span class="${shot.correct ? "pass" : "fail"}">${shot.correct ? "pass" : "fail"}</span>`;
-  const think = shot.thinking_prediction && shot.thinking_prediction !== shot.model_output
+  const parsed = shot.answer_prediction || "";
+  const thinkingSource = (
+    shot.thinking_prediction && shot.thinking_prediction !== parsed
+      ? shot.thinking_prediction
+      : (shot.model_output && shot.model_output !== parsed ? shot.model_output : "")
+  );
+  const think = thinkingSource
     ? `<details class="accordion"><summary><span>Thinking</span></summary>
-        <div class="accordion-body"><pre>${escapeHtml(shot.thinking_prediction)}</pre></div>
+        <div class="accordion-body"><pre>${escapeHtml(thinkingSource)}</pre></div>
        </details>`
     : "";
+  const disagree = shotDisagreement(shot);
+  const disagreeChip = disagree === null
+    ? ""
+    : `<span class="chip" title="1 − max(percent pass, percent fail)">${fmtDisagree(disagree)} disagree</span>`;
   return `<div class="shot">
     <div class="shot-head">
       <span>shot ${shot.shot_index ?? "—"}</span>
-      ${verdict}
-      <span class="muted">parsed: ${escapeHtml(shot.answer_prediction || "")}</span>
+      ${disagreeChip}
     </div>
-    <pre>${escapeHtml(shot.model_output || "")}</pre>
+    ${shotJudgeChips(shot)}
+    ${parsed ? `<pre>${escapeHtml(parsed)}</pre>` : `<p class="muted">No parsed answer.</p>`}
     ${think}
+    ${shotJudgeAccordions(shot)}
   </div>`;
 }
 
@@ -1410,7 +1906,8 @@ async function selectQuestion(id) {
       }
       const shots = (pred.shots || []).slice().sort((a, b) => (a.shot_index ?? 0) - (b.shot_index ?? 0));
       const shotsHtml = shots.map(shotBlock).join("");
-      const rateChip = `<span class="chip">${fmtRate(pm.shot_success_rate)} (${pm.n_shot_correct ?? "—"}/${pm.n_shots ?? shots.length})</span>`;
+      const stats = modelJudgeStats(pm);
+      const rateChip = `<span class="chip">${fmtRate(stats.shot_success_rate)}</span>`;
       modelsHtml += `<div class="model-block">
         <h3>${escapeHtml(label)} ${rateChip}</h3>
         ${shotsHtml || "<p class='muted'>No shots stored.</p>"}
@@ -1419,6 +1916,10 @@ async function selectQuestion(id) {
     const audio = data.audio_url
       ? `<audio controls preload="none" src="${escapeHtml(data.audio_url)}"></audio>`
       : `<p class="muted">Audio not found locally.</p>`;
+    const sourceUrl = row.url || "";
+    const audioSource = sourceUrl
+      ? `<p class="audio-source"><a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(sourceUrl)}</a></p>`
+      : "";
     const cover = `${row.n_models ?? "—"}/${row.n_models_total ?? labels.length} models`;
     detail.innerHTML = `
       <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
@@ -1427,9 +1928,10 @@ async function selectQuestion(id) {
         ${row.complete ? "" : `<span class="chip missing">${escapeHtml(cover)}</span>`}
       </div>
       <h3 style="margin:0.4rem 0 0.2rem;font-family:Space Grotesk,sans-serif">${escapeHtml(row.question || "")}</h3>
-      <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")} · avg ${fmtRate(row.avg_success_rate)} · ${escapeHtml(cover)}</p>
+      <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")} · avg ${fmtRate(questionAvg(row))} · disagree ${fmtDisagree(questionDisagree(row))} · ${escapeHtml(cover)}</p>
       ${renderVerdictGrid(labels, data.predictions || {}, nShots)}
       ${audio}
+      ${audioSource}
       ${renderPromptAccordion(data.prompts)}
       <div class="choice-box hidden-from-model">
         <strong>Choices</strong>
@@ -1455,11 +1957,16 @@ async function init() {
   state.coverage = data.coverage || [];
   state.nShots = data.n_shots || 5;
   state.nComplete = data.n_complete || 0;
+  state.nGraded = data.n_graded || state.questions.filter(questionHasGrades).length;
+  state.judges = data.judges || [];
+  state.primaryJudge = data.primary_judge || (state.judges[0] && state.judges[0].label) || null;
   const metaBits = [];
   if (data.n_shots) metaBits.push(`${data.n_shots} shots`);
   metaBits.push(`${state.modelLabels.length} models`);
   metaBits.push(`${state.questions.length} questions`);
   if (data.n_complete != null) metaBits.push(`${data.n_complete} with every model`);
+  if (state.nGraded) metaBits.push(`${state.nGraded} graded`);
+  if (state.judges.length) metaBits.push(`${state.judges.length} judges`);
   document.getElementById("run-meta").textContent = metaBits.join(" · ");
   const sel = document.getElementById("modality");
   sel.innerHTML = `<option value="">All</option>` + state.modalities.map(m =>
@@ -1467,10 +1974,24 @@ async function init() {
   ).join("");
   document.getElementById("search").addEventListener("input", renderList);
   sel.addEventListener("change", renderList);
+  document.getElementById("sort").addEventListener("change", renderList);
+  document.getElementById("filter-graded").addEventListener("click", () => {
+    state.filterGraded = !state.filterGraded;
+    document.getElementById("filter-graded").classList.toggle("active", state.filterGraded);
+    renderList();
+    const items = filteredQuestions();
+    if (items.length && !items.some(row => row.id === state.selectedId)) {
+      selectQuestion(items[0].id);
+    }
+  });
   document.getElementById("filter-incomplete").addEventListener("click", () => {
     state.filterIncomplete = !state.filterIncomplete;
     document.getElementById("filter-incomplete").classList.toggle("active", state.filterIncomplete);
     renderList();
+    const items = filteredQuestions();
+    if (items.length && !items.some(row => row.id === state.selectedId)) {
+      selectQuestion(items[0].id);
+    }
   });
   bindSamplingModal();
   if (!state.questions.length) {
@@ -1530,7 +2051,10 @@ class Handler(BaseHTTPRequestHandler):
                         "coverage": bundle["coverage"],
                         "n_shots": bundle["n_shots"],
                         "n_complete": bundle["n_complete"],
+                        "n_graded": bundle.get("n_graded") or 0,
                         "n_questions": bundle["n_questions"],
+                        "judges": bundle.get("judges") or [],
+                        "primary_judge": bundle.get("primary_judge"),
                     }
                 )
                 return
@@ -1569,6 +2093,8 @@ class Handler(BaseHTTPRequestHandler):
                         "model_labels": model_labels,
                         "n_shots": bundle["n_shots"],
                         "prompts": build_model_prompts(sample),
+                        "judges": bundle.get("judges") or [],
+                        "primary_judge": bundle.get("primary_judge"),
                     }
                 )
                 return

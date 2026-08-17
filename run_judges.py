@@ -1,39 +1,51 @@
-"""Judge the collated MMAR freeform 5-shot pack with a local vLLM judge.
+"""Judge the collated MMAR freeform 5-shot pack.
 
 Always reads and writes ``outputs/mmar-freeform-5-shot``. Shots that already
 have a verdict for the same judge key (model + prompt + gold/nongold) are
 skipped. Regenerates ``difficulty.jsonl`` / ``scores.json`` after grading.
 
-Prereq: seed the judge weights on the data volume, e.g.::
+vLLM suite / dedicated judges start Modal from this script. API judges
+(gpt-audio-mini, gemini-3.7-flash) run locally and never open an App.
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
-Usage::
+    # All suite judges; each grades every other pack model's 5 shots
+    uv run run_judges.py
 
-    # Add a text judge; skip shots already graded with these settings
-    uv run modal run --detach run_judges.py \\
+    # Only these judges
+    uv run run_judges.py \\
+      --judge-model-id qwen3-omni-instruct,phi-4-multimodal
+
+    # Dedicated text judge (not in the suite)
+    uv run run_judges.py \\
       --judge-model-id qwen3.6-35b-a3b-fp8
 
-    # Round-robin: each suite model grades every other model's 5 shots
-    uv run modal run --detach run_judges.py \\
-      --round-robin \\
-      --grade-prompt permissive,neutral
-
     # Audio judge, no gold (hears the clip)
-    uv run modal run --detach run_judges.py \\
+    uv run run_judges.py \\
       --judge-model-id qwen3-omni-instruct \\
       --no-include-gold
 
-    # Grade a fixed random sample (larger N continues the same shuffle)
-    uv run modal run --detach run_judges.py \\
-      --judge-model-id qwen3.6-35b-a3b-fp8 \\
-      --n-questions 32
+Local API judges::
+
+    export OPENAI_API_KEY=...
+    export GEMINI_API_KEY=...
+
+    uv run run_judges.py --judge-model-id gpt-audio-mini,gemini-3.7-flash
+    uv run run_judges.py --judge-model-id api --no-include-gold
+
+Mixed (API locally while Modal vLLM runs detached)::
+
+    uv run run_judges.py \\
+      --judge-model-id gpt-audio-mini,qwen3-omni-instruct
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
+import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +67,7 @@ PACK_NAME = "mmar-freeform-5-shot"
 LOCAL_PACK_DIR = REPO_ROOT / "outputs" / PACK_NAME
 REMOTE_PACK_DIR = RESULTS_MOUNT / PACK_NAME
 LOCAL_PACK_MOUNT = Path("/local-pack")
+INGEST_DIR_NAME = "_local_ingest"
 
 app = modal.App("run-judges")
 
@@ -74,6 +87,8 @@ def _mount_sources(image: modal.Image) -> modal.Image:
     return image.add_local_python_source(
         "modal_cache",
         "mmar_common",
+        "mmar_api",
+        "mmar_groundedness",
         "audio_flamingo_runtime",
         "aggregate",
         "grader",
@@ -235,43 +250,80 @@ def _merge_manifest_file(src: Path, dest: Path) -> None:
         "graded_at",
     )
     merged = dict(local)
-    for key in keep:
-        if prior.get(key) not in (None, [], ""):
-            merged[key] = prior[key]
+    local_judges = local.get("judges") or []
+    prior_judges = prior.get("judges") or []
+    if local_judges:
+        by_label: dict[str, dict] = {}
+        for entry in list(prior_judges) + list(local_judges):
+            if isinstance(entry, dict) and entry.get("label"):
+                by_label[str(entry["label"])] = dict(entry)
+            elif isinstance(entry, str) and entry:
+                by_label.setdefault(entry, {"label": entry})
+        ordered: list[dict] = []
+        seen: set[str] = set()
+        for source in (local_judges, prior_judges):
+            for entry in source:
+                label = (
+                    str(entry.get("label"))
+                    if isinstance(entry, dict)
+                    else str(entry)
+                )
+                if label and label not in seen and label in by_label:
+                    ordered.append(by_label[label])
+                    seen.add(label)
+        if ordered:
+            merged["judges"] = ordered
+        if not merged.get("primary_judge"):
+            merged["primary_judge"] = prior.get("primary_judge")
+        if not merged.get("grader_model_id"):
+            merged["grader_model_id"] = prior.get("grader_model_id")
+        if not merged.get("scoring"):
+            merged["scoring"] = prior.get("scoring")
+        if not merged.get("graded_at"):
+            merged["graded_at"] = prior.get("graded_at")
+    else:
+        for key in keep:
+            if prior.get(key) not in (None, [], ""):
+                merged[key] = prior[key]
     dest.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+
+
+def _merge_pack_from(src: Path, dest: Path) -> None:
+    """Merge predictions + manifest from ``src`` into ``dest``, keeping dest verdicts."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.name in {"models", INGEST_DIR_NAME}:
+            continue
+        target = dest / item.name
+        if item.name == "manifest.json" and item.is_file():
+            _merge_manifest_file(item, target)
+        elif item.is_file():
+            shutil.copy2(item, target)
+        elif item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+    local_models = src / "models"
+    if local_models.is_dir():
+        for model_dir in sorted(local_models.iterdir()):
+            if not model_dir.is_dir():
+                continue
+            dest_model = dest / "models" / model_dir.name
+            dest_model.mkdir(parents=True, exist_ok=True)
+            for child in model_dir.iterdir():
+                if child.name == "predictions.jsonl" and child.is_file():
+                    _merge_predictions_jsonl(child, dest_model / child.name)
+                elif child.is_file():
+                    shutil.copy2(child, dest_model / child.name)
+                elif child.is_dir():
+                    shutil.copytree(
+                        child, dest_model / child.name, dirs_exist_ok=True
+                    )
 
 
 def _sync_local_pack() -> Path:
     """Copy the local pack onto the results volume, keeping existing verdicts."""
     dest = _pack_dir()
     if LOCAL_PACK_MOUNT.is_dir():
-        dest.mkdir(parents=True, exist_ok=True)
-        for item in LOCAL_PACK_MOUNT.iterdir():
-            if item.name == "models":
-                continue
-            target = dest / item.name
-            if item.name == "manifest.json" and item.is_file():
-                _merge_manifest_file(item, target)
-            elif item.is_file():
-                shutil.copy2(item, target)
-            elif item.is_dir():
-                shutil.copytree(item, target, dirs_exist_ok=True)
-        local_models = LOCAL_PACK_MOUNT / "models"
-        if local_models.is_dir():
-            for model_dir in sorted(local_models.iterdir()):
-                if not model_dir.is_dir():
-                    continue
-                dest_model = dest / "models" / model_dir.name
-                dest_model.mkdir(parents=True, exist_ok=True)
-                for child in model_dir.iterdir():
-                    if child.name == "predictions.jsonl" and child.is_file():
-                        _merge_predictions_jsonl(child, dest_model / child.name)
-                    elif child.is_file():
-                        shutil.copy2(child, dest_model / child.name)
-                    elif child.is_dir():
-                        shutil.copytree(
-                            child, dest_model / child.name, dirs_exist_ok=True
-                        )
+        _merge_pack_from(LOCAL_PACK_MOUNT, dest)
         results_volume.commit()
         print(f"[run-judges] synced {LOCAL_PACK_MOUNT} -> {dest}")
     if not dest.is_dir() or not (dest / "manifest.json").is_file():
@@ -340,6 +392,7 @@ def _merge_judge_manifest(
     judge_key: str,
     primary: str,
     make_primary: bool = False,
+    update_primary: bool = True,
     prompt: str | None = None,
     include_gold: bool | None = None,
 ) -> dict:
@@ -377,13 +430,86 @@ def _merge_judge_manifest(
     for item in ordered:
         item["primary"] = item.get("label") == primary
     manifest["judges"] = ordered
-    if make_primary or not existing_primary:
+    if update_primary and (make_primary or not existing_primary):
         manifest["primary_judge"] = primary
         primary_entry = next((e for e in ordered if e.get("label") == primary), None)
         manifest["grader_model_id"] = (primary_entry or {}).get("model_id") or model_id
     manifest["scoring"] = manifest.get("scoring") or "qwen_freeform_judge"
     manifest["graded_at"] = datetime.now(timezone.utc).isoformat()
     return manifest
+
+
+def _csv_parts(raw: str) -> list[str]:
+    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
+
+
+def _as_suite_judge(raw: str) -> str | None:
+    from grader import ROUND_ROBIN_SUITE, resolve_judge_model_id, _suite_label_for
+
+    for candidate in (raw.strip(), resolve_judge_model_id(raw)):
+        if not candidate:
+            continue
+        if candidate in ROUND_ROBIN_SUITE:
+            return candidate
+        label = _suite_label_for(candidate)
+        if label in ROUND_ROBIN_SUITE:
+            return label
+    return None
+
+
+def _select_judges(
+    judge_model_id: str,
+) -> tuple[list[str], list[dict], list[str], str | None]:
+    """Suite labels, dedicated text judges, API labels, and the first requested.
+
+    Empty ``judge_model_id`` means the full vLLM suite (no API judges).
+    """
+    from grader import ROUND_ROBIN_SUITE, resolve_judge_model_id
+    from mmar_api import expand_api_judge_token
+
+    requested = _csv_parts(judge_model_id)
+    if not requested:
+        suite = list(ROUND_ROBIN_SUITE)
+        return suite, [], [], suite[0] if suite else None
+
+    suite: list[str] = []
+    dedicated: list[dict] = []
+    api: list[str] = []
+    seen: set[str] = set()
+    first: str | None = None
+
+    def _note(label: str) -> None:
+        nonlocal first
+        if first is None:
+            first = label
+
+    for item in requested:
+        api_labels = expand_api_judge_token(item)
+        if api_labels is not None:
+            for label in api_labels:
+                if label not in seen:
+                    api.append(label)
+                    seen.add(label)
+                    _note(label)
+            continue
+        suite_label = _as_suite_judge(item)
+        if suite_label:
+            if suite_label not in seen:
+                suite.append(suite_label)
+                seen.add(suite_label)
+                _note(suite_label)
+            continue
+        model_id = resolve_judge_model_id(item)
+        key = judge_label(model_id)
+        if not key:
+            raise SystemExit(f"Invalid --judge-model-id: {item!r}")
+        if key not in seen:
+            dedicated.append({"model_id": model_id, "label": key})
+            seen.add(key)
+            _note(key)
+    if not suite and not dedicated and not api:
+        raise SystemExit("No judges resolved from --judge-model-id")
+    return suite, dedicated, api, first
 
 
 @app.function(
@@ -395,11 +521,8 @@ def prepare_judges(
     judge_model_id: str = "",
     make_primary: bool = False,
     models: str = "all",
-    round_robin: bool = False,
 ) -> dict:
-    """Validate the pack is freeform and resolve model labels / primary."""
-    from grader import ROUND_ROBIN_SUITE, resolve_judge_model_id
-
+    """Validate the pack is freeform and resolve gradees / judges."""
     volume.reload()
     results_volume.reload()
     pack_dir = _sync_local_pack()
@@ -422,7 +545,7 @@ def prepare_judges(
         local_labels = {p.name for p in local_models.iterdir() if p.is_dir()}
         labels = [label for label in labels if label in local_labels]
     if models and models.strip().lower() != "all":
-        requested = [part.strip() for part in models.split(",") if part.strip()]
+        requested = _csv_parts(models)
         missing = [label for label in requested if label not in labels]
         if missing:
             raise SystemExit(
@@ -433,50 +556,21 @@ def prepare_judges(
     if not labels:
         raise SystemExit(f"No model predictions found under {pack_dir / 'models'}")
 
-    if round_robin:
-        suite = [label for label in ROUND_ROBIN_SUITE if label in labels]
-        if models and models.strip().lower() != "all":
-            suite = [label for label in labels if label in ROUND_ROBIN_SUITE]
-        if len(suite) < 2:
-            raise SystemExit(
-                f"Round-robin needs at least two suite models in the pack; found {suite}. "
-                f"Available: {labels}"
-            )
-        return {
-            "pack": PACK_NAME,
-            "mode": mode,
-            "round_robin": True,
-            "judge_model_id": None,
-            "judge_label": None,
-            "primary_judge": existing_primary,
-            "make_primary": make_primary,
-            "model_labels": suite,
-            "existing_judges": [
-                (e.get("label") if isinstance(e, dict) else e)
-                for e in (manifest.get("judges") or [])
-            ],
-            "existing_primary": existing_primary,
-        }
-
-    if not judge_model_id or not str(judge_model_id).strip():
-        raise SystemExit("--judge-model-id is required unless --round-robin is set")
-
-    judge_model_id = resolve_judge_model_id(judge_model_id)
-    judge_key = judge_label(judge_model_id)
-    if not judge_key:
-        raise SystemExit(f"Invalid judge_model_id: {judge_model_id!r}")
-
+    suite_judges, dedicated_judges, api_judges, first_new = _select_judges(
+        judge_model_id
+    )
     if make_primary:
-        primary = judge_key
+        primary = first_new
     else:
-        primary = existing_primary or judge_key
+        primary = existing_primary or first_new
 
     return {
         "pack": PACK_NAME,
         "mode": mode,
-        "round_robin": False,
-        "judge_model_id": judge_model_id,
-        "judge_label": judge_key,
+        "suite_judges": suite_judges,
+        "dedicated_judges": dedicated_judges,
+        "api_judges": api_judges,
+        "first_new": first_new,
         "primary_judge": primary,
         "make_primary": make_primary,
         "model_labels": labels,
@@ -796,11 +890,21 @@ def merge_round_robin(
     timeout=30 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
 )
-def run_aggregate() -> dict:
+def ingest_local_pack() -> dict:
+    """Merge a local-entrypoint upload of API verdicts into the volume pack."""
     results_volume.reload()
-    pack_dir = _pack_dir()
-    if not pack_dir.is_dir():
-        raise SystemExit(f"Pack not found: {pack_dir}")
+    dest = _pack_dir()
+    src = dest / INGEST_DIR_NAME
+    if not src.is_dir():
+        return {"status": "missing", "pack": PACK_NAME}
+    _merge_pack_from(src, dest)
+    shutil.rmtree(src, ignore_errors=True)
+    results_volume.commit()
+    print(f"[run-judges] ingested local pack -> {dest}")
+    return {"status": "ok", "pack": PACK_NAME}
+
+
+def _aggregate_pack(pack_dir: Path) -> dict:
     result = aggregate_difficulty(pack_dir)
     manifest = _load_manifest(pack_dir)
     scores = result.get("scores") or {}
@@ -816,8 +920,22 @@ def run_aggregate() -> dict:
         scores["primary_judge"] = manifest["primary_judge"]
     write_json(pack_dir / "scores.json", scores)
     result["scores"] = scores
-    results_volume.commit()
     print("Aggregated:", scores)
+    return result
+
+
+@app.function(
+    image=cpu_image,
+    timeout=30 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+)
+def run_aggregate() -> dict:
+    results_volume.reload()
+    pack_dir = _pack_dir()
+    if not pack_dir.is_dir():
+        raise SystemExit(f"Pack not found: {pack_dir}")
+    result = _aggregate_pack(pack_dir)
+    results_volume.commit()
     return result
 
 
@@ -828,159 +946,502 @@ def _download_pack() -> None:
     print(f"[run-judges] downloaded pack -> {saved}")
 
 
-@app.local_entrypoint()
-def main(
+def _require_local_pack() -> Path:
+    if not LOCAL_PACK_DIR.is_dir() or not (LOCAL_PACK_DIR / "manifest.json").is_file():
+        raise SystemExit(
+            f"Pack not found at {LOCAL_PACK_DIR}. "
+            "Run collate_mmar_freeform.py first."
+        )
+    return LOCAL_PACK_DIR
+
+
+def _local_model_labels(models: str) -> list[str]:
+    pack_dir = _require_local_pack()
+    manifest = _load_manifest(pack_dir)
+    _assert_freeform_run(manifest)
+    labels = discover_model_labels(pack_dir, manifest=manifest)
+    if models and models.strip().lower() != "all":
+        requested = _csv_parts(models)
+        missing = [label for label in requested if label not in labels]
+        if missing:
+            raise SystemExit(
+                f"Requested model(s) not found under {pack_dir / 'models'}: {missing}. "
+                f"Available: {labels}"
+            )
+        labels = requested
+    if not labels:
+        raise SystemExit(f"No model predictions found under {pack_dir / 'models'}")
+    return labels
+
+
+def _upload_local_ingest(pack_dir: Path) -> None:
+    """Upload current local predictions/manifest for ingest after GPU workers finish.
+
+    ``add_local_dir`` is snapshotted when the first remote function runs, so API
+    verdicts written later must be pushed onto the volume separately.
+    """
+    prefix = f"/{PACK_NAME}/{INGEST_DIR_NAME}"
+    uploads: list[tuple[str, str]] = []
+    manifest = pack_dir / "manifest.json"
+    if manifest.is_file():
+        uploads.append((str(manifest), f"{prefix}/manifest.json"))
+    models = pack_dir / "models"
+    if models.is_dir():
+        for model_dir in sorted(models.iterdir()):
+            pred = model_dir / "predictions.jsonl"
+            if model_dir.is_dir() and pred.is_file():
+                uploads.append(
+                    (str(pred), f"{prefix}/models/{model_dir.name}/predictions.jsonl")
+                )
+    if not uploads:
+        return
+    with results_volume.batch_upload(force=True) as batch:
+        for local_path, remote_path in uploads:
+            batch.put_file(local_path, remote_path)
+    print(f"[run-judges] uploaded {len(uploads)} files -> {prefix}")
+
+
+def _merge_api_manifest(
+    pack_dir: Path,
+    api_results: list[dict],
+    *,
+    make_primary: bool,
+    primary_judge: str | None,
+    update_primary: bool,
+) -> dict:
+    manifest = _load_manifest(pack_dir)
+    _assert_freeform_run(manifest)
+    for index, result in enumerate(api_results):
+        manifest = _merge_judge_manifest(
+            manifest,
+            model_id=str(result.get("model_id") or ""),
+            judge_key=str(result.get("judge_key") or ""),
+            primary=primary_judge or manifest.get("primary_judge") or "",
+            make_primary=bool(make_primary) and index == 0,
+            update_primary=update_primary and index == 0,
+            prompt=result.get("prompt"),
+            include_gold=result.get("include_gold"),
+        )
+    write_json(pack_dir / "manifest.json", manifest)
+    return manifest
+
+
+def _spawn_remote_judges(
+    *,
+    suite: list[str],
+    dedicated: list[dict],
+    gradees: list[str],
+    prompts: list[str],
+    grade_prompt: str,
+    include_gold: bool,
+    force: bool,
+    batch_size: int | None,
+    n_questions: int | None,
+    primary_judge: str,
+    dedicated_make_primary: bool,
+) -> tuple[list[tuple[str, object]], list[tuple[dict, object]]]:
+    suite_handles: list[tuple[str, object]] = []
+    for label in suite:
+        fn = _SUITE_GRADE_FNS.get(label)
+        if fn is None:
+            raise SystemExit(f"No GPU worker for suite judge {label!r}")
+        print(f"[run-judges] spawning suite judge {label}")
+        suite_handles.append(
+            (
+                label,
+                fn.spawn(
+                    label,
+                    model_labels=gradees,
+                    grade_prompt=",".join(prompts),
+                    include_gold=include_gold,
+                    force=force,
+                    batch_size=batch_size,
+                    n_questions=n_questions,
+                ),
+            )
+        )
+
+    dedicated_handles: list[tuple[dict, object]] = []
+    for i, entry in enumerate(dedicated):
+        this_primary = bool(dedicated_make_primary) and i == 0
+        print(f"[run-judges] spawning dedicated judge {entry['label']}")
+        dedicated_handles.append(
+            (
+                entry,
+                grade_with_judge.spawn(
+                    judge_model_id=entry["model_id"],
+                    primary_judge=primary_judge,
+                    model_labels=gradees,
+                    batch_size=batch_size,
+                    force=force,
+                    grade_prompt=grade_prompt,
+                    include_gold=include_gold,
+                    make_primary=this_primary,
+                    n_questions=n_questions,
+                ),
+            )
+        )
+    return suite_handles, dedicated_handles
+
+
+def _collect_remote_judges(
+    suite_handles: list[tuple[str, object]],
+    dedicated_handles: list[tuple[dict, object]],
+    prompts: list[str],
+    include_gold: bool,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    from grader import compose_judge_key
+
+    grade_results: list[dict] = []
+    judge_entries: list[dict] = []
+    for label, handle in suite_handles:
+        result = handle.get()
+        grade_results.append(result)
+        print(f"Judge {label}:", result)
+        model_id = result.get("model_id") or label
+        for prompt_name in result.get("prompts") or prompts:
+            judge_entries.append(
+                {
+                    "judge_key": compose_judge_key(
+                        label,
+                        prompt=prompt_name,
+                        include_gold=include_gold,
+                    ),
+                    "model_id": model_id,
+                    "prompt": prompt_name,
+                    "include_gold": include_gold,
+                }
+            )
+
+    dedicated_grades: list[dict] = []
+    for _entry, handle in dedicated_handles:
+        grade = handle.get()
+        print("Graded:", grade)
+        dedicated_grades.append(grade)
+    return grade_results, dedicated_grades, judge_entries
+
+
+def _finish_remote_pack(
+    *,
+    suite: list[str],
+    gradees: list[str],
+    judge_entries: list[dict],
+    suite_make_primary: bool,
+    primary_judge: str | None,
+    skip_aggregate: bool,
+    ingest: bool,
+) -> tuple[dict | None, dict | None, dict | None]:
+    ingest_result = None
+    if ingest:
+        ingest_result = ingest_local_pack.remote()
+        print("Ingested local API pack:", ingest_result)
+
+    merge = None
+    if suite:
+        merge = merge_round_robin.remote(
+            model_labels=gradees,
+            judge_entries=judge_entries,
+            make_primary=suite_make_primary,
+            primary_judge=primary_judge,
+        )
+        print("Merged:", merge)
+
+    agg = None
+    if not skip_aggregate:
+        agg = run_aggregate.remote()
+        print("Aggregated:", agg)
+    return ingest_result, merge, agg
+
+
+@app.function(
+    image=cpu_image,
+    timeout=24 * 60 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+)
+def run_judges_pipeline(
     judge_model_id: str = "",
     models: str = "all",
     make_primary: bool = False,
     force: bool = False,
     batch_size: int | None = None,
     skip_aggregate: bool = False,
-    round_robin: bool = False,
     grade_prompt: str = "permissive",
     include_gold: bool = True,
     n_questions: int | None = None,
-):
-    """Judge ``outputs/mmar-freeform-5-shot`` with a dedicated or suite judge.
+    ingest_local: bool = False,
+) -> dict:
+    """Remote orchestrator so a detached App stays alive across GPU phases."""
+    from grader import parse_grade_prompt_list
 
-    Shots that already have a verdict for the same judge key are skipped
-    unless ``force`` is True.
-
-    Args:
-        judge_model_id: Hugging Face id / alias for a dedicated text judge.
-            Required unless ``round_robin``.
-        models: Comma-separated test-model labels or ``all``. Under
-            round-robin, defaults to the five-label suite intersected with
-            the pack.
-        make_primary: If True, the new judge becomes primary (affects ranking).
-            Default keeps the existing primary.
-        force: Replace existing verdicts for this judge. Default False —
-            only grade shots that lack this judge key.
-        batch_size: Shots per grader generate() call (default: per-judge spec).
-        skip_aggregate: Grade only; skip difficulty.jsonl / scores.json.
-        round_robin: Each suite model grades every other model's 5 shots.
-        grade_prompt: ``permissive``, ``neutral``, or a comma list.
-        include_gold: Insert the benchmark gold answer in the grade prompt
-            (default True). Pass ``--no-include-gold`` so an audio judge
-            hears the clip and decides without gold. Text-only judges cannot
-            run NO_GOLD.
-        n_questions: Grade only the first N questions in the fixed shuffled
-            order (seed is hardcoded in ``grader.GRADE_SAMPLE_SEED``). Omit
-            or pass a negative value to grade all. Larger N continues down
-            the same list.
-    """
-    if not round_robin and (not judge_model_id or not str(judge_model_id).strip()):
-        raise SystemExit("--judge-model-id is required unless --round-robin is set")
-    if not include_gold and not round_robin:
-        from grader import require_audio_nongold_judge
-
-        require_audio_nongold_judge(judge_model_id, include_gold=False)
-
+    if n_questions is not None and int(n_questions) < 0:
+        n_questions = None
+    prompts = parse_grade_prompt_list(grade_prompt)
     prep = prepare_judges.remote(
         judge_model_id=(judge_model_id or "").strip(),
         make_primary=make_primary,
         models=models,
-        round_robin=round_robin,
+    )
+    suite = list(prep.get("suite_judges") or [])
+    dedicated = list(prep.get("dedicated_judges") or [])
+    gradees = list(prep["model_labels"])
+    first_new = prep.get("first_new")
+    print(
+        f"[run-judges] pipeline prep primary={prep['primary_judge']} "
+        f"(existing_primary={prep['existing_primary']}) "
+        f"existing_judges={prep['existing_judges']}"
+    )
+    suite_handles, dedicated_handles = _spawn_remote_judges(
+        suite=suite,
+        dedicated=dedicated,
+        gradees=gradees,
+        prompts=prompts,
+        grade_prompt=grade_prompt,
+        include_gold=include_gold,
+        force=force,
+        batch_size=batch_size,
+        n_questions=n_questions,
+        primary_judge=prep["primary_judge"],
+        dedicated_make_primary=bool(make_primary)
+        and any(first_new == entry["label"] for entry in dedicated),
+    )
+    n_remote = len(suite_handles) + len(dedicated_handles)
+    if n_remote:
+        print(f"[run-judges] {n_remote} remote judge(s) running")
+    grade_results, dedicated_grades, judge_entries = _collect_remote_judges(
+        suite_handles, dedicated_handles, prompts, include_gold
+    )
+    _ingest, merge, agg = _finish_remote_pack(
+        suite=suite,
+        gradees=gradees,
+        judge_entries=judge_entries,
+        suite_make_primary=bool(make_primary) and first_new in suite,
+        primary_judge=prep.get("primary_judge"),
+        skip_aggregate=skip_aggregate,
+        ingest=ingest_local,
+    )
+    return {
+        "prepare": prep,
+        "grade": grade_results,
+        "dedicated": dedicated_grades,
+        "merge": merge,
+        "aggregate": agg,
+    }
+
+
+def _run_judges(
+    *,
+    judge_model_id: str = "",
+    models: str = "all",
+    make_primary: bool = False,
+    force: bool = False,
+    batch_size: int | None = None,
+    skip_aggregate: bool = False,
+    grade_prompt: str = "permissive",
+    include_gold: bool = True,
+    n_questions: int | None = None,
+    qps: float = 4.0,
+    max_workers: int = 8,
+    timeout: float = 180.0,
+    retries: int = 20,
+    retry_interval: float = 1.0,
+) -> dict:
+    from grader import compose_judge_key, parse_grade_prompt_list, require_audio_nongold_judge
+    from mmar_api import grade_pack_with_api_judges
+
+    if n_questions is not None and int(n_questions) < 0:
+        n_questions = None
+
+    suite, dedicated, api, first_new = _select_judges(judge_model_id)
+    if not include_gold:
+        if dedicated:
+            for entry in dedicated:
+                require_audio_nongold_judge(entry["model_id"], include_gold=False)
+        elif not suite and not api:
+            raise SystemExit("--no-include-gold needs an audio-capable judge")
+
+    needs_modal = bool(suite or dedicated)
+    prompts = parse_grade_prompt_list(grade_prompt)
+    pack_dir: Path | None = None
+    gradees: list[str] = []
+    existing_primary = None
+    mode = "freeform"
+    if api or not needs_modal:
+        pack_dir = _require_local_pack()
+        manifest = _load_manifest(pack_dir)
+        mode = _assert_freeform_run(manifest)
+        gradees = _local_model_labels(models)
+        existing_primary = manifest.get("primary_judge")
+    if make_primary:
+        primary = first_new
+    else:
+        primary = existing_primary or first_new
+
+    api_make_primary = bool(make_primary) and first_new in api
+
+    print(
+        f"[run-judges] pack={PACK_NAME} mode={mode} "
+        f"suite_judges={suite} dedicated_judges={[d['label'] for d in dedicated]} "
+        f"api_judges={api} gradees={gradees or '(modal)'} primary={primary} "
+        f"(existing_primary={existing_primary}) "
+        f"prompt={grade_prompt} include_gold={include_gold} "
+        f"n_questions={n_questions} force={force}"
     )
 
-    if prep.get("round_robin"):
-        from grader import compose_judge_key, parse_grade_prompt_list
+    api_results: list[dict] = []
 
-        prompts = parse_grade_prompt_list(grade_prompt)
-        suite = list(prep["model_labels"])
-        print(
-            f"[run-judges] round-robin pack={PACK_NAME} mode={prep['mode']} "
-            f"judges={suite} prompts={prompts} include_gold={include_gold} "
-            f"n_questions={n_questions} "
-            f"primary={prep['primary_judge']} force={force}"
-        )
-        handles = []
-        for judge_label in suite:
-            fn = _SUITE_GRADE_FNS.get(judge_label)
-            if fn is None:
-                raise SystemExit(f"No GPU worker for suite judge {judge_label!r}")
-            handles.append(
-                (
-                    judge_label,
-                    fn.spawn(
-                        judge_label,
-                        model_labels=suite,
-                        grade_prompt=",".join(prompts),
-                        include_gold=include_gold,
-                        force=force,
-                        batch_size=batch_size,
-                        n_questions=n_questions,
-                    ),
-                )
+    def _run_api() -> None:
+        nonlocal api_results
+        if not api:
+            return
+        if pack_dir is None:
+            raise SystemExit(
+                "API judges require a local pack at outputs/mmar-freeform-5-shot"
             )
-        grade_results = []
-        judge_entries: list[dict] = []
-        for judge_label, handle in handles:
-            result = handle.get()
-            grade_results.append(result)
-            print(f"Judge {judge_label}:", result)
-            model_id = result.get("model_id") or judge_label
-            for prompt_name in result.get("prompts") or prompts:
-                judge_entries.append(
-                    {
-                        "judge_key": compose_judge_key(
-                            judge_label,
-                            prompt=prompt_name,
-                            include_gold=include_gold,
-                        ),
-                        "model_id": model_id,
-                        "prompt": prompt_name,
-                        "include_gold": include_gold,
-                    }
-                )
-        merge = merge_round_robin.remote(
-            model_labels=suite,
-            judge_entries=judge_entries,
-            make_primary=make_primary,
-            primary_judge=prep.get("primary_judge"),
+        first_api_key = compose_judge_key(
+            api[0], prompt=prompts[0], include_gold=include_gold
         )
-        print("Merged:", merge)
-        agg = None
-        if not skip_aggregate:
-            agg = run_aggregate.remote()
-            print("Aggregated:", agg)
-        _download_pack()
+        set_primary = api_make_primary or (
+            not existing_primary and not suite and not dedicated
+        )
+        api_results = asyncio.run(
+            grade_pack_with_api_judges(
+                pack_dir,
+                labels=api,
+                model_labels=gradees,
+                prompts=prompts,
+                include_gold=include_gold,
+                force=force,
+                n_questions=n_questions,
+                make_primary=set_primary,
+                primary_judge=first_api_key if set_primary else primary,
+                qps=qps,
+                max_workers=max_workers,
+                timeout=timeout,
+                retries=retries,
+                retry_interval=retry_interval,
+            )
+        )
+        first_key = str(api_results[0].get("judge_key") or first_api_key)
+        _merge_api_manifest(
+            pack_dir,
+            api_results,
+            make_primary=set_primary,
+            primary_judge=first_key or primary,
+            update_primary=set_primary,
+        )
+
+    if not needs_modal:
+        _run_api()
+        if pack_dir is None:
+            raise SystemExit(f"Pack not found at {LOCAL_PACK_DIR}")
+        agg = None if skip_aggregate else _aggregate_pack(pack_dir)
         return {
-            "prepare": prep,
-            "grade": grade_results,
-            "merge": merge,
+            "prepare": None,
+            "grade": [],
+            "dedicated": [],
+            "api": api_results,
+            "merge": None,
             "aggregate": agg,
         }
 
-    print(
-        f"[run-judges] pack={PACK_NAME} mode={prep['mode']} "
-        f"judge={prep['judge_label']} ({prep['judge_model_id']}) "
-        f"primary={prep['primary_judge']} "
-        f"(existing_primary={prep['existing_primary']}) "
-        f"models={prep['model_labels']} "
-        f"existing_judges={prep['existing_judges']} "
-        f"prompt={grade_prompt} include_gold={include_gold} "
-        f"n_questions={n_questions} "
-        f"force={force}"
-    )
-
-    grade = grade_with_judge.remote(
-        judge_model_id=prep["judge_model_id"],
-        primary_judge=prep["primary_judge"],
-        model_labels=prep["model_labels"],
-        batch_size=batch_size,
+    run_judges_pipeline.spawn(
+        judge_model_id=(judge_model_id or "").strip(),
+        models=models,
+        make_primary=make_primary,
         force=force,
+        batch_size=batch_size,
+        skip_aggregate=skip_aggregate,
         grade_prompt=grade_prompt,
         include_gold=include_gold,
-        make_primary=make_primary,
         n_questions=n_questions,
+        ingest_local=bool(api),
     )
-    print("Graded:", grade)
+    dashboard = app.get_dashboard_url()
+    if dashboard:
+        print(f"[run-judges] Modal GPU pipeline started (detached): {dashboard}")
+    else:
+        print("[run-judges] Modal GPU pipeline started (detached)")
 
-    agg = None
-    if not skip_aggregate:
-        agg = run_aggregate.remote()
-        print("Aggregated:", agg)
+    _run_api()
+    if api and pack_dir is not None:
+        _upload_local_ingest(pack_dir)
+        ingest = ingest_local_pack.remote()
+        print("Ingested local API pack:", ingest)
+        if not skip_aggregate:
+            agg = run_aggregate.remote()
+            print("Aggregated:", agg)
 
-    _download_pack()
-    return {"prepare": prep, "grade": grade, "aggregate": agg}
+    return {
+        "detached": True,
+        "dashboard": dashboard,
+        "prepare": None,
+        "grade": [],
+        "dedicated": [],
+        "api": api_results,
+        "merge": None,
+        "aggregate": None,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--judge-model-id",
+        default="",
+        help="Comma-separated judges, or 'api' for both API judges",
+    )
+    parser.add_argument("--models", default="all")
+    parser.add_argument("--make-primary", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Shots per vLLM grader generate() call (default: per-judge spec)",
+    )
+    parser.add_argument("--skip-aggregate", action="store_true")
+    parser.add_argument("--grade-prompt", default="permissive")
+    parser.add_argument(
+        "--include-gold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--n-questions", type=int, default=None)
+    parser.add_argument("--qps", type=float, default=4.0)
+    parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--retries", type=int, default=20)
+    parser.add_argument("--retry-interval", type=float, default=1.0)
+    return parser.parse_args()
+
+
+def _run_judges_from_args(args: argparse.Namespace) -> dict:
+    return _run_judges(
+        judge_model_id=args.judge_model_id,
+        models=args.models,
+        make_primary=args.make_primary,
+        force=args.force,
+        batch_size=args.batch_size,
+        skip_aggregate=args.skip_aggregate,
+        grade_prompt=args.grade_prompt,
+        include_gold=args.include_gold,
+        n_questions=args.n_questions,
+        qps=args.qps,
+        max_workers=args.max_workers,
+        timeout=args.timeout,
+        retries=args.retries,
+        retry_interval=args.retry_interval,
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    args = parse_args()
+    suite, dedicated, _api, _first = _select_judges(args.judge_model_id)
+    if suite or dedicated:
+        with app.run(detach=True):
+            _run_judges_from_args(args)
+    else:
+        _run_judges_from_args(args)
+
+

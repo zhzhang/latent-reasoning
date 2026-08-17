@@ -24,17 +24,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import hashlib
 import json
 import logging
-import os
 import random
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mmar_api import (
+    ALL_API_LABELS,
+    API_SPECS,
+    make_api_taker,
+    parse_api_model_list,
+)
 from mmar_common import (
     aggregate_n_shot_record,
     build_mmar_freeform_prompt,
@@ -50,7 +53,6 @@ from mmar_common import (
     write_json,
     write_jsonl,
 )
-from mmar_groundedness import gemini_response_text
 from view_mmar import DEFAULT_AUDIO_DIR, DEFAULT_DATA_DIR, ensure_mmar_audio
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -62,36 +64,22 @@ DEFAULT_N_SHOTS = 5
 DEFAULT_SEED = 42
 DEFAULT_MODE = "freeform"
 
-API_SPECS: dict[str, dict[str, Any]] = {
-    "gpt-audio-mini": {
-        "model_id": "gpt-audio-mini",
-        "backend": "openai",
-        "native_thinking": False,
-        "sampling": {"temperature": 1.0, "max_tokens": 1024},
-    },
-    "gemini-3.7-flash": {
-        "model_id": "gemini-3.7-flash",
-        "backend": "gemini",
-        "native_thinking": True,
-        "sampling": {"temperature": 1.0, "max_tokens": 1024},
-    },
-}
-
-ALL_API_LABELS = tuple(API_SPECS.keys())
 logger = logging.getLogger(__name__)
 
 
-def parse_api_model_list(value: str) -> list[str]:
-    raw = [item.strip() for item in value.split(",") if item.strip()]
-    if not raw or any(item.lower() == "all" for item in raw):
-        return list(ALL_API_LABELS)
-    unknown = [item for item in raw if item not in API_SPECS]
-    if unknown:
-        raise SystemExit(
-            f"Unknown API model label(s): {unknown}. "
-            f"Choose from {list(ALL_API_LABELS)} or 'all'."
-        )
-    return raw
+def _attach_usage(shot_outputs: list[dict], record: dict) -> None:
+    shots = record.get("shots") or []
+    for shot, output in zip(shots, shot_outputs):
+        if output.get("cached_tokens") is not None:
+            shot["cached_tokens"] = output["cached_tokens"]
+        if output.get("prompt_tokens") is not None:
+            shot["prompt_tokens"] = output["prompt_tokens"]
+
+
+def _sum_usage(shot_outputs: list[dict]) -> tuple[int, int]:
+    cached = sum(int(out.get("cached_tokens") or 0) for out in shot_outputs)
+    prompt = sum(int(out.get("prompt_tokens") or 0) for out in shot_outputs)
+    return cached, prompt
 
 
 def _shot_seed(seed: int, question_id: str, shot_index: int) -> int:
@@ -180,170 +168,10 @@ def _output_from_text(raw: str, item: dict, *, mode: str, native_thinking: bool)
     }
 
 
-class OpenAIAudioTaker:
-    def __init__(
-        self,
-        *,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        qps: float,
-        timeout: float,
-        retries: int,
-        retry_interval: float,
-    ):
-        from openai import AsyncOpenAI
-
-        if not (os.environ.get("OPENAI_API_KEY") or "").strip():
-            raise SystemExit("Set OPENAI_API_KEY to call gpt-audio-mini.")
-        self.client = AsyncOpenAI()
-        self.model_id = model_id
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.retries = retries
-        self.retry_interval = retry_interval
-        self._interval = 1.0 / max(float(qps), 0.1)
-        self._next_time = 0.0
-        self._lock = asyncio.Lock()
-
-    async def _throttle(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            if now < self._next_time:
-                await asyncio.sleep(self._next_time - now)
-                now = time.monotonic()
-            self._next_time = now + self._interval
-
-    async def complete(self, prompt: str, audio_path: str, seed: int) -> str:
-        audio_b64 = base64.b64encode(Path(audio_path).read_bytes()).decode("ascii")
-        last_exc: Exception | None = None
-        for attempt in range(1, self.retries + 1):
-            try:
-                await self._throttle()
-                response = await asyncio.wait_for(
-                    self.client.chat.completions.create(
-                        model=self.model_id,
-                        modalities=["text"],
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                        seed=int(seed),
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {
-                                        "type": "input_audio",
-                                        "input_audio": {
-                                            "data": audio_b64,
-                                            "format": "wav",
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
-                    ),
-                    timeout=self.timeout,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                logger.warning("openai attempt %s failed: %s", attempt, exc)
-                await asyncio.sleep(self.retry_interval * attempt)
-                continue
-            choice = (response.choices or [None])[0]
-            text = ""
-            if choice is not None and choice.message is not None:
-                text = str(choice.message.content or "").strip()
-            if text:
-                return text
-            logger.warning("openai attempt %s empty response", attempt)
-            await asyncio.sleep(self.retry_interval)
-        raise RuntimeError(f"OpenAI retries exhausted: {last_exc}")
-
-
-class GeminiAudioTaker:
-    def __init__(
-        self,
-        *,
-        model_id: str,
-        temperature: float,
-        max_tokens: int,
-        qps: float,
-        timeout: float,
-        retries: int,
-        retry_interval: float,
-    ):
-        from google import genai
-        from google.genai import types
-
-        api_key = (
-            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-        ).strip()
-        if not api_key:
-            raise SystemExit("Set GEMINI_API_KEY or GOOGLE_API_KEY to call Gemini.")
-        self.types = types
-        self.client = genai.Client(api_key=api_key)
-        self.model_id = model_id
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.retries = retries
-        self.retry_interval = retry_interval
-        self._interval = 1.0 / max(float(qps), 0.1)
-        self._next_time = 0.0
-        self._lock = asyncio.Lock()
-
-    async def _throttle(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            if now < self._next_time:
-                await asyncio.sleep(self._next_time - now)
-                now = time.monotonic()
-            self._next_time = now + self._interval
-
-    async def complete(self, prompt: str, audio_path: str, seed: int) -> str:
-        del seed  # Gemini generate_content has no per-request seed here.
-        audio_bytes = Path(audio_path).read_bytes()
-        config = self.types.GenerateContentConfig(
-            temperature=self.temperature,
-            max_output_tokens=int(self.max_tokens),
-        )
-        last_exc: Exception | None = None
-        for attempt in range(1, self.retries + 1):
-            try:
-                await self._throttle()
-                response = await asyncio.wait_for(
-                    self.client.aio.models.generate_content(
-                        model=self.model_id,
-                        contents=[
-                            self.types.Part.from_bytes(
-                                data=audio_bytes, mime_type="audio/wav"
-                            ),
-                            prompt,
-                        ],
-                        config=config,
-                    ),
-                    timeout=self.timeout,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                logger.warning("gemini attempt %s failed: %s", attempt, exc)
-                await asyncio.sleep(self.retry_interval * attempt)
-                continue
-            text = gemini_response_text(response)
-            if text:
-                return text
-            logger.warning("gemini attempt %s empty response", attempt)
-            await asyncio.sleep(self.retry_interval)
-        raise RuntimeError(f"Gemini retries exhausted: {last_exc}")
-
-
 def _make_taker(label: str, args: argparse.Namespace):
-    spec = API_SPECS[label]
     sampling = resolve_api_sampling(label, args)
-    kwargs = dict(
-        model_id=spec["model_id"],
+    return make_api_taker(
+        label,
         temperature=float(sampling["temperature"]),
         max_tokens=int(sampling["max_tokens"]),
         qps=args.qps,
@@ -351,11 +179,6 @@ def _make_taker(label: str, args: argparse.Namespace):
         retries=args.retries,
         retry_interval=args.retry_interval,
     )
-    if spec["backend"] == "openai":
-        return OpenAIAudioTaker(**kwargs)
-    if spec["backend"] == "gemini":
-        return GeminiAudioTaker(**kwargs)
-    raise SystemExit(f"Unknown backend for {label}")
 
 
 async def _run_label(
@@ -389,40 +212,85 @@ async def _run_label(
         }
 
     taker = _make_taker(label, args)
-    semaphore = asyncio.Semaphore(args.max_workers)
+    shot_sem = asyncio.Semaphore(args.max_workers)
+    question_sem = asyncio.Semaphore(2 if args.n_shots > 1 else args.max_workers)
     write_lock = asyncio.Lock()
     written = 0
+    total_cached = 0
+    total_prompt = 0
+
+    async def _shot(
+        item: dict,
+        prompt: str,
+        shot_index: int,
+        cached_content: str | None,
+    ) -> dict:
+        seed = _shot_seed(args.seed, str(item["id"]), shot_index)
+        async with shot_sem:
+            result = await taker.complete(
+                prompt,
+                item["audio_path"],
+                seed,
+                question_id=str(item["id"]),
+                cached_content=cached_content,
+            )
+        output = _output_from_text(
+            result.text,
+            item,
+            mode=prompt_mode,
+            native_thinking=native_thinking,
+        )
+        output["cached_tokens"] = result.cached_tokens
+        output["prompt_tokens"] = result.prompt_tokens
+        return output
 
     async def _one(item: dict) -> None:
-        nonlocal written
+        nonlocal written, total_cached, total_prompt
         prompt = _build_api_prompt(item, prompt_mode)
-        shot_outputs: list[dict] = []
-        for shot_index in range(args.n_shots):
-            seed = _shot_seed(args.seed, str(item["id"]), shot_index)
-            async with semaphore:
-                text = await taker.complete(prompt, item["audio_path"], seed)
-            shot_outputs.append(
-                _output_from_text(
-                    text,
-                    item,
-                    mode=prompt_mode,
-                    native_thinking=native_thinking,
-                )
-            )
+        cache_name = None
+        async with question_sem:
+            try:
+                if args.n_shots > 1:
+                    cache_name = await taker.begin_prefix(item["audio_path"], prompt)
+                first = await _shot(item, prompt, 0, cache_name)
+                rest: list[dict] = []
+                if args.n_shots > 1:
+                    rest = list(
+                        await asyncio.gather(
+                            *(
+                                _shot(item, prompt, shot_index, cache_name)
+                                for shot_index in range(1, args.n_shots)
+                            )
+                        )
+                    )
+                shot_outputs = [first, *rest]
+            finally:
+                await taker.end_prefix(cache_name)
         record = aggregate_n_shot_record(
             item, shot_outputs, pending_grade=pending_grade
         )
+        _attach_usage(shot_outputs, record)
+        cached, prompt_tokens = _sum_usage(shot_outputs)
         async with write_lock:
             write_jsonl(predictions_path, [record], mode="a")
             written += 1
+            total_cached += cached
+            total_prompt += prompt_tokens
             if written % args.print_every == 0 or written == len(pending):
+                hit = (total_cached / total_prompt) if total_prompt else 0.0
                 print(
                     f"[{label}] {written}/{len(pending)} id={item['id']} "
-                    f"answer={record.get('answer_prediction')!r}"
+                    f"answer={record.get('answer_prediction')!r} "
+                    f"cache={total_cached}/{total_prompt} ({hit:.0%})"
                 )
 
     await asyncio.gather(*(_one(item) for item in pending))
     total = len(load_completed_ids(predictions_path) & set(question_ids))
+    hit = (total_cached / total_prompt) if total_prompt else 0.0
+    print(
+        f"[{label}] cache summary cached_tokens={total_cached} "
+        f"prompt_tokens={total_prompt} hit={hit:.1%}"
+    )
     return {
         "status": "ok",
         "model_label": label,
@@ -431,6 +299,9 @@ async def _run_label(
         "predictions_path": str(predictions_path),
         "backend": spec["backend"],
         "mode": prompt_mode,
+        "cached_tokens": total_cached,
+        "prompt_tokens": total_prompt,
+        "cache_hit_fraction": hit,
     }
 
 

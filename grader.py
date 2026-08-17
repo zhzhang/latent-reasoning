@@ -13,7 +13,9 @@ from audio_flamingo_runtime import resolve_model_dir
 from mmar_common import (
     ensure_judge_schema,
     judge_label,
+    parse_freeform_output,
     recompute_multi_judge_scores,
+    split_last_think_close,
     write_jsonl,
 )
 
@@ -498,7 +500,14 @@ def _normalize_grade_answer(text: str) -> str:
 
 
 def _shot_prediction_text(shot: dict) -> str:
-    return str(shot.get("answer_prediction") or shot.get("model_output") or "")
+    """Extracted answer shown to the judge; never includes text before last ``</think>``."""
+    raw = str(shot.get("model_output") or "")
+    extracted = str(shot.get("answer_prediction") or "")
+    source = raw if split_last_think_close(raw) is not None else (extracted or raw)
+    if split_last_think_close(source) is not None:
+        _, answer = parse_freeform_output(source)
+        return answer
+    return extracted or raw
 
 
 def _shot_judge_entry(shot: dict, judge_key: str) -> dict | None:
@@ -569,8 +578,10 @@ def judge_is_audio_model(
     model_id: str | None = None,
     handle: dict[str, Any] | None = None,
 ) -> bool:
-    """True when this judge can hear MMAR audio (suite audio models)."""
+    """True when this judge can hear MMAR audio (suite or API audio models)."""
     if handle and handle.get("suite_label"):
+        return True
+    if handle and handle.get("backend") in {"openai", "gemini"}:
         return True
     keys = [
         (handle or {}).get("suite_label"),
@@ -578,7 +589,11 @@ def judge_is_audio_model(
         (handle or {}).get("model_id"),
         model_id,
     ]
-    return any(_suite_label_for(str(key or "")) is not None for key in keys)
+    if any(_suite_label_for(str(key or "")) is not None for key in keys):
+        return True
+    from mmar_api import is_api_judge
+
+    return any(is_api_judge(str(key or "")) for key in keys if key)
 
 
 def require_audio_nongold_judge(
@@ -602,7 +617,7 @@ def require_audio_nongold_judge(
     raise SystemExit(
         "NO_GOLD / --no-include-gold grading requires an audio-capable judge "
         f"that receives the clip (got {shown!r}). Text-only judges cannot "
-        "grade without ground truth; use a suite audio model or pass "
+        "grade without ground truth; use a suite or API audio model or pass "
         "--include-gold."
     )
 
@@ -740,7 +755,7 @@ def _format_chat(
 
 
 def resolve_grade_audio_path(audio_path: str | None) -> Path | None:
-    """Resolve a prediction ``audio_path`` against the MMAR data volume."""
+    """Resolve a prediction ``audio_path`` against MMAR data (volume or local)."""
     if not audio_path:
         return None
     path = Path(str(audio_path))
@@ -756,6 +771,13 @@ def resolve_grade_audio_path(audio_path: str | None) -> Path | None:
         candidates.append(data_root / "audio" / path.name)
     except Exception:
         pass
+    repo_root = Path(__file__).resolve().parent
+    local_data = repo_root / "data" / "mmar"
+    local_audio = local_data / "audio"
+    if not path.is_absolute():
+        candidates.append(local_data / path)
+        candidates.append(repo_root / path)
+    candidates.append(local_audio / path.name)
     for candidate in candidates:
         if candidate.is_file():
             return candidate

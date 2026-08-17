@@ -35,6 +35,8 @@ ANSWER_MARKERS = (
     r"final answer[:\s]*",
 )
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+THINK_CLOSE = "</think>"
+THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +147,37 @@ def build_mmar_freeform_prompt(item, think_suffix: str | None = None):
     return prompt
 
 
+def _last_think_close_span(text: str) -> tuple[int, int] | None:
+    """Byte span of the last ``</think>`` (case-insensitive), if any."""
+    idx = text.lower().rfind(THINK_CLOSE)
+    if idx < 0:
+        return None
+    return idx, idx + len(THINK_CLOSE)
+
+
+def after_last_think_close(text: str) -> str:
+    """Drop everything through the last ``</think>``; else return ``text``."""
+    span = _last_think_close_span(text)
+    if span is None:
+        return text
+    return text[span[1] :].strip()
+
+
+def split_last_think_close(text: str) -> tuple[str, str] | None:
+    """Split on the last ``</think>``. ``None`` when the closing tag is absent."""
+    span = _last_think_close_span(text)
+    if span is None:
+        return None
+    start, end = span
+    return text[:start].strip(), text[end:].strip()
+
+
+def _strip_think_tags(text: str) -> str:
+    """Keep think-block inner text; drop leftover ``<think>`` / ``</think>`` tags."""
+    cleaned = THINK_BLOCK_RE.sub(lambda match: match.group(1), text)
+    return THINK_TAG_RE.sub("", cleaned).strip()
+
+
 def _match_choice_in_text(text, choices):
     matched = []
     for index, choice in enumerate(choices):
@@ -168,7 +201,7 @@ def _match_choice_in_text(text, choices):
 
 def parse_choice_output(raw_text, choices):
     """Split free-form model text into (thinking, answer) for MMAR choices."""
-    text = (raw_text or "").strip()
+    text = after_last_think_close((raw_text or "").strip())
     if not text:
         return "", ""
 
@@ -213,23 +246,23 @@ def parse_choice_output(raw_text, choices):
 
 
 def parse_think_tagged_output(raw_text, choices):
-    """Parse outputs that may wrap CoT in ``<think>...</think>`` tags."""
+    """Parse outputs that may wrap CoT in ``<think>...</think>`` tags.
+
+    Answer extraction never includes text before the last closing ``</think>``.
+    Existing choice / marker / last-line rules then run on the remainder.
+    """
     text = (raw_text or "").strip()
     if not text:
         return "", ""
 
-    match = THINK_BLOCK_RE.search(text)
-    if match:
-        thinking_prediction = match.group(1).strip()
-        remainder = (text[: match.start()] + text[match.end() :]).strip()
+    split = split_last_think_close(text)
+    if split is not None:
+        prefix, remainder = split
+        thinking_prediction = _strip_think_tags(prefix)
         if remainder:
             _, answer_prediction = parse_choice_output(remainder, choices)
             return thinking_prediction, answer_prediction
-        # Think block present but no trailing answer text; fall back to choice match.
-        answer_prediction = _match_choice_in_text(thinking_prediction, choices)
-        if answer_prediction:
-            return thinking_prediction, answer_prediction
-        return thinking_prediction, remainder or text
+        return thinking_prediction, ""
 
     return parse_choice_output(text, choices)
 
@@ -238,19 +271,20 @@ def parse_freeform_output(raw_text, choices=None):
     """Split free-form model text into (thinking, answer) without choice matching.
 
     ``choices`` is accepted for API compatibility with choice parsers but ignored.
+    Answer extraction never includes text before the last closing ``</think>``.
     """
     del choices  # unused — free-form answers are not constrained to options
     text = (raw_text or "").strip()
     if not text:
         return "", ""
 
-    match = THINK_BLOCK_RE.search(text)
-    if match:
-        thinking_prediction = match.group(1).strip()
-        remainder = (text[: match.start()] + text[match.end() :]).strip()
+    split = split_last_think_close(text)
+    if split is not None:
+        prefix, remainder = split
+        thinking_prediction = _strip_think_tags(prefix)
         if remainder:
             return thinking_prediction, remainder
-        return thinking_prediction, thinking_prediction
+        return thinking_prediction, ""
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for marker in ANSWER_MARKERS:
@@ -292,7 +326,7 @@ def string_match(answer, prediction, choices):
 def score_answer_prediction(item: dict, answer_prediction: str) -> bool:
     return string_match(
         item.get("answer", ""),
-        answer_prediction or "",
+        after_last_think_close(answer_prediction or ""),
         item.get("choices") or [],
     )
 
