@@ -399,7 +399,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --radius: 12px;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; min-height: 100%; }
+  html, body { margin: 0; height: 100%; }
   body {
     font-family: "IBM Plex Sans", system-ui, sans-serif;
     color: var(--ink);
@@ -407,9 +407,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       linear-gradient(160deg, #dfeaf1 0%, transparent 42%),
       linear-gradient(345deg, #cfdde6 0%, transparent 36%),
       var(--bg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
   header {
-    position: sticky; top: 0; z-index: 20;
+    flex: 0 0 auto;
+    z-index: 20;
     backdrop-filter: blur(10px);
     background: color-mix(in srgb, var(--bg) 82%, transparent);
     border-bottom: 1px solid var(--line);
@@ -433,11 +437,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center;
   }
   main {
-    max-width: 720px;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    width: 100%;
+    max-width: 1200px;
     margin: 0 auto;
     padding: 1.25rem;
     display: grid;
     gap: 1rem;
+    align-content: start;
   }
   .panel {
     background: var(--card);
@@ -445,6 +454,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: var(--radius);
     box-shadow: var(--shadow);
     padding: 1.1rem 1.2rem;
+  }
+  .stimulus {
+    position: sticky;
+    top: -1.25rem;
+    z-index: 10;
+    background: var(--card);
+    margin: 0 -1.2rem 0.85rem;
+    padding: 1.25rem 1.2rem 0.85rem;
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 10px 18px -12px rgba(20,32,42,0.28);
+  }
+  .stimulus .question {
+    margin: 0 0 0.5rem;
+  }
+  .stimulus audio {
+    width: 100%;
+    margin: 0;
   }
   .steps {
     display: flex;
@@ -466,9 +492,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .question {
     font-size: 1.15rem;
     line-height: 1.45;
-    margin: 0.35rem 0 0.75rem;
   }
-  audio { width: 100%; margin: 0.35rem 0 0.85rem; }
   .field-label {
     font-size: 0.75rem;
     letter-spacing: 0.04em;
@@ -491,12 +515,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor: pointer;
     line-height: 1.4;
   }
-  label.choice:hover, label.check:hover { background: #eef5fa; }
+  label.choice:hover { background: #eef5fa; }
   label.choice.selected {
     border-color: #8fb3c9;
     background: #e2eef6;
   }
-  label.choice input, label.check input { margin-top: 0.2rem; }
+  label.choice input { margin-top: 0.2rem; }
   .choice .title { font-weight: 500; }
   .choice .hint {
     display: block;
@@ -508,7 +532,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: "IBM Plex Mono", monospace;
     font-size: 0.9rem;
     white-space: pre-wrap;
-    word-break: break-word;
+    overflow-wrap: break-word;
+    word-break: normal;
+    flex: 1;
+    min-width: 0;
   }
   .row-actions {
     display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
@@ -535,6 +562,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-color: var(--line);
   }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.verdict {
+    display: flex;
+    gap: 0.7rem;
+    align-items: flex-start;
+    width: 100%;
+    text-align: left;
+    font-weight: 400;
+    color: var(--ink);
+    line-height: 1.4;
+    padding: 0.7rem 0.8rem;
+  }
+  button.verdict.pass {
+    background: var(--soft-good);
+    border-color: #b7dcc8;
+  }
+  button.verdict.fail {
+    background: var(--soft-bad);
+    border-color: #e3b6b6;
+  }
+  button.verdict:hover.pass { background: #cbe6d6; }
+  button.verdict:hover.fail { background: #edd0d0; }
+  .verdict-tag {
+    flex: 0 0 3.4rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 600;
+    padding-top: 0.18rem;
+  }
+  button.verdict.pass .verdict-tag { color: var(--good); }
+  button.verdict.fail .verdict-tag { color: var(--bad); }
   .status { color: var(--muted); font-size: 0.85rem; min-height: 1.2em; }
   .status.err { color: var(--bad); }
   .status.ok { color: var(--good); }
@@ -571,13 +630,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </header>
 <main>
   <section class="panel" id="quiz" hidden>
+    <div class="stimulus">
+      <div class="question" id="question"></div>
+      <audio id="player" controls preload="metadata"></audio>
+    </div>
     <div class="banner" id="banner" hidden></div>
     <div class="steps">
       <span class="step" id="step1">1 Unique or multiple</span>
       <span class="step" id="step2">2 Acceptable answers</span>
     </div>
-    <div class="question" id="question"></div>
-    <audio id="player" controls preload="metadata"></audio>
 
     <p class="field-label">This question</p>
     <div class="choices" id="cardinality">
@@ -599,7 +660,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div id="answersSection" hidden>
       <p class="field-label" style="margin-top:1rem">Which generations should a judge mark correct?</p>
-      <p class="muted" id="answersHint">Select every string that is actually correct given the audio. None is allowed.</p>
+      <p class="muted" id="answersHint">Click a generation to toggle pass or fail. Fail is the default; none passing is allowed.</p>
       <div class="choices" id="answers"></div>
     </div>
 
@@ -694,6 +755,13 @@ function syncCardinalityUi() {
   setSteps();
 }
 
+function setVerdictRow(row, pass) {
+  row.classList.toggle("pass", pass);
+  row.classList.toggle("fail", !pass);
+  const tag = row.querySelector(".verdict-tag");
+  if (tag) tag.textContent = pass ? "pass" : "fail";
+}
+
 function renderAnswers(answers, selected) {
   const root = document.getElementById("answers");
   root.innerHTML = "";
@@ -704,14 +772,23 @@ function renderAnswers(answers, selected) {
     return;
   }
   state.answers.forEach((text, i) => {
-    const label = document.createElement("label");
-    label.className = "check";
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.value = String(i);
-    input.checked = selectedSet.has(i);
-    input.addEventListener("change", () => {
-      if (input.checked) {
+    const pass = selectedSet.has(i);
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "verdict " + (pass ? "pass" : "fail");
+    row.dataset.index = String(i);
+    const tag = document.createElement("span");
+    tag.className = "verdict-tag";
+    tag.textContent = pass ? "pass" : "fail";
+    const body = document.createElement("span");
+    body.className = "answer-text";
+    body.textContent = text;
+    row.appendChild(tag);
+    row.appendChild(body);
+    row.addEventListener("click", () => {
+      const nowPass = !row.classList.contains("pass");
+      setVerdictRow(row, nowPass);
+      if (nowPass) {
         if (!state.accepted.includes(i)) state.accepted.push(i);
       } else {
         state.accepted = state.accepted.filter((x) => x !== i);
@@ -719,12 +796,7 @@ function renderAnswers(answers, selected) {
       state.accepted.sort((a, b) => a - b);
       if (state.labeled) queueAutosave();
     });
-    const body = document.createElement("span");
-    body.className = "answer-text";
-    body.textContent = text;
-    label.appendChild(input);
-    label.appendChild(body);
-    root.appendChild(label);
+    root.appendChild(row);
   });
 }
 
