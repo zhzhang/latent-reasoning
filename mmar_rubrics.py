@@ -23,8 +23,6 @@ RUBRIC_META_KEYS = ("thinking", "cue", "rubric")
 DEFAULT_MODEL_LABEL = "qwen3-omni"
 AF_NEXT_MODEL_LABEL = "af-next-think"
 DEFAULT_LIMIT = 100
-# Viewer / API composite key: "<source_run_id>::<model_label>"
-EVAL_RUN_SEP = "::"
 
 
 def load_question_ids(run_dir: Path) -> list[str]:
@@ -79,42 +77,6 @@ def discover_test_taker_labels(run_dir: Path, manifest: dict | None = None) -> l
             _add(entry.get("label"))
     _add(manifest.get("model_label"))
     return labels
-
-
-def eval_run_key(source_run_id: str, model_label: str, kind: str | None = None) -> str:
-    """Stable id for one (source run, test-taker[, kind]) eval in the viewer."""
-    base = f"{source_run_id}{EVAL_RUN_SEP}{model_label}"
-    extra = str(kind or "").strip()
-    if extra and extra != "rubrics":
-        return f"{base}{EVAL_RUN_SEP}{extra}"
-    return base
-
-
-def parse_eval_run_key(key: str, *, default_model: str = DEFAULT_MODEL_LABEL) -> tuple[str, str]:
-    """Split a viewer run id into ``(source_run_id, model_label)``.
-
-    Bare source-run ids (legacy bookmarks) keep the default test-taker.
-    A trailing kind (e.g. ``::groundedness``) is ignored here; use
-    ``parse_eval_run_parts`` when the kind is needed.
-    """
-    source_run_id, model_label, _kind = parse_eval_run_parts(
-        key, default_model=default_model
-    )
-    return source_run_id, model_label
-
-
-def parse_eval_run_parts(
-    key: str, *, default_model: str = DEFAULT_MODEL_LABEL
-) -> tuple[str, str, str]:
-    """Split a viewer run id into ``(source_run_id, model_label, kind)``."""
-    text = str(key or "").strip()
-    parts = [part.strip() for part in text.split(EVAL_RUN_SEP)]
-    parts = [part for part in parts if part]
-    if len(parts) >= 3:
-        return parts[0], parts[1], parts[2]
-    if len(parts) == 2:
-        return parts[0], parts[1], "rubrics"
-    return text, default_model, "rubrics"
 
 
 def load_predictions_by_id(predictions_path: Path) -> dict[str, dict]:

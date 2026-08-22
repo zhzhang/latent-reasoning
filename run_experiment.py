@@ -52,7 +52,7 @@ Usage:
       --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni
     uv run modal run --detach run_experiment.py \\
       --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni \\
-      --mode freeform --n-shots 5 --num-samples -1 --source-run-id none \\
+      --mode freeform --n-shots 3 --num-samples -1 --source-run-id none \\
       --question-ids-csv answer-variety/open_ended_question_ids.csv
     # Resume after a crash (reuse question set; skip finished models /
     # already-written questions):

@@ -11,7 +11,7 @@ Usage::
     uv run python run_experiment_api.py \\
       --models gpt-audio-mini,gemini-3.7-flash \\
       --mode freeform \\
-      --n-shots 5 \\
+      --n-shots 3 \\
       --question-ids-csv answer-variety/open_ended_question_ids.csv
 
     # Full-MMAR native MCQ sanity check (1 greedy pass; Gemini keeps T=1.0)
@@ -60,7 +60,7 @@ API_EXPERIMENT = "exp-mmar-question-difficulty-api"
 DEFAULT_RESULTS_DIR = REPO_ROOT / "outputs"
 DEFAULT_META = DEFAULT_DATA_DIR / "MMAR-meta.jsonl"
 DEFAULT_IDS_CSV = REPO_ROOT / "answer-variety" / "open_ended_question_ids.csv"
-DEFAULT_N_SHOTS = 5
+DEFAULT_N_SHOTS = 3
 DEFAULT_SEED = 42
 DEFAULT_MODE = "freeform"
 

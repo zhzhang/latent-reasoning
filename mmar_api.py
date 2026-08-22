@@ -89,6 +89,20 @@ def _gemini_usage(response: Any) -> tuple[int | None, int | None]:
     return cached_tokens, prompt_tokens
 
 
+def gemini_response_text(response: Any) -> str:
+    text = getattr(response, "text", None)
+    if text:
+        return str(text).strip()
+    parts: list[str] = []
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            piece = getattr(part, "text", None)
+            if piece:
+                parts.append(str(piece))
+    return "\n".join(parts).strip()
+
+
 def parse_api_model_list(value: str) -> list[str]:
     raw = [item.strip() for item in value.split(",") if item.strip()]
     if not raw or any(item.lower() == "all" for item in raw):
@@ -369,8 +383,6 @@ class GeminiAudioTaker:
         cached_content: str | None = None,
         prompt_cache_key: str | None = None,
     ) -> CompletionResult:
-        from mmar_groundedness import gemini_response_text
-
         del seed, question_id, prompt_cache_key
         if cached_content:
             contents: list[Any] = [prompt]

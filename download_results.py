@@ -14,11 +14,6 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       manifest.json
       judges/<judge>/models/<label>/predictions.evaluated.jsonl
     # Local API rubrics live under outputs/exp-mmar-rubrics-api/ (not on volume)
-    exp-mmar-groundedness/<run_id>/          # run_groundedness_eval.py (Qwen3-Omni)
-      question_ids.json
-      manifest.json
-      judges/<judge>/models/<label>/predictions.evaluated.jsonl
-    # Local Gemini groundedness lives under outputs/exp-mmar-groundedness-api/
     mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
       predictions.evaluated.jsonl    # OpenAI rubric grades

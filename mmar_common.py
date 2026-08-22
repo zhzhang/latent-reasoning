@@ -187,9 +187,9 @@ def build_mmar_freeform_prompt(item, think_suffix: str | None = None):
     """Prompt the model with the question only (no multiple-choice options)."""
     question = str(item["question"]).strip()
     prompt = (
-        f"{question}\n"
         "Listen to the audio and answer the question. "
-        "Give a concise final answer."
+        "Reason briefly, then give a concise final answer.\n"
+        f"This question is: {question}\n"
     )
     if think_suffix:
         prompt += f"\n{think_suffix}"

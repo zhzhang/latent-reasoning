@@ -88,7 +88,6 @@ def _mount_sources(image: modal.Image) -> modal.Image:
         "modal_cache",
         "mmar_common",
         "mmar_api",
-        "mmar_groundedness",
         "audio_flamingo_runtime",
         "aggregate",
         "grader",

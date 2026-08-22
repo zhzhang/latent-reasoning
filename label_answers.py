@@ -23,6 +23,7 @@ import csv
 import json
 import mimetypes
 import random
+import re
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,9 +32,10 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from collate_mmar_freeform import DEFAULT_OUT_DIR
-from mmar_common import load_question_ids_csv, write_json
+from mmar_common import load_jsonl, load_question_ids_csv, write_json
 from view_mmar import (
     DEFAULT_AUDIO_DIR,
+    DEFAULT_DATA_DIR,
     LABEL_ORDER,
     ensure_mmar_audio,
     load_pack,
@@ -45,9 +47,14 @@ OPEN_ENDED_IDS_PATH = PACKAGE_DIR / "open_ended_question_ids.csv"
 SAMPLE_IDS_PATH = PACKAGE_DIR / "label_sample_question_ids.csv"
 SAMPLE_JSON_PATH = PACKAGE_DIR / "label_sample.json"
 DEFAULT_LABELS_DIR = REPO_ROOT / "outputs" / "answer-labels"
+DEFAULT_META = DEFAULT_DATA_DIR / "MMAR-meta.jsonl"
 
 SAMPLE_N = 100
 SAMPLE_SEED = 42
+CLIP_ID_RE = re.compile(
+    r"^(?P<video>.+)_(?P<start>\d{2}-\d{2}-\d{2})_(?P<end>\d{2}-\d{2}-\d{2})"
+    r"(?:_combined)?$"
+)
 
 CONFIG: dict[str, Any] = {}
 STATE_LOCK = threading.Lock()
@@ -77,6 +84,132 @@ def write_id_csv(path: Path, ids: list[str]) -> Path:
 
 def unique_answer_key(text: str) -> str:
     return " ".join(str(text or "").split())
+
+
+def _hms_to_seconds(hms: str) -> int:
+    hours, minutes, seconds = (int(part) for part in hms.split("-"))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def parse_clip_id(qid: str) -> tuple[str, int | None, int | None]:
+    match = CLIP_ID_RE.match(str(qid or "").strip())
+    if not match:
+        return str(qid or "").strip(), None, None
+    return (
+        match.group("video"),
+        _hms_to_seconds(match.group("start")),
+        _hms_to_seconds(match.group("end")),
+    )
+
+
+def youtube_video_id(url: str, fallback: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return fallback
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if "youtu.be" in host:
+        return parsed.path.strip("/").split("/")[0] or fallback
+    if "youtube.com" in host:
+        query = parse_qs(parsed.query)
+        if query.get("v"):
+            return str(query["v"][0])
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts and parts[0] in {"shorts", "embed", "live", "v"} and len(parts) > 1:
+            return parts[1]
+        if parts:
+            return parts[-1]
+    return fallback
+
+
+def timestamped_source_url(qid: str, source: str, url: str) -> str | None:
+    video, start, _end = parse_clip_id(qid)
+    source_l = str(source or "").strip().lower()
+    raw = str(url or "").strip()
+    is_bili = (
+        source_l == "bilibili"
+        or video.startswith("BV")
+        or "bilibili.com" in raw
+    )
+    if is_bili:
+        href = f"https://www.bilibili.com/video/{video}" if video.startswith("BV") else raw
+        if not href:
+            return None
+        if start:
+            href += f"?t={start}"
+        return href
+    yt_id = youtube_video_id(raw, video)
+    if not yt_id:
+        return raw or None
+    href = f"https://www.youtube.com/watch?v={yt_id}"
+    if start:
+        href += f"&t={start}s"
+    return href
+
+
+def format_timestamp(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def spoiler_from_row(qid: str, row: dict[str, Any]) -> dict[str, Any]:
+    source = str(row.get("source") or "").strip()
+    url = str(row.get("url") or "").strip()
+    video, start, end = parse_clip_id(qid)
+    return {
+        "id": qid,
+        "choices": [str(choice) for choice in (row.get("choices") or [])],
+        "answer": str(row.get("answer") or "").strip(),
+        "source": source,
+        "source_url": timestamped_source_url(qid, source, url),
+        "start_seconds": start,
+        "end_seconds": end,
+        "start_label": format_timestamp(start),
+        "end_label": format_timestamp(end),
+        "video_id": video,
+    }
+
+
+def load_spoilers(
+    ids: list[str],
+    *,
+    meta_path: Path,
+    pack_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    wanted = set(ids)
+    found: dict[str, dict[str, Any]] = {}
+
+    def ingest(row: dict[str, Any]) -> None:
+        qid = str(row.get("id") or "")
+        if qid and qid in wanted and qid not in found:
+            found[qid] = spoiler_from_row(qid, row)
+
+    if meta_path.is_file():
+        for row in load_jsonl(meta_path):
+            ingest(row)
+            if len(found) >= len(wanted):
+                break
+    if len(found) < len(wanted) and pack_dir.is_dir():
+        models = pack_dir / "models"
+        if models.is_dir():
+            for child in sorted(models.iterdir()):
+                pred = child / "predictions.jsonl"
+                if not pred.is_file():
+                    continue
+                for row in load_jsonl(pred):
+                    ingest(row)
+                    if len(found) >= len(wanted):
+                        break
+                if len(found) >= len(wanted):
+                    break
+    for qid in ids:
+        found.setdefault(qid, spoiler_from_row(qid, {}))
+    return found
 
 
 def ordered_model_labels(labels: list[str]) -> list[str]:
@@ -297,7 +430,33 @@ def session_snapshot() -> dict:
     }
 
 
-def saved_public(record: dict) -> dict:
+def normalize_note(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def normalize_generation_notes(item: dict, raw: Any) -> dict[str, str]:
+    n = len(item["answers"])
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        entries = raw.items()
+    elif isinstance(raw, list):
+        entries = enumerate(raw)
+    else:
+        return {}
+    for key, value in entries:
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= n:
+            continue
+        text = normalize_note(value)
+        if text:
+            out[str(index)] = text
+    return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
+
+
+def saved_public(record: dict, item: dict) -> dict:
     cardinality = str(record.get("answer_cardinality") or "").strip()
     if cardinality not in {"unique", "multiple"}:
         cardinality = ""
@@ -311,6 +470,10 @@ def saved_public(record: dict) -> dict:
         "answer_cardinality": cardinality,
         "accepted_answer_indices": indices,
         "accepted_answers": answers,
+        "note": normalize_note(record.get("note")),
+        "generation_notes": normalize_generation_notes(
+            item, record.get("generation_notes")
+        ),
         "timestamp": record.get("timestamp"),
     }
 
@@ -324,7 +487,7 @@ def question_payload(index: int) -> dict:
     is_labeled = qid in CONFIG["labeled_ids"]
     saved = None
     if is_labeled:
-        saved = saved_public(CONFIG["labels_by_id"][qid])
+        saved = saved_public(CONFIG["labels_by_id"][qid], item)
     include_answers = bool(
         saved and saved.get("answer_cardinality") == "multiple"
     )
@@ -611,6 +774,146 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--muted);
   }
   .muted { color: var(--muted); font-size: 0.9rem; }
+  label.field {
+    display: grid;
+    gap: 0.3rem;
+    margin-top: 1rem;
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  textarea, input[type="text"] {
+    font: inherit;
+    font-size: 0.92rem;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--ink);
+    width: 100%;
+    border: 1px solid var(--line);
+    background: #fff;
+    border-radius: 8px;
+    padding: 0.45rem 0.65rem;
+  }
+  textarea {
+    min-height: 4.2rem;
+    resize: vertical;
+    line-height: 1.4;
+  }
+  .generation {
+    display: grid;
+    gap: 0.35rem;
+  }
+  .gen-note {
+    font-size: 0.88rem;
+  }
+  .spoiler-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem 0.9rem;
+    align-items: center;
+    margin: 0.85rem 0 0.75rem;
+    padding: 0.7rem 0.8rem;
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+    background: #f7f4ee;
+  }
+  .spoiler-row .warn {
+    flex: 1;
+    min-width: 16rem;
+    margin: 0;
+    font-size: 0.88rem;
+    color: #6b4a1a;
+    line-height: 1.35;
+  }
+  .modal {
+    position: fixed; inset: 0; z-index: 40;
+    display: none; align-items: start; justify-content: center;
+    padding: 4.5rem 1rem 1.5rem;
+  }
+  .modal.open { display: flex; }
+  .modal-backdrop {
+    position: absolute; inset: 0;
+    background: rgba(20, 32, 42, 0.38);
+    backdrop-filter: blur(4px);
+  }
+  .modal-card {
+    position: relative; z-index: 1;
+    width: min(640px, 100%);
+    max-height: calc(100vh - 6rem);
+    overflow: auto;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .modal-head {
+    position: sticky; top: 0;
+    display: flex; align-items: start; justify-content: space-between;
+    gap: 1rem; padding: 1rem 1.15rem;
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  .modal-head h2 {
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 1.15rem; font-weight: 600; letter-spacing: -0.03em;
+    margin: 0 0 0.2rem;
+  }
+  .modal-head p { margin: 0; color: var(--muted); font-size: 0.85rem; }
+  .modal-close {
+    font: inherit; cursor: pointer;
+    background: transparent; border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.25rem 0.55rem; color: var(--muted);
+  }
+  .modal-body { padding: 1rem 1.15rem 1.2rem; display: grid; gap: 0.85rem; }
+  .modal-body h3 {
+    margin: 0 0 0.4rem;
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .gold-box {
+    background: var(--soft-good);
+    border: 1px solid #b7dcc8;
+    border-radius: 10px;
+    padding: 0.75rem 0.85rem;
+  }
+  .gold-box .gold {
+    font-size: 1.05rem;
+    font-weight: 500;
+  }
+  .choice-list {
+    display: grid;
+    gap: 0.35rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .choice-list li {
+    display: flex;
+    gap: 0.55rem;
+    align-items: flex-start;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fff;
+  }
+  .choice-list li.gold {
+    background: var(--soft-good);
+    border-color: #b7dcc8;
+  }
+  .choice-letter {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.78rem;
+    color: var(--muted);
+    flex: 0 0 1.6rem;
+  }
+  .source-link {
+    color: var(--accent);
+    word-break: break-all;
+  }
 </style>
 </head>
 <body>
@@ -660,9 +963,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div id="answersSection" hidden>
       <p class="field-label" style="margin-top:1rem">Which generations should a judge mark correct?</p>
-      <p class="muted" id="answersHint">Click a generation to toggle pass or fail. Fail is the default; none passing is allowed.</p>
+      <p class="muted" id="answersHint">Click a generation to toggle pass or fail. Fail is the default; none passing is allowed. Add an optional short note under any generation.</p>
+      <div class="spoiler-row">
+        <button type="button" class="secondary" id="spoilerBtn">Reveal MCQ, gold, and source</button>
+        <p class="warn">Only click if you have no idea what a right answer to the question might be.</p>
+      </div>
       <div class="choices" id="answers"></div>
     </div>
+
+    <label class="field">Labeler note
+      <textarea id="questionNote" placeholder="Optional note about this question…"></textarea>
+    </label>
 
     <div class="row-actions">
       <button type="button" id="primaryBtn">Save</button>
@@ -672,6 +983,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </section>
   <section class="panel empty" id="empty">Loading…</section>
 </main>
+<div id="spoilerModal" class="modal" aria-hidden="true">
+  <div class="modal-backdrop" data-close-spoiler></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="spoilerTitle">
+    <div class="modal-head">
+      <div>
+        <h2 id="spoilerTitle">Original MCQ and source</h2>
+        <p>Reference only. Use this when the audio and question are not enough.</p>
+      </div>
+      <button class="modal-close" type="button" data-close-spoiler aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body" id="spoilerBody">
+      <p class="muted">Loading…</p>
+    </div>
+  </div>
+</div>
 <script>
 const state = {
   index: 0,
@@ -681,6 +1007,8 @@ const state = {
   cardinality: null,
   accepted: [],
   answers: [],
+  note: "",
+  generationNotes: {},
   firstUnlabeled: null,
   saveTimer: null,
   suppressAutosave: false,
@@ -697,6 +1025,61 @@ async function api(path, opts) {
     throw new Error(msg);
   }
   return payload;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => {
+    return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c];
+  });
+}
+
+function closeSpoiler() {
+  const modal = document.getElementById("spoilerModal");
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function openSpoiler() {
+  const modal = document.getElementById("spoilerModal");
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function renderSpoiler(data) {
+  const labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const gold = data.answer || "";
+  const choices = data.choices || [];
+  const choiceHtml = choices.length
+    ? `<ul class="choice-list">${choices.map((text, i) => {
+        const isGold = gold && text === gold;
+        return `<li class="${isGold ? "gold" : ""}"><span class="choice-letter">(${labels[i] || i})</span><span>${escapeHtml(text)}</span></li>`;
+      }).join("")}</ul>`
+    : `<p class="muted">No MCQ choices stored.</p>`;
+  let sourceHtml = `<p class="muted">No source URL stored.</p>`;
+  if (data.source_url) {
+    const when = data.start_label
+      ? ` starting at ${escapeHtml(data.start_label)}`
+      : "";
+    const kind = data.source ? ` (${escapeHtml(data.source)}${when})` : when;
+    sourceHtml = `<p><a class="source-link" href="${escapeHtml(data.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(data.source_url)}</a>${kind}</p>`;
+  }
+  document.getElementById("spoilerBody").innerHTML =
+    `<div><h3>MCQ choices</h3>${choiceHtml}</div>` +
+    `<div class="gold-box"><h3>Ground truth</h3><div class="gold">${escapeHtml(gold) || "<span class='muted'>Not stored.</span>"}</div></div>` +
+    `<div><h3>Original video</h3>${sourceHtml}</div>`;
+}
+
+async function showSpoiler() {
+  if (!state.item) return;
+  document.getElementById("spoilerBody").innerHTML = `<p class="muted">Loading…</p>`;
+  openSpoiler();
+  try {
+    const data = await api("/api/spoiler?id=" + encodeURIComponent(state.item.id));
+    renderSpoiler(data);
+  } catch (err) {
+    document.getElementById("spoilerBody").innerHTML =
+      `<p class="muted">Failed to load reference: ${escapeHtml(String(err.message || err))}</p>`;
+  }
 }
 
 function setSteps() {
@@ -762,6 +1145,18 @@ function setVerdictRow(row, pass) {
   if (tag) tag.textContent = pass ? "pass" : "fail";
 }
 
+function collectGenerationNotes() {
+  const notes = { ...state.generationNotes };
+  document.querySelectorAll("#answers .gen-note").forEach((el) => {
+    const key = String(el.dataset.index);
+    const text = (el.value || "").trim();
+    if (text) notes[key] = text;
+    else delete notes[key];
+  });
+  state.generationNotes = notes;
+  return notes;
+}
+
 function renderAnswers(answers, selected) {
   const root = document.getElementById("answers");
   root.innerHTML = "";
@@ -773,6 +1168,8 @@ function renderAnswers(answers, selected) {
   }
   state.answers.forEach((text, i) => {
     const pass = selectedSet.has(i);
+    const wrap = document.createElement("div");
+    wrap.className = "generation";
     const row = document.createElement("button");
     row.type = "button";
     row.className = "verdict " + (pass ? "pass" : "fail");
@@ -796,7 +1193,21 @@ function renderAnswers(answers, selected) {
       state.accepted.sort((a, b) => a - b);
       if (state.labeled) queueAutosave();
     });
-    root.appendChild(row);
+    const note = document.createElement("input");
+    note.type = "text";
+    note.className = "gen-note";
+    note.dataset.index = String(i);
+    note.placeholder = "Short note (optional)";
+    note.value = state.generationNotes[String(i)] || "";
+    note.addEventListener("input", () => {
+      const textValue = (note.value || "").trim();
+      if (textValue) state.generationNotes[String(i)] = textValue;
+      else delete state.generationNotes[String(i)];
+      if (state.labeled) queueAutosave();
+    });
+    wrap.appendChild(row);
+    wrap.appendChild(note);
+    root.appendChild(wrap);
   });
 }
 
@@ -829,12 +1240,15 @@ async function loadIndex(index) {
     state.saveTimer = null;
   }
   setStatus("");
+  closeSpoiler();
   const data = await api("/api/question?index=" + encodeURIComponent(index));
   state.index = data.item.index;
   state.item = data.item;
   state.labeled = !!data.is_labeled;
   state.cardinality = (data.saved && data.saved.answer_cardinality) || null;
   state.accepted = (data.saved && data.saved.accepted_answer_indices) || [];
+  state.note = (data.saved && data.saved.note) || "";
+  state.generationNotes = { ...((data.saved && data.saved.generation_notes) || {}) };
   state.answers = data.item.answers || [];
 
   document.getElementById("quiz").hidden = false;
@@ -852,6 +1266,7 @@ async function loadIndex(index) {
   }
 
   state.suppressAutosave = true;
+  document.getElementById("questionNote").value = state.note;
   if (state.cardinality === "multiple") {
     const answers = await ensureAnswersLoaded();
     renderAnswers(answers, state.accepted);
@@ -877,6 +1292,8 @@ async function saveLabel({ quiet, advance } = {}) {
         id: state.item.id,
         answer_cardinality: state.cardinality,
         accepted_answer_indices: state.cardinality === "multiple" ? state.accepted : [],
+        note: (document.getElementById("questionNote").value || "").trim(),
+        generation_notes: collectGenerationNotes(),
       }),
     });
     state.labeled = true;
@@ -908,6 +1325,16 @@ function queueAutosave() {
 document.querySelectorAll('input[name="cardinality"]').forEach((el) => {
   el.addEventListener("change", () => onCardinality(el.value));
 });
+document.getElementById("questionNote").addEventListener("input", () => {
+  state.note = document.getElementById("questionNote").value;
+  if (state.labeled) queueAutosave();
+});
+document.getElementById("spoilerBtn").addEventListener("click", () => {
+  showSpoiler();
+});
+document.querySelectorAll("[data-close-spoiler]").forEach((el) => {
+  el.addEventListener("click", () => closeSpoiler());
+});
 document.getElementById("primaryBtn").onclick = () => {
   const advance = !state.labeled;
   saveLabel({ advance });
@@ -921,6 +1348,10 @@ function goNext() {
 document.getElementById("prevBtn").onclick = () => goPrev();
 document.getElementById("nextBtn").onclick = () => goNext();
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeSpoiler();
+    return;
+  }
   if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
     return;
   }
@@ -1027,6 +1458,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"id": qid, "answers": list(item["answers"])})
             return
 
+        if path == "/api/spoiler":
+            qid = str((qs.get("id") or [""])[0]).strip()
+            with STATE_LOCK:
+                if qid not in CONFIG["by_id"]:
+                    self._send_json({"error": "unknown id"}, 404)
+                    return
+                spoiler = (CONFIG.get("spoilers") or {}).get(qid) or spoiler_from_row(
+                    qid, {}
+                )
+                self._send_json(spoiler)
+            return
+
         if path.startswith("/audio/"):
             name = unquote(path[len("/audio/") :])
             if Path(name).name != name:
@@ -1071,6 +1514,10 @@ class Handler(BaseHTTPRequestHandler):
                     cardinality=cardinality,
                     raw_indices=payload.get("accepted_answer_indices"),
                 )
+                note = normalize_note(payload.get("note"))
+                generation_notes = normalize_generation_notes(
+                    item, payload.get("generation_notes")
+                )
                 updated = qid in CONFIG["labeled_ids"]
                 record = {
                     "id": qid,
@@ -1078,6 +1525,8 @@ class Handler(BaseHTTPRequestHandler):
                     "answer_cardinality": cardinality,
                     "accepted_answer_indices": indices,
                     "accepted_answers": answers,
+                    "note": note,
+                    "generation_notes": generation_notes,
                     "timestamp": utc_now(),
                 }
                 upsert_label(record)
@@ -1089,6 +1538,8 @@ class Handler(BaseHTTPRequestHandler):
                         "answer_cardinality": cardinality,
                         "accepted_answer_indices": indices,
                         "accepted_answers": answers,
+                        "note": note,
+                        "generation_notes": generation_notes,
                         "labels_path": str(CONFIG["labels_path"]),
                     }
                 )
@@ -1124,6 +1575,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_AUDIO_DIR,
         help="Local MMAR wav directory",
+    )
+    parser.add_argument(
+        "--meta",
+        type=Path,
+        default=DEFAULT_META,
+        help="MMAR-meta.jsonl used for the optional MCQ/gold/source spoiler",
     )
     parser.add_argument(
         "--force-audio-download",
@@ -1189,6 +1646,11 @@ def main() -> None:
     )
 
     items = load_sample(args.sample_json.expanduser().resolve())
+    spoilers = load_spoilers(
+        [item["id"] for item in items],
+        meta_path=args.meta.expanduser().resolve(),
+        pack_dir=args.pack_dir.expanduser().resolve(),
+    )
     labels_path = resolve_labels_path(args)
     labels_path.parent.mkdir(parents=True, exist_ok=True)
     labels_by_id = load_labels_by_id(labels_path)
@@ -1201,6 +1663,7 @@ def main() -> None:
     CONFIG["labeled_ids"] = labeled_ids
     CONFIG["labels_path"] = labels_path
     CONFIG["audio_dir"] = audio_dir
+    CONFIG["spoilers"] = spoilers
     CONFIG["participant"] = (args.participant or "").strip()
     CONFIG["start_index"] = (
         first_unlabeled_index()
@@ -1211,6 +1674,7 @@ def main() -> None:
     remaining = sum(1 for item in items if item["id"] not in labeled_ids)
     print(f"Sample:   {args.sample_json}")
     print(f"Audio:    {audio_dir}")
+    print(f"Meta:     {args.meta}")
     print(f"Labels:   {labels_path}")
     print(
         f"Set:      {len(items)} questions "
