@@ -51,8 +51,8 @@ MODELS_ROOT = VOLUME_MOUNT / "models"
 
 MMAR_REPO = "BoJack/MMAR"
 MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
-# HF MMAR-meta.json omits thinking/rubric/cue required by MMAR-Rubrics scoring.
-# Use the GitHub release that includes instance rubrics + GT CoT.
+# HF MMAR-meta.json omits thinking/rubric/cue. Use the GitHub jsonl that
+# includes GT CoT and instance rubrics (shown in view_mmar.py).
 MMAR_META_URL = "https://raw.githubusercontent.com/ddlBoJack/MMAR/main/MMAR-meta.jsonl"
 MMAR_RUBRIC_KEYS = ("thinking", "rubric", "cue")
 MIN_MMAR_WAVS = 1000
@@ -205,7 +205,7 @@ def _download_mmar_rubric_meta(dest: Path) -> int:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    print(f"Downloading rubric meta from {MMAR_META_URL} ...")
+    print(f"Downloading MMAR-meta.jsonl from {MMAR_META_URL} ...")
     urllib.request.urlretrieve(MMAR_META_URL, tmp)
     if not _meta_has_rubrics(tmp):
         tmp.unlink(missing_ok=True)

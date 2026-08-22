@@ -422,7 +422,7 @@ def _scoring_label(mode: str) -> str:
     return (
         "qwen_freeform_judge"
         if mode == "freeform"
-        else "string_match_no_rubric"
+        else "string_match"
     )
 
 

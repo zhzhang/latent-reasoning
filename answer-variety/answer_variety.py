@@ -28,10 +28,10 @@ from mmar_common import (  # noqa: E402
     write_json,
     write_jsonl,
 )
-from mmar_rubrics import SOURCE_EXPERIMENT  # noqa: E402
 import view_difficulty as vd  # noqa: E402
 
 ANSWER_VARIETY_EXPERIMENT = "exp-mmar-answer-variety"
+SOURCE_EXPERIMENT = "exp-mmar-question-difficulty"
 DEFAULT_SOURCE_RUN_ID = "20260807T145000Z"
 DEFAULT_GEMINI_MODEL = "gemini-3.7-flash"
 DEFAULT_LIMIT = 0  # 0 = all questions

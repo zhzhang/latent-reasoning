@@ -9,14 +9,8 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       manifest.json
       models/<label>/predictions.jsonl
     mmar-freeform-5-shot/                    # run_judges.py (collated pack)
-    exp-mmar-rubrics/<run_id>/               # run_rubrics_eval.py (Modal Qwen)
-      question_ids.json
-      manifest.json
-      judges/<judge>/models/<label>/predictions.evaluated.jsonl
-    # Local API rubrics live under outputs/exp-mmar-rubrics-api/ (not on volume)
     mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
-      predictions.evaluated.jsonl    # OpenAI rubric grades
       scores.json
       manifest.json
     mmar/af-next-think/<run_id>/     # legacy single-model AF-Next runs
