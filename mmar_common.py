@@ -624,7 +624,7 @@ def recompute_multi_judge_scores(
                 shot.pop("grader", None)
                 shot.pop("grader_output", None)
             else:
-                # Prefer short Pass/Fail label; fall back to full generation.
+                # Prefer short 0/1 (or legacy Pass/Fail) label; fall back to full generation.
                 short = entry.get("output")
                 if short is None and entry.get("generation") is not None:
                     short = entry.get("generation")

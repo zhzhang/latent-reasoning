@@ -489,7 +489,7 @@ def _resolve_judge_key(
     """Map a bare judge label onto a composite ``label__prompt__gold`` key.
 
     Manifest ``primary_judge`` is sometimes the model slug (``gpt-audio-mini``)
-    while shot verdicts are stored under ``gpt-audio-mini__permissive__nongold``.
+        while shot verdicts are stored under ``gpt-audio-mini__free__nongold``.
     """
     keys = [str(key) for key in available if key]
     if not wanted:

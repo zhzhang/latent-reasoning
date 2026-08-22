@@ -1206,7 +1206,6 @@ def _run_freeform_grade_body(
     primary_judge: str | None = None,
     batch_size: int | None = None,
     force: bool = False,
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     first_shot_only: bool = False,
     make_primary: bool = False,
@@ -1230,7 +1229,7 @@ def _run_freeform_grade_body(
         raise SystemExit(f"Run dir not found: {run_dir}")
 
     model_id = judge_model_id or grader_model_id or DEFAULT_GRADER_MODEL_ID
-    prompts = parse_grade_prompt_list(grade_prompt)
+    prompts = parse_grade_prompt_list(include_gold=include_gold)
     shot_indices = parse_shot_indices(first_shot_only)
     labels = list(model_labels or DEFAULT_MODEL_LABELS)
     handle = load_grader(model_id)
@@ -1327,7 +1326,7 @@ def _run_freeform_grade_body(
         "judge_label": last_key,
         "primary_judge": manifest.get("primary_judge") or existing_primary,
         "by_model": per_model,
-        "prompt": prompts[-1] if prompts else "permissive",
+        "prompt": prompts[-1] if prompts else "with_gt",
         "include_gold": include_gold,
         "n_questions": n_questions,
     }
@@ -1420,7 +1419,6 @@ def run_pipeline(
     force_grade: bool = False,
     grader_batch_size: int | None = None,
     skip_grade: bool = False,
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     first_shot_only: bool = False,
     make_primary: bool = False,
@@ -1472,7 +1470,7 @@ def run_pipeline(
             print(f"[grade] could not read existing judges ({exc}); using force_grade only")
 
         results: list[dict] = []
-        first_prompt = parse_grade_prompt_list(grade_prompt)[0]
+        first_prompt = parse_grade_prompt_list(include_gold=include_gold)[0]
         for model_id in judge_ids:
             require_audio_nongold_judge(model_id, include_gold=include_gold)
             worker = _grade_worker_for(model_id)
@@ -1495,7 +1493,6 @@ def run_pipeline(
                 primary_judge=primary_judge,
                 batch_size=grader_batch_size,
                 force=replace,
-                grade_prompt=grade_prompt,
                 include_gold=include_gold,
                 first_shot_only=first_shot_only,
                 make_primary=make_primary,
@@ -1687,7 +1684,6 @@ def main(
     force_grade: bool = False,
     grader_batch_size: int | None = None,
     skip_grade: bool = False,
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     first_shot_only: bool = False,
     make_primary: bool = False,
@@ -1737,7 +1733,6 @@ def main(
         grader_batch_size: Shots per grader generate() call (default: per-judge
             spec — 128 for qwen2.5-3b-instruct, 512 for qwen3.6-35b-a3b-fp8).
         skip_grade: Freeform generation without the grading pass.
-        grade_prompt: ``permissive``, ``neutral``, or a comma list.
         include_gold: Include the benchmark gold in the grade prompt (default
             True). Pass ``--no-include-gold`` so an audio judge hears the clip
             and decides without gold. Text-only judges cannot run NO_GOLD.
@@ -1779,7 +1774,6 @@ def main(
         force_grade=force_grade,
         grader_batch_size=grader_batch_size,
         skip_grade=skip_grade,
-        grade_prompt=grade_prompt,
         include_gold=include_gold,
         first_shot_only=first_shot_only,
         make_primary=make_primary,

@@ -46,7 +46,7 @@ API_JUDGE_ALIASES: dict[str, str] = {
 API_JUDGE_GROUP_ALIASES = frozenset({"api", "all-api"})
 GEMINI_CACHE_TTL = "900s"
 GEMINI_CACHE_MAX_BYTES = 10 * 1024 * 1024
-JUDGE_SAMPLING: dict[str, Any] = {"temperature": 0.0, "max_tokens": 1024}
+JUDGE_SAMPLING: dict[str, Any] = {"temperature": 0.0, "max_tokens": 2048}
 JUDGE_CACHE_KEY_PREFIX = "mmar-judge"
 
 
@@ -449,11 +449,11 @@ class _PendingJob:
     owners: list[tuple[str, int, int]] = field(default_factory=list)
 
 
-def _gold_prefix(question: str, answer: str, prompt_name: str) -> str:
-    from grader import build_grade_instructions
+def _gold_prefix(question: str, answer: str, prompt_name: str | None = None) -> str:
+    from grader import build_grade_gold_prefix
 
-    header = build_grade_instructions(prompt=prompt_name, include_gold=True)
-    return f"{header}\n\nQuestion: {question}\nCorrect answer: {answer}\n"
+    del prompt_name
+    return build_grade_gold_prefix(question=question, answer=answer)
 
 
 def _verdict_entry(
@@ -501,7 +501,7 @@ async def grade_pack_with_api_judge(
     *,
     label: str,
     model_labels: list[str],
-    prompt: str = "permissive",
+    prompt: str | None = None,
     include_gold: bool = True,
     force: bool = False,
     n_questions: int | None = None,
@@ -517,6 +517,7 @@ async def grade_pack_with_api_judge(
     """Grade pack predictions with one API judge; writes ``predictions.jsonl``."""
     from grader import (
         compose_judge_key,
+        grade_prompt_name,
         require_audio_nongold_judge,
         resolve_grade_audio_path,
         _grade_reuse_key,
@@ -524,14 +525,14 @@ async def grade_pack_with_api_judge(
         _shot_needs_grade,
         _shot_prediction_text,
         _shot_judge_entry,
-        normalize_grade_prompt,
     )
 
     resolved = resolve_api_judge_label(label) or label
     spec = API_SPECS[resolved]
     model_id = spec["model_id"]
-    prompt_name = normalize_grade_prompt(prompt)
     include_gold = bool(include_gold)
+    prompt_name = grade_prompt_name(include_gold)
+    del prompt
     require_audio_nongold_judge(model_id=resolved, include_gold=include_gold)
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
     gradees = [item for item in model_labels if item != resolved]

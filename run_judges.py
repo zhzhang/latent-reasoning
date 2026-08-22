@@ -595,7 +595,6 @@ def grade_with_judge(
     model_labels: list[str],
     batch_size: int | None = None,
     force: bool = False,
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     make_primary: bool = False,
     n_questions: int | None = None,
@@ -621,11 +620,11 @@ def grade_with_judge(
     _assert_freeform_run(manifest)
 
     judge_model_id = resolve_judge_model_id(judge_model_id)
-    prompts = parse_grade_prompt_list(grade_prompt)
+    prompts = parse_grade_prompt_list(include_gold=include_gold)
     handle = load_grader(judge_model_id)
     per_model: dict[str, dict] = {}
     last_key = None
-    last_prompt = prompts[-1] if prompts else "permissive"
+    last_prompt = prompts[-1] if prompts else "with_gt"
     for prompt_name in prompts:
         key = resolve_grade_judge_key(
             handle, prompt=prompt_name, include_gold=include_gold
@@ -683,7 +682,6 @@ def _grade_suite_judge(
     judge_label: str,
     *,
     model_labels: list[str],
-    grade_prompt: str,
     include_gold: bool,
     force: bool,
     batch_size: int | None,
@@ -703,7 +701,7 @@ def _grade_suite_judge(
         raise SystemExit(f"Pack not found: {pack_dir}")
     _assert_freeform_run(_load_manifest(pack_dir))
 
-    prompts = parse_grade_prompt_list(grade_prompt)
+    prompts = parse_grade_prompt_list(include_gold=include_gold)
     handle = load_grader(judge_label)
     model_id = handle.get("model_id") or judge_label
     per_model: dict[str, dict] = {}
@@ -763,7 +761,6 @@ _SUITE_GRADE_KW = dict(
 def grade_suite_l40s(
     judge_label: str,
     model_labels: list[str],
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     force: bool = False,
     batch_size: int | None = None,
@@ -772,7 +769,6 @@ def grade_suite_l40s(
     return _grade_suite_judge(
         judge_label,
         model_labels=model_labels,
-        grade_prompt=grade_prompt,
         include_gold=include_gold,
         force=force,
         batch_size=batch_size,
@@ -784,7 +780,6 @@ def grade_suite_l40s(
 def grade_suite_a100(
     judge_label: str,
     model_labels: list[str],
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     force: bool = False,
     batch_size: int | None = None,
@@ -793,7 +788,6 @@ def grade_suite_a100(
     return _grade_suite_judge(
         judge_label,
         model_labels=model_labels,
-        grade_prompt=grade_prompt,
         include_gold=include_gold,
         force=force,
         batch_size=batch_size,
@@ -805,7 +799,6 @@ def grade_suite_a100(
 def grade_suite_h100(
     judge_label: str,
     model_labels: list[str],
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     force: bool = False,
     batch_size: int | None = None,
@@ -814,7 +807,6 @@ def grade_suite_h100(
     return _grade_suite_judge(
         judge_label,
         model_labels=model_labels,
-        grade_prompt=grade_prompt,
         include_gold=include_gold,
         force=force,
         batch_size=batch_size,
@@ -1031,7 +1023,6 @@ def _spawn_remote_judges(
     dedicated: list[dict],
     gradees: list[str],
     prompts: list[str],
-    grade_prompt: str,
     include_gold: bool,
     force: bool,
     batch_size: int | None,
@@ -1051,7 +1042,6 @@ def _spawn_remote_judges(
                 fn.spawn(
                     label,
                     model_labels=gradees,
-                    grade_prompt=",".join(prompts),
                     include_gold=include_gold,
                     force=force,
                     batch_size=batch_size,
@@ -1073,7 +1063,6 @@ def _spawn_remote_judges(
                     model_labels=gradees,
                     batch_size=batch_size,
                     force=force,
-                    grade_prompt=grade_prompt,
                     include_gold=include_gold,
                     make_primary=this_primary,
                     n_questions=n_questions,
@@ -1164,7 +1153,6 @@ def run_judges_pipeline(
     force: bool = False,
     batch_size: int | None = None,
     skip_aggregate: bool = False,
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     n_questions: int | None = None,
     ingest_local: bool = False,
@@ -1174,7 +1162,7 @@ def run_judges_pipeline(
 
     if n_questions is not None and int(n_questions) < 0:
         n_questions = None
-    prompts = parse_grade_prompt_list(grade_prompt)
+    prompts = parse_grade_prompt_list(include_gold=include_gold)
     prep = prepare_judges.remote(
         judge_model_id=(judge_model_id or "").strip(),
         make_primary=make_primary,
@@ -1194,7 +1182,6 @@ def run_judges_pipeline(
         dedicated=dedicated,
         gradees=gradees,
         prompts=prompts,
-        grade_prompt=grade_prompt,
         include_gold=include_gold,
         force=force,
         batch_size=batch_size,
@@ -1235,7 +1222,6 @@ def _run_judges(
     force: bool = False,
     batch_size: int | None = None,
     skip_aggregate: bool = False,
-    grade_prompt: str = "permissive",
     include_gold: bool = True,
     n_questions: int | None = None,
     qps: float = 4.0,
@@ -1259,7 +1245,7 @@ def _run_judges(
             raise SystemExit("--no-include-gold needs an audio-capable judge")
 
     needs_modal = bool(suite or dedicated)
-    prompts = parse_grade_prompt_list(grade_prompt)
+    prompts = parse_grade_prompt_list(include_gold=include_gold)
     pack_dir: Path | None = None
     gradees: list[str] = []
     existing_primary = None
@@ -1282,7 +1268,7 @@ def _run_judges(
         f"suite_judges={suite} dedicated_judges={[d['label'] for d in dedicated]} "
         f"api_judges={api} gradees={gradees or '(modal)'} primary={primary} "
         f"(existing_primary={existing_primary}) "
-        f"prompt={grade_prompt} include_gold={include_gold} "
+        f"prompt={prompts[0] if prompts else 'with_gt'} include_gold={include_gold} "
         f"n_questions={n_questions} force={force}"
     )
 
@@ -1350,7 +1336,6 @@ def _run_judges(
         force=force,
         batch_size=batch_size,
         skip_aggregate=skip_aggregate,
-        grade_prompt=grade_prompt,
         include_gold=include_gold,
         n_questions=n_questions,
         ingest_local=bool(api),
@@ -1399,7 +1384,6 @@ def parse_args() -> argparse.Namespace:
         help="Shots per vLLM grader generate() call (default: per-judge spec)",
     )
     parser.add_argument("--skip-aggregate", action="store_true")
-    parser.add_argument("--grade-prompt", default="permissive")
     parser.add_argument(
         "--include-gold",
         action=argparse.BooleanOptionalAction,
@@ -1422,7 +1406,6 @@ def _run_judges_from_args(args: argparse.Namespace) -> dict:
         force=args.force,
         batch_size=args.batch_size,
         skip_aggregate=args.skip_aggregate,
-        grade_prompt=args.grade_prompt,
         include_gold=args.include_gold,
         n_questions=args.n_questions,
         qps=args.qps,
