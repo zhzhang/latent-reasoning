@@ -1,4 +1,4 @@
-"""Collate MMAR 5-shot freeform runs into one zip-ready pack.
+"""Collate MMAR freeform runs into one zip-ready pack.
 
 Merges the full-MMAR vLLM run, the open-ended vLLM run, and any local API
 runs. Keeps only the IDs in ``answer-variety/open_ended_question_ids.csv``
@@ -7,7 +7,7 @@ stripped so the pack can be re-graded from scratch.
 
 Writes::
 
-    outputs/mmar-freeform-5-shot/
+    outputs/mmar-freeform/
       manifest.json
       question_ids.json
       models/<label>/predictions.jsonl
@@ -18,7 +18,7 @@ Usage::
 
     uv run python collate_mmar_freeform.py
     uv run python collate_mmar_freeform.py \\
-      --out /tmp/mmar-freeform-5-shot
+      --out /tmp/mmar-freeform
 """
 
 from __future__ import annotations
@@ -35,11 +35,12 @@ from mmar_common import load_question_ids_csv, write_json
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS_DIR = REPO_ROOT / "outputs"
 DEFAULT_IDS_CSV = REPO_ROOT / "answer-variety" / "open_ended_question_ids.csv"
-DEFAULT_OUT_DIR = DEFAULT_RESULTS_DIR / "mmar-freeform-5-shot"
+DEFAULT_OUT_DIR = DEFAULT_RESULTS_DIR / "mmar-freeform"
 DEFAULT_N_SHOTS = 5
 VLLM_EXPERIMENT = "exp-mmar-question-difficulty"
 API_EXPERIMENT = "exp-mmar-question-difficulty-api"
-ALL_API_LABELS = ("gpt-audio-mini", "gemini-3.7-flash", "gpt-4o-mini")
+ALL_API_LABELS = ("gemini-3.7-flash", "gpt-4o-mini")
+SKIP_LABELS = frozenset({"gpt-audio-mini"})
 
 # Later entries override earlier ones for the same model label.
 DEFAULT_VLLM_RUN_IDS = (
@@ -102,7 +103,7 @@ def compact_record(
     source_run_id: str,
     n_shots: int,
 ) -> dict[str, Any] | None:
-    """Return a 5-shot record, or None if this row is short."""
+    """Return an n-shot record, or None if this row is short."""
     shots = list(record.get("shots") or [])
     shots.sort(key=_shot_index)
     if len(shots) < n_shots:
@@ -229,6 +230,8 @@ def collate(
             }
         )
         for label in labels:
+            if label in SKIP_LABELS:
+                continue
             rows = iter_wanted_records(
                 run_dir / "models" / label / "predictions.jsonl",
                 wanted,
@@ -274,7 +277,7 @@ def collate(
     )
     now = datetime.now(timezone.utc).isoformat()
     manifest = {
-        "name": "mmar-freeform-5-shot",
+        "name": "mmar-freeform",
         "mode": "freeform",
         "n_shots": n_shots,
         "n_questions": len(question_ids),
@@ -314,12 +317,12 @@ def _print_summary(manifest: dict[str, Any], out_dir: Path) -> None:
     except ValueError:
         zip_target = out_dir
     print()
-    print(f"Zip with:  zip -r mmar-freeform-5-shot.zip {zip_target}")
+    print(f"Zip with:  zip -r mmar-freeform.zip {zip_target}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collate MMAR 5-shot freeform runs into one zip-ready pack."
+        description="Collate MMAR freeform runs into one zip-ready pack."
     )
     parser.add_argument(
         "--results-dir",
@@ -337,7 +340,7 @@ def parse_args() -> argparse.Namespace:
         "--out",
         type=Path,
         default=DEFAULT_OUT_DIR,
-        help="Output directory to zip later (default: outputs/mmar-freeform-5-shot)",
+        help="Output directory to zip later (default: outputs/mmar-freeform)",
     )
     parser.add_argument(
         "--n-shots",

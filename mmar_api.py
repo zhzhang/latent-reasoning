@@ -15,19 +15,12 @@ from typing import Any
 from mmar_common import (
     ensure_judge_schema,
     recompute_multi_judge_scores,
-    select_grade_question_ids,
     write_jsonl,
 )
 
 logger = logging.getLogger(__name__)
 
 API_SPECS: dict[str, dict[str, Any]] = {
-    "gpt-audio-mini": {
-        "model_id": "gpt-audio-mini",
-        "backend": "openai",
-        "native_thinking": False,
-        "sampling": {"temperature": 1.0, "max_tokens": 1024},
-    },
     "gemini-3.7-flash": {
         "model_id": "gemini-3.7-flash",
         "backend": "gemini",
@@ -38,7 +31,6 @@ API_SPECS: dict[str, dict[str, Any]] = {
 
 ALL_API_LABELS = tuple(API_SPECS.keys())
 API_JUDGE_ALIASES: dict[str, str] = {
-    "gpt-audio-mini": "gpt-audio-mini",
     "gemini-3.7-flash": "gemini-3.7-flash",
     "gemini-3.7-mini": "gemini-3.7-flash",
     "gemini": "gemini-3.7-flash",
@@ -183,7 +175,7 @@ class OpenAIAudioTaker:
         from openai import AsyncOpenAI
 
         if not (os.environ.get("OPENAI_API_KEY") or "").strip():
-            raise SystemExit("Set OPENAI_API_KEY to call gpt-audio-mini.")
+            raise SystemExit("Set OPENAI_API_KEY to call OpenAI audio models.")
         self.client = AsyncOpenAI()
         self.model_id = model_id
         self.temperature = temperature
@@ -505,6 +497,7 @@ async def grade_pack_with_api_judge(
     include_gold: bool = True,
     force: bool = False,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
     make_primary: bool = False,
     primary_judge: str | None = None,
     qps: float = 4.0,
@@ -519,6 +512,7 @@ async def grade_pack_with_api_judge(
         compose_judge_key,
         grade_prompt_name,
         require_audio_nongold_judge,
+        resolve_grade_allowed_ids,
         resolve_grade_audio_path,
         _grade_reuse_key,
         _record_needs_grade,
@@ -551,8 +545,9 @@ async def grade_pack_with_api_judge(
             if qid:
                 all_ids.append(qid)
 
-    selected = select_grade_question_ids(all_ids, n_questions)
-    allowed_ids = set(selected) if selected is not None else None
+    allowed_ids = resolve_grade_allowed_ids(
+        all_ids, question_ids=question_ids, n_questions=n_questions
+    )
 
     def _in_sample(record: dict) -> bool:
         if allowed_ids is None:
@@ -813,6 +808,7 @@ async def grade_pack_with_api_judge(
         "prompt": prompt_name,
         "include_gold": include_gold,
         "n_questions": n_questions,
+        "n_labeled": len(question_ids) if question_ids is not None else None,
     }
 
 
@@ -825,6 +821,7 @@ async def grade_pack_with_api_judges(
     include_gold: bool,
     force: bool,
     n_questions: int | None,
+    question_ids: list[str] | None = None,
     make_primary: bool,
     primary_judge: str | None,
     qps: float = 4.0,
@@ -847,6 +844,7 @@ async def grade_pack_with_api_judges(
                 include_gold=include_gold,
                 force=force,
                 n_questions=n_questions,
+                question_ids=question_ids,
                 make_primary=this_primary,
                 primary_judge=primary_judge,
                 qps=qps,

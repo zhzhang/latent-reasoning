@@ -1,4 +1,4 @@
-"""Re-extract af-next-think answers in the freeform 5-shot pack.
+"""Re-extract af-next-think answers in the freeform pack.
 
 Rewrites ``thinking_prediction`` / ``answer_prediction`` from ``model_output``
 using the current parsers (nothing before the last ``</think>``). Shots whose
@@ -27,7 +27,7 @@ from mmar_common import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_PACK = REPO_ROOT / "outputs" / "mmar-freeform-5-shot"
+DEFAULT_PACK = REPO_ROOT / "outputs" / "mmar-freeform"
 DEFAULT_MODEL = "af-next-think"
 
 
@@ -75,7 +75,7 @@ def main() -> None:
         "--pack",
         type=Path,
         default=DEFAULT_PACK,
-        help="Freeform pack directory (default: outputs/mmar-freeform-5-shot).",
+        help="Freeform pack directory (default: outputs/mmar-freeform).",
     )
     parser.add_argument(
         "--model",

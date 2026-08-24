@@ -286,14 +286,46 @@ def normalize_grade_prompt(
     )
 
 
+def gold_mode_flags(include_gold: bool | None) -> list[bool]:
+    """``None`` means both with-GT then no-GT; otherwise a single mode."""
+    if include_gold is None:
+        return [True, False]
+    return [bool(include_gold)]
+
+
 def parse_grade_prompt_list(
     value: str | None = None,
     *,
-    include_gold: bool = DEFAULT_INCLUDE_GOLD,
+    include_gold: bool | None = DEFAULT_INCLUDE_GOLD,
 ) -> list[str]:
-    """Return the single active prompt name. Style lists are ignored."""
+    """Return prompt names for the selected gold mode(s). Style lists are ignored."""
     del value
-    return [grade_prompt_name(include_gold)]
+    return [grade_prompt_name(flag) for flag in gold_mode_flags(include_gold)]
+
+
+def resolve_grade_allowed_ids(
+    record_ids: list[str] | tuple[str, ...],
+    *,
+    question_ids: list[str] | tuple[str, ...] | None = None,
+    n_questions: int | None = None,
+) -> set[str] | None:
+    """Question ids to grade, or ``None`` to grade every record.
+
+    ``question_ids`` restricts to that set. ``n_questions`` then takes a prefix
+    of the fixed shuffle of the remaining ids.
+    """
+    wanted: set[str] | None = None
+    if question_ids is not None:
+        wanted = {str(qid).strip() for qid in question_ids if str(qid).strip()}
+    pool = [
+        str(qid).strip()
+        for qid in record_ids
+        if str(qid).strip() and (wanted is None or str(qid).strip() in wanted)
+    ]
+    selected = select_grade_question_ids(pool, n_questions)
+    if selected is not None:
+        return set(selected)
+    return wanted
 
 
 def gold_tag(include_gold: bool) -> str:
@@ -878,6 +910,14 @@ def load_grader(
         loaded = load_model(suite_label, ns)
         llm = loaded["llm"]
         tokenizer = llm.get_tokenizer()
+        local_id = resolve_model_dir(
+            spec["model_id"], getattr(ns, "local_model_dir", None)
+        )
+        _ensure_tokenizer_chat_template(
+            tokenizer,
+            model_dir=local_id,
+            fallback=_CHATML_JINJA if "qwen" in suite_label else None,
+        )
         sampling = _grade_sampling_for_engine(spec.get("engine") or {}, spec.get("sampling") or {})
         print(
             f"Freeform grader ready (suite): {suite_label} ({spec['model_id']}) "
@@ -925,6 +965,7 @@ def load_grader(
         llm_kwargs.pop("language_model_only", None)
         llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
+    _ensure_tokenizer_chat_template(tokenizer, model_dir=local_id)
     dtype = engine.get("dtype", "?")
     print(
         f"Freeform grader ready: {model_id} ({local_id}) "
@@ -946,6 +987,112 @@ def load_grader(
     }
 
 
+# Qwen3-Omni stores this in chat_template.json, not tokenizer_config.json.
+# vLLM's get_tokenizer() therefore has chat_template unset.
+_CHATML_JINJA = (
+    "{% for message in messages %}"
+    "{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{'<|im_start|>assistant\\n'}}{% endif %}"
+)
+
+
+def _tokenizer_objects(tokenizer: Any) -> list[Any]:
+    seen: list[Any] = []
+    for obj in (
+        tokenizer,
+        getattr(tokenizer, "tokenizer", None),
+        getattr(tokenizer, "_tokenizer", None),
+    ):
+        if obj is not None and obj not in seen:
+            seen.append(obj)
+    return seen
+
+
+def _chat_template_of(tokenizer: Any) -> str | None:
+    for obj in _tokenizer_objects(tokenizer):
+        template = getattr(obj, "chat_template", None)
+        if isinstance(template, str) and template.strip():
+            return template
+        if isinstance(template, dict):
+            for key in ("default", "chat_template"):
+                value = template.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            value = next(iter(template.values()), None)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
+def _read_model_chat_template(model_dir: str | Path | None) -> tuple[str | None, str | None]:
+    if not model_dir:
+        return None, None
+    root = Path(model_dir)
+    jinja = root / "chat_template.jinja"
+    if jinja.is_file():
+        text = jinja.read_text(encoding="utf-8").strip()
+        if text:
+            return text, str(jinja)
+    json_path = root / "chat_template.json"
+    if json_path.is_file():
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        if isinstance(data, str) and data.strip():
+            return data, str(json_path)
+        if isinstance(data, dict):
+            for key in ("chat_template", "default", "template"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value, str(json_path)
+    return None, None
+
+
+def _ensure_tokenizer_chat_template(
+    tokenizer: Any,
+    *,
+    model_dir: str | Path | None = None,
+    fallback: str | None = None,
+) -> str | None:
+    """Attach a chat template when vLLM loaded the tokenizer without one."""
+    existing = _chat_template_of(tokenizer)
+    if existing:
+        return existing
+    dirs: list[str | Path] = []
+    if model_dir:
+        dirs.append(model_dir)
+    for obj in _tokenizer_objects(tokenizer):
+        name = getattr(obj, "name_or_path", None)
+        if name:
+            dirs.append(name)
+    template = None
+    source = None
+    for path in dirs:
+        template, source = _read_model_chat_template(path)
+        if template:
+            break
+    if not template:
+        template = fallback
+        source = "ChatML fallback" if template else None
+    if not template:
+        return None
+    for obj in _tokenizer_objects(tokenizer):
+        if hasattr(obj, "chat_template"):
+            try:
+                obj.chat_template = template
+            except (AttributeError, TypeError):
+                pass
+    print(f"[grader] tokenizer.chat_template was unset; loaded from {source}")
+    return template
+
+
+def _format_chatml(user_text: str) -> str:
+    return (
+        "<|im_start|>user\n"
+        f"{user_text}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
 def _format_chat(
     tokenizer: Any,
     user_text: str,
@@ -953,22 +1100,39 @@ def _format_chat(
     chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     messages = [{"role": "user", "content": user_text}]
-    if hasattr(tokenizer, "apply_chat_template"):
-        kwargs = dict(chat_template_kwargs or {})
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return f"User: {user_text}\nAssistant:"
+    kwargs = dict(chat_template_kwargs or {})
+    template = kwargs.get("chat_template") or _chat_template_of(tokenizer)
+    if template and "chat_template" not in kwargs:
+        kwargs["chat_template"] = template
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        )
+    except TypeError:
         try:
             return tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                **kwargs,
             )
-        except TypeError:
+        except ValueError:
+            pass
+    except ValueError:
+        try:
             return tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                chat_template=template or _CHATML_JINJA,
             )
-    return f"User: {user_text}\nAssistant:"
+        except (TypeError, ValueError):
+            pass
+    return _format_chatml(user_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1448,6 +1612,7 @@ def grade_predictions_file(
     make_primary: bool = False,
     sidecar_path: Path | None = None,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Grade shots in a predictions.jsonl file for one judge configuration.
 
@@ -1455,8 +1620,9 @@ def grade_predictions_file(
     When ``sidecar_path`` is set, verdicts are written there instead of
     rewriting ``predictions.jsonl`` (safe for concurrent round-robin judges).
     ``make_primary`` False keeps each record's existing ``primary_judge``.
-    ``n_questions`` grades a prefix of the fixed shuffled id list (see
-    ``mmar_common.GRADE_SAMPLE_SEED``); None or < 0 grades every question.
+    ``question_ids`` limits grading to those ids. ``n_questions`` then grades
+    a prefix of the fixed shuffled remaining id list (see
+    ``mmar_common.GRADE_SAMPLE_SEED``); None or < 0 keeps the full set.
     Duplicate model answers (lowercase, stripped) reuse an existing verdict
     for the same question and gold, including shots already graded for this
     judge when ``force`` is False.
@@ -1499,11 +1665,11 @@ def grade_predictions_file(
             fallback_model_id=model_id,
         )
 
-    selected_ids = select_grade_question_ids(
+    allowed_ids = resolve_grade_allowed_ids(
         [str(record.get("id") or "") for record in records],
-        n_questions,
+        question_ids=question_ids,
+        n_questions=n_questions,
     )
-    allowed_ids = set(selected_ids) if selected_ids is not None else None
 
     def _in_sample(record: dict) -> bool:
         if allowed_ids is None:

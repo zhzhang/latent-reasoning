@@ -2,7 +2,7 @@
   "seed": 42,
   "n": 100,
   "source_ids_csv": "answer-variety/open_ended_question_ids.csv",
-  "pack_dir": "outputs/mmar-freeform-5-shot",
+  "pack_dir": "outputs/mmar-freeform",
   "unique_key": "whitespace-collapsed answer_prediction (case-sensitive)",
   "order": "first appearance: LABEL_ORDER models, then remaining alpha, shots by shot_index",
   "items": [

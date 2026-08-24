@@ -1,13 +1,13 @@
-"""Local viewer for the collated MMAR 5-shot freeform pack.
+"""Local viewer for the collated MMAR freeform pack.
 
-Shows every question in ``outputs/mmar-freeform-5-shot`` with audio, gold
+Shows every question in ``outputs/mmar-freeform`` with audio, gold
 reference, and all stored shots from every model.
 
 Usage::
 
     uv run python view_mmar.py
     uv run python view_mmar.py --port 7860
-    uv run python view_mmar.py --pack-dir ./outputs/mmar-freeform-5-shot
+    uv run python view_mmar.py --pack-dir ./outputs/mmar-freeform
 """
 
 from __future__ import annotations
@@ -44,10 +44,6 @@ LABEL_ORDER = MODEL_LABEL_ORDER + ALL_API_LABELS
 
 # API models are not in MODEL_SPECS (run_experiment_api.API_SPECS).
 API_SAMPLING: dict[str, dict[str, Any]] = {
-    "gpt-audio-mini": {
-        "model_id": "gpt-audio-mini",
-        "sampling": {"temperature": 1.0, "max_tokens": 1024},
-    },
     "gemini-3.7-flash": {
         "model_id": "gemini-3.7-flash",
         "sampling": {"temperature": 1.0, "max_tokens": 1024},
@@ -139,11 +135,6 @@ SAMPLING_SOURCES: dict[str, dict[str, str]] = {
             "Thinking-mode card: T=0.6, top_p=0.95. "
             "max_tokens capped at 2048 for MMAR (card recommends 20480)."
         ),
-    },
-    "gpt-audio-mini": {
-        "url": "https://platform.openai.com/docs/models/gpt-audio-mini",
-        "label": "OpenAI model docs",
-        "note": "OpenAI Chat Completions default temperature is 1.0.",
     },
     "gemini-3.7-flash": {
         "url": "https://ai.google.dev/api/generate-content",
@@ -488,8 +479,8 @@ def _resolve_judge_key(
 ) -> str | None:
     """Map a bare judge label onto a composite ``label__prompt__gold`` key.
 
-    Manifest ``primary_judge`` is sometimes the model slug (``gpt-audio-mini``)
-        while shot verdicts are stored under ``gpt-audio-mini__free__nongold``.
+    Manifest ``primary_judge`` is sometimes the model slug (``gemini-3.7-flash``)
+        while shot verdicts are stored under ``gemini-3.7-flash__free__nongold``.
     """
     keys = [str(key) for key in available if key]
     if not wanted:
@@ -773,7 +764,6 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
             "<|im_start|>user\n<audio_patch><|im_end|>\n"
             "<|im_start|>assistant\n"
         ),
-        "gpt-audio-mini": base,
         "gemini-3.7-flash": base,
         "gpt-4o-mini": base,
     }
@@ -1352,7 +1342,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <h1>MMAR Freeform</h1>
         <span class="mode-badge">Freeform</span>
       </div>
-      <p>All models × all shots from the 5-shot freeform pack</p>
+      <p>All models × all shots from the freeform pack</p>
       <div class="run-meta" id="run-meta"></div>
     </div>
     <div class="header-right">
@@ -1668,7 +1658,6 @@ function shortLabel(label) {
     "phi-4-multimodal": "phi-4",
     "gemma-4-e4b": "gemma",
     "nemotron-3-nano-omni": "nemotron",
-    "gpt-audio-mini": "gpt-mini",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
     "step-audio-2-mini": "step",
@@ -2124,7 +2113,7 @@ def main() -> None:
         "--pack-dir",
         type=Path,
         default=DEFAULT_OUT_DIR,
-        help="Collated freeform pack (default: outputs/mmar-freeform-5-shot)",
+        help="Collated freeform pack (default: outputs/mmar-freeform)",
     )
     parser.add_argument(
         "--audio-dir",

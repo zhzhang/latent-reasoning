@@ -1,15 +1,14 @@
-"""Local MMAR test-taker via OpenAI / Gemini audio APIs.
+"""Local MMAR test-taker via Gemini audio APIs.
 
 Writes under ``outputs/exp-mmar-question-difficulty-api/<run_id>/`` so Modal
 downloads into ``outputs/exp-mmar-question-difficulty/`` cannot overwrite them.
 
 Usage::
 
-    export OPENAI_API_KEY=...
     export GEMINI_API_KEY=...
 
     uv run python run_experiment_api.py \\
-      --models gpt-audio-mini,gemini-3.7-flash \\
+      --models gemini-3.7-flash \\
       --mode freeform \\
       --n-shots 3 \\
       --question-ids-csv answer-variety/open_ended_question_ids.csv
@@ -408,7 +407,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--models",
-        default="gpt-audio-mini,gemini-3.7-flash",
+        default="gemini-3.7-flash",
         help="Comma-separated labels or 'all'",
     )
     parser.add_argument("--mode", default=DEFAULT_MODE)

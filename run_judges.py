@@ -1,23 +1,25 @@
-"""Judge the collated MMAR freeform 5-shot pack.
+"""Judge the collated MMAR freeform pack.
 
-Always reads and writes ``outputs/mmar-freeform-5-shot``. Shots that already
-have a verdict for the same judge key (model + prompt + gold/nongold) are
-skipped. Regenerates ``difficulty.jsonl`` / ``scores.json`` after grading.
+Always reads and writes ``outputs/mmar-freeform``. Grades only
+questions present in ``labels.csv``. Default is both with-GT and no-GT
+recipes (one GPU load per judge). Shots that already have a verdict for
+the same judge key are skipped. Regenerates ``difficulty.jsonl`` /
+``scores.json`` after grading, then writes ``judge_accuracy.json``.
 
 vLLM suite / dedicated judges start Modal from this script. API judges
-(gpt-audio-mini, gemini-3.7-flash) run locally and never open an App.
+(gemini-3.7-flash) run locally and never open an App.
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
-    # All suite judges; each grades every other pack model's 5 shots
+    # All suite judges; both gold modes; labeled questions only
     uv run run_judges.py
 
     # Only these judges
     uv run run_judges.py \\
       --judge-model-id qwen3-omni-instruct,phi-4-multimodal
 
-    # Dedicated text judge (not in the suite)
+    # Dedicated text judge (not in the suite; with-GT only)
     uv run run_judges.py \\
       --judge-model-id qwen3.6-35b-a3b-fp8
 
@@ -26,24 +28,27 @@ vLLM suite / dedicated judges start Modal from this script. API judges
       --judge-model-id qwen3-omni-instruct \\
       --no-include-gold
 
+    # Recompute accuracy from existing local verdicts
+    uv run run_judges.py --accuracy-only
+
 Local API judges::
 
-    export OPENAI_API_KEY=...
     export GEMINI_API_KEY=...
 
-    uv run run_judges.py --judge-model-id gpt-audio-mini,gemini-3.7-flash
+    uv run run_judges.py --judge-model-id gemini-3.7-flash
     uv run run_judges.py --judge-model-id api --no-include-gold
 
 Mixed (API locally while Modal vLLM runs detached)::
 
     uv run run_judges.py \\
-      --judge-model-id gpt-audio-mini,qwen3-omni-instruct
+      --judge-model-id gemini-3.7-flash,qwen3-omni-instruct
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import shutil
@@ -63,13 +68,244 @@ from modal_cache import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
-PACK_NAME = "mmar-freeform-5-shot"
+PACK_NAME = "mmar-freeform"
 LOCAL_PACK_DIR = REPO_ROOT / "outputs" / PACK_NAME
 REMOTE_PACK_DIR = RESULTS_MOUNT / PACK_NAME
 LOCAL_PACK_MOUNT = Path("/local-pack")
 INGEST_DIR_NAME = "_local_ingest"
+LABELS_CSV_NAME = "labels.csv"
+ACCURACY_JSON_NAME = "judge_accuracy.json"
 
 app = modal.App("run-judges")
+
+
+def _parse_ratings_cell(raw: object) -> list[bool]:
+    if isinstance(raw, list):
+        values = raw
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        try:
+            values = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(values, list) or not values:
+        return []
+    out: list[bool] = []
+    for item in values:
+        if isinstance(item, bool):
+            out.append(item)
+        else:
+            return []
+    return out
+
+
+def load_pack_label_rows(labels_path: Path) -> list[dict]:
+    """Rows with a non-empty boolean ``ratings`` list."""
+    rows: list[dict] = []
+    with labels_path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for raw in reader:
+            qid = str(raw.get("question_id") or "").strip()
+            model = str(raw.get("model_label") or "").strip()
+            ratings = _parse_ratings_cell(raw.get("ratings"))
+            if not qid or not model or not ratings:
+                continue
+            try:
+                shot_index = int(raw.get("shot_index", 0))
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "question_id": qid,
+                    "model_label": model,
+                    "shot_index": shot_index,
+                    "ratings": ratings,
+                }
+            )
+    return rows
+
+
+def labeled_question_ids(rows: list[dict]) -> list[str]:
+    return list(dict.fromkeys(str(row["question_id"]) for row in rows))
+
+
+def _labels_path(pack_dir: Path) -> Path:
+    return pack_dir / LABELS_CSV_NAME
+
+
+def _require_labeled_question_ids(pack_dir: Path) -> list[str]:
+    path = _labels_path(pack_dir)
+    if not path.is_file():
+        raise SystemExit(
+            f"labels.csv not found at {path}. "
+            f"Expected {LOCAL_PACK_DIR / LABELS_CSV_NAME}."
+        )
+    ids = labeled_question_ids(load_pack_label_rows(path))
+    if not ids:
+        raise SystemExit(f"No labeled questions in {path}")
+    return ids
+
+
+def _judge_mode_bucket(judge_key: str, entry: dict | None) -> str | None:
+    if isinstance(entry, dict):
+        if entry.get("include_gold") is True or entry.get("prompt") == "with_gt":
+            return "with_gt"
+        if entry.get("include_gold") is False or entry.get("prompt") == "free":
+            return "free"
+    key = str(judge_key or "")
+    if "__with_gt__" in key or key.endswith("__gold"):
+        return "with_gt"
+    if "__free__" in key or key.endswith("__nongold"):
+        return "free"
+    return None
+
+
+def _load_predictions_by_id(path: Path) -> dict[str, dict]:
+    by_id: dict[str, dict] = {}
+    if not path.is_file():
+        return by_id
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            record = json.loads(stripped)
+            qid = str(record.get("id") or "").strip()
+            if qid:
+                by_id[qid] = record
+    return by_id
+
+
+def _shot_for_index(record: dict, shot_index: int) -> dict | None:
+    for shot in record.get("shots") or []:
+        try:
+            if int(shot.get("shot_index", 0)) == shot_index:
+                return shot
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def report_judge_accuracy(pack_dir: Path) -> dict:
+    """Compare judge verdicts to the first human rating in labels.csv."""
+    labels_path = _labels_path(pack_dir)
+    if not labels_path.is_file():
+        raise SystemExit(f"labels.csv not found at {labels_path}")
+    rows = load_pack_label_rows(labels_path)
+    if not rows:
+        raise SystemExit(f"No labeled rows in {labels_path}")
+
+    pred_cache: dict[str, dict[str, dict]] = {}
+    samples: list[tuple[bool, dict[str, dict] | None]] = []
+    judge_keys: set[str] = set()
+
+    for row in rows:
+        gold = bool(row["ratings"][0])
+        model = row["model_label"]
+        if model not in pred_cache:
+            pred_cache[model] = _load_predictions_by_id(
+                pack_dir / "models" / model / "predictions.jsonl"
+            )
+        record = pred_cache[model].get(row["question_id"])
+        shot = _shot_for_index(record, row["shot_index"]) if record else None
+        judges = None
+        if shot is not None and isinstance(shot.get("judges"), dict):
+            judges = {
+                str(key): dict(entry)
+                for key, entry in shot["judges"].items()
+                if key
+            }
+            judge_keys.update(judges)
+        samples.append((gold, judges))
+
+    stats: dict[str, dict[str, dict[str, int]]] = {
+        "with_gt": {},
+        "free": {},
+    }
+    key_mode: dict[str, str] = {}
+    for key in sorted(judge_keys):
+        sample_entry = next(
+            (
+                (judges or {}).get(key)
+                for _gold, judges in samples
+                if judges and key in judges
+            ),
+            None,
+        )
+        mode = _judge_mode_bucket(key, sample_entry if isinstance(sample_entry, dict) else None)
+        if mode is None:
+            continue
+        key_mode[key] = mode
+        stats[mode][key] = {"n": 0, "n_agree": 0, "n_missing": 0}
+
+    for gold, judges in samples:
+        for key, mode in key_mode.items():
+            bucket = stats[mode][key]
+            entry = (judges or {}).get(key) if judges else None
+            correct = None
+            if isinstance(entry, dict) and entry.get("correct") is not None:
+                correct = bool(entry.get("correct"))
+            if correct is None:
+                bucket["n_missing"] += 1
+                continue
+            bucket["n"] += 1
+            if correct == gold:
+                bucket["n_agree"] += 1
+
+    def _mode_payload(mode: str) -> dict:
+        by_judge: dict[str, dict] = {}
+        for key, bucket in stats[mode].items():
+            n = int(bucket["n"])
+            agree = int(bucket["n_agree"])
+            missing = int(bucket["n_missing"])
+            by_judge[key] = {
+                "n": n,
+                "n_agree": agree,
+                "n_missing": missing,
+                "accuracy": (agree / n) if n else None,
+            }
+        return by_judge
+
+    payload = {
+        "pack": PACK_NAME,
+        "labels_path": str(labels_path),
+        "n_label_rows": len(rows),
+        "n_questions": len(labeled_question_ids(rows)),
+        "with_gt": _mode_payload("with_gt"),
+        "free": _mode_payload("free"),
+    }
+    dest = pack_dir / ACCURACY_JSON_NAME
+    write_json(dest, payload)
+    _print_judge_accuracy(payload)
+    print(f"[run-judges] wrote {dest}")
+    return payload
+
+
+def _print_judge_accuracy(payload: dict) -> None:
+    for mode in ("with_gt", "free"):
+        print(f"\n=== judge accuracy ({mode}) ===")
+        print(f"{'judge':<52} {'n':>6} {'agree':>7} {'miss':>6} {'acc':>8}")
+        by_judge = payload.get(mode) or {}
+        if not by_judge:
+            print("(no verdicts)")
+            continue
+        for key in sorted(by_judge):
+            row = by_judge[key]
+            acc = row.get("accuracy")
+            acc_s = f"{acc:.3f}" if isinstance(acc, float) else "—"
+            print(
+                f"{key:<52} {row.get('n', 0):>6} {row.get('n_agree', 0):>7} "
+                f"{row.get('n_missing', 0):>6} {acc_s:>8}"
+            )
+    print()
+
+
+def _gold_mode_note(include_gold: bool | None) -> str:
+    if include_gold is None:
+        return "both"
+    return "with_gt" if include_gold else "free"
 
 
 def _cuda_base_image(python_version: str = "3.12") -> modal.Image:
@@ -555,6 +791,12 @@ def prepare_judges(
     if not labels:
         raise SystemExit(f"No model predictions found under {pack_dir / 'models'}")
 
+    question_ids = _require_labeled_question_ids(pack_dir)
+    print(
+        f"[run-judges] labeled questions={len(question_ids)} "
+        f"from {_labels_path(pack_dir)}"
+    )
+
     suite_judges, dedicated_judges, api_judges, first_new = _select_judges(
         judge_model_id
     )
@@ -573,6 +815,7 @@ def prepare_judges(
         "primary_judge": primary,
         "make_primary": make_primary,
         "model_labels": labels,
+        "question_ids": question_ids,
         "existing_judges": [
             (e.get("label") if isinstance(e, dict) else e)
             for e in (manifest.get("judges") or [])
@@ -595,15 +838,18 @@ def grade_with_judge(
     model_labels: list[str],
     batch_size: int | None = None,
     force: bool = False,
-    include_gold: bool = True,
+    include_gold: bool | None = None,
     make_primary: bool = False,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict:
     """Grade with one dedicated text judge; merge into predictions + manifest."""
     from grader import (
+        gold_mode_flags,
         grade_predictions_file,
+        grade_prompt_name,
+        judge_is_audio_model,
         load_grader,
-        parse_grade_prompt_list,
         resolve_grade_judge_key,
         resolve_judge_batch_size,
         resolve_judge_model_id,
@@ -620,23 +866,37 @@ def grade_with_judge(
     _assert_freeform_run(manifest)
 
     judge_model_id = resolve_judge_model_id(judge_model_id)
-    prompts = parse_grade_prompt_list(include_gold=include_gold)
     handle = load_grader(judge_model_id)
+    audio_ok = judge_is_audio_model(handle=handle)
     per_model: dict[str, dict] = {}
+    modes: list[dict] = []
     last_key = None
-    last_prompt = prompts[-1] if prompts else "with_gt"
-    for prompt_name in prompts:
+    last_prompt = "with_gt"
+    last_gold: bool | None = include_gold
+    for gold_flag in gold_mode_flags(include_gold):
+        if not gold_flag and not audio_ok:
+            print(
+                f"[run-judges] skipping no-GT for text judge {judge_model_id}"
+            )
+            continue
+        prompt_name = grade_prompt_name(gold_flag)
         key = resolve_grade_judge_key(
-            handle, prompt=prompt_name, include_gold=include_gold
+            handle, prompt=prompt_name, include_gold=gold_flag
         )
         last_key = key
+        last_prompt = prompt_name
+        last_gold = gold_flag
+        modes.append(
+            {"prompt": prompt_name, "include_gold": gold_flag, "judge_key": key}
+        )
         effective_batch_size = resolve_judge_batch_size(judge_model_id, batch_size)
         for label in model_labels:
             predictions_path = pack_dir / "models" / label / "predictions.jsonl"
             print(
                 f"[run-judges] {label} with {key} "
                 f"(primary={primary_judge}, batch_size={effective_batch_size}"
-                f"{f', n_questions={n_questions}' if n_questions is not None else ''}) "
+                f"{f', n_questions={n_questions}' if n_questions is not None else ''}"
+                f", n_labeled={len(question_ids) if question_ids is not None else 'all'}) "
                 f"-> {predictions_path}"
             )
             per_model[f"{label}/{key}"] = grade_predictions_file(
@@ -647,9 +907,10 @@ def grade_with_judge(
                 batch_size=effective_batch_size,
                 force=force,
                 prompt=prompt_name,
-                include_gold=include_gold,
+                include_gold=gold_flag,
                 make_primary=make_primary,
                 n_questions=n_questions,
+                question_ids=question_ids,
             )
             results_volume.commit()
             print(f"[run-judges] {label}:", per_model[f"{label}/{key}"])
@@ -660,7 +921,7 @@ def grade_with_judge(
             primary=primary_judge,
             make_primary=make_primary,
             prompt=prompt_name,
-            include_gold=include_gold,
+            include_gold=gold_flag,
         )
     write_json(pack_dir / "manifest.json", manifest)
     results_volume.commit()
@@ -673,8 +934,10 @@ def grade_with_judge(
         "by_model": per_model,
         "judges": manifest.get("judges"),
         "prompt": last_prompt,
-        "include_gold": include_gold,
+        "include_gold": last_gold if include_gold is not None else None,
+        "modes": modes,
         "n_questions": n_questions,
+        "n_labeled": len(question_ids) if question_ids is not None else None,
     }
 
 
@@ -682,16 +945,18 @@ def _grade_suite_judge(
     judge_label: str,
     *,
     model_labels: list[str],
-    include_gold: bool,
+    include_gold: bool | None,
     force: bool,
     batch_size: int | None,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict:
     from grader import (
         compose_judge_key,
+        gold_mode_flags,
         grade_predictions_file,
+        grade_prompt_name,
         load_grader,
-        parse_grade_prompt_list,
     )
 
     volume.reload()
@@ -701,20 +966,28 @@ def _grade_suite_judge(
         raise SystemExit(f"Pack not found: {pack_dir}")
     _assert_freeform_run(_load_manifest(pack_dir))
 
-    prompts = parse_grade_prompt_list(include_gold=include_gold)
     handle = load_grader(judge_label)
     model_id = handle.get("model_id") or judge_label
     per_model: dict[str, dict] = {}
     keys: list[str] = []
+    modes: list[dict] = []
     gradees = [label for label in model_labels if label != judge_label]
-    for gradee in gradees:
-        predictions_path = pack_dir / "models" / gradee / "predictions.jsonl"
-        for prompt_name in prompts:
-            key = compose_judge_key(
-                judge_label, prompt=prompt_name, include_gold=include_gold
+    for gold_flag in gold_mode_flags(include_gold):
+        prompt_name = grade_prompt_name(gold_flag)
+        key = compose_judge_key(
+            judge_label, prompt=prompt_name, include_gold=gold_flag
+        )
+        if key not in keys:
+            keys.append(key)
+            modes.append(
+                {
+                    "prompt": prompt_name,
+                    "include_gold": gold_flag,
+                    "judge_key": key,
+                }
             )
-            if key not in keys:
-                keys.append(key)
+        for gradee in gradees:
+            predictions_path = pack_dir / "models" / gradee / "predictions.jsonl"
             sidecar = (
                 pack_dir / "models" / gradee / "judge_partials" / f"{key}.jsonl"
             )
@@ -729,9 +1002,10 @@ def _grade_suite_judge(
                 batch_size=batch_size,
                 force=force,
                 prompt=prompt_name,
-                include_gold=include_gold,
+                include_gold=gold_flag,
                 sidecar_path=sidecar,
                 n_questions=n_questions,
+                question_ids=question_ids,
             )
             results_volume.commit()
             print(f"[run-judges-rr] {gradee}/{key}:", per_model[f"{gradee}/{key}"])
@@ -743,8 +1017,10 @@ def _grade_suite_judge(
         "gradees": gradees,
         "by_model": per_model,
         "include_gold": include_gold,
-        "prompts": prompts,
+        "modes": modes,
+        "prompts": [item["prompt"] for item in modes],
         "n_questions": n_questions,
+        "n_labeled": len(question_ids) if question_ids is not None else None,
     }
 
 
@@ -761,10 +1037,11 @@ _SUITE_GRADE_KW = dict(
 def grade_suite_l40s(
     judge_label: str,
     model_labels: list[str],
-    include_gold: bool = True,
+    include_gold: bool | None = None,
     force: bool = False,
     batch_size: int | None = None,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict:
     return _grade_suite_judge(
         judge_label,
@@ -773,6 +1050,7 @@ def grade_suite_l40s(
         force=force,
         batch_size=batch_size,
         n_questions=n_questions,
+        question_ids=question_ids,
     )
 
 
@@ -780,10 +1058,11 @@ def grade_suite_l40s(
 def grade_suite_a100(
     judge_label: str,
     model_labels: list[str],
-    include_gold: bool = True,
+    include_gold: bool | None = None,
     force: bool = False,
     batch_size: int | None = None,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict:
     return _grade_suite_judge(
         judge_label,
@@ -792,6 +1071,7 @@ def grade_suite_a100(
         force=force,
         batch_size=batch_size,
         n_questions=n_questions,
+        question_ids=question_ids,
     )
 
 
@@ -799,10 +1079,11 @@ def grade_suite_a100(
 def grade_suite_h100(
     judge_label: str,
     model_labels: list[str],
-    include_gold: bool = True,
+    include_gold: bool | None = None,
     force: bool = False,
     batch_size: int | None = None,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict:
     return _grade_suite_judge(
         judge_label,
@@ -811,6 +1092,7 @@ def grade_suite_h100(
         force=force,
         batch_size=batch_size,
         n_questions=n_questions,
+        question_ids=question_ids,
     )
 
 
@@ -930,6 +1212,21 @@ def run_aggregate() -> dict:
     return result
 
 
+@app.function(
+    image=cpu_image,
+    timeout=30 * 60,
+    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+)
+def run_accuracy() -> dict:
+    results_volume.reload()
+    pack_dir = _pack_dir()
+    if not pack_dir.is_dir():
+        raise SystemExit(f"Pack not found: {pack_dir}")
+    result = report_judge_accuracy(pack_dir)
+    results_volume.commit()
+    return result
+
+
 def _download_pack() -> None:
     from download_results import download_results
 
@@ -1022,11 +1319,11 @@ def _spawn_remote_judges(
     suite: list[str],
     dedicated: list[dict],
     gradees: list[str],
-    prompts: list[str],
-    include_gold: bool,
+    include_gold: bool | None,
     force: bool,
     batch_size: int | None,
     n_questions: int | None,
+    question_ids: list[str] | None,
     primary_judge: str,
     dedicated_make_primary: bool,
 ) -> tuple[list[tuple[str, object]], list[tuple[dict, object]]]:
@@ -1046,6 +1343,7 @@ def _spawn_remote_judges(
                     force=force,
                     batch_size=batch_size,
                     n_questions=n_questions,
+                    question_ids=question_ids,
                 ),
             )
         )
@@ -1066,6 +1364,7 @@ def _spawn_remote_judges(
                     include_gold=include_gold,
                     make_primary=this_primary,
                     n_questions=n_questions,
+                    question_ids=question_ids,
                 ),
             )
         )
@@ -1075,10 +1374,8 @@ def _spawn_remote_judges(
 def _collect_remote_judges(
     suite_handles: list[tuple[str, object]],
     dedicated_handles: list[tuple[dict, object]],
-    prompts: list[str],
-    include_gold: bool,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    from grader import compose_judge_key
+    from grader import compose_judge_key, gold_mode_flags, grade_prompt_name
 
     grade_results: list[dict] = []
     judge_entries: list[dict] = []
@@ -1087,17 +1384,34 @@ def _collect_remote_judges(
         grade_results.append(result)
         print(f"Judge {label}:", result)
         model_id = result.get("model_id") or label
-        for prompt_name in result.get("prompts") or prompts:
+        modes = list(result.get("modes") or [])
+        if not modes:
+            include_gold = result.get("include_gold")
+            for gold_flag in gold_mode_flags(
+                None if include_gold is None else bool(include_gold)
+            ):
+                prompt_name = grade_prompt_name(gold_flag)
+                modes.append(
+                    {
+                        "prompt": prompt_name,
+                        "include_gold": gold_flag,
+                        "judge_key": compose_judge_key(
+                            label, prompt=prompt_name, include_gold=gold_flag
+                        ),
+                    }
+                )
+        for mode in modes:
             judge_entries.append(
                 {
-                    "judge_key": compose_judge_key(
+                    "judge_key": mode.get("judge_key")
+                    or compose_judge_key(
                         label,
-                        prompt=prompt_name,
-                        include_gold=include_gold,
+                        prompt=mode.get("prompt"),
+                        include_gold=bool(mode.get("include_gold")),
                     ),
                     "model_id": model_id,
-                    "prompt": prompt_name,
-                    "include_gold": include_gold,
+                    "prompt": mode.get("prompt"),
+                    "include_gold": mode.get("include_gold"),
                 }
             )
 
@@ -1118,7 +1432,7 @@ def _finish_remote_pack(
     primary_judge: str | None,
     skip_aggregate: bool,
     ingest: bool,
-) -> tuple[dict | None, dict | None, dict | None]:
+) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     ingest_result = None
     if ingest:
         ingest_result = ingest_local_pack.remote()
@@ -1138,7 +1452,9 @@ def _finish_remote_pack(
     if not skip_aggregate:
         agg = run_aggregate.remote()
         print("Aggregated:", agg)
-    return ingest_result, merge, agg
+    accuracy = run_accuracy.remote()
+    print("Judge accuracy:", accuracy)
+    return ingest_result, merge, agg, accuracy
 
 
 @app.function(
@@ -1153,7 +1469,7 @@ def run_judges_pipeline(
     force: bool = False,
     batch_size: int | None = None,
     skip_aggregate: bool = False,
-    include_gold: bool = True,
+    include_gold: bool | None = None,
     n_questions: int | None = None,
     ingest_local: bool = False,
 ) -> dict:
@@ -1171,21 +1487,23 @@ def run_judges_pipeline(
     suite = list(prep.get("suite_judges") or [])
     dedicated = list(prep.get("dedicated_judges") or [])
     gradees = list(prep["model_labels"])
+    question_ids = list(prep.get("question_ids") or [])
     first_new = prep.get("first_new")
     print(
         f"[run-judges] pipeline prep primary={prep['primary_judge']} "
         f"(existing_primary={prep['existing_primary']}) "
-        f"existing_judges={prep['existing_judges']}"
+        f"existing_judges={prep['existing_judges']} "
+        f"n_labeled={len(question_ids)} gold={_gold_mode_note(include_gold)}"
     )
     suite_handles, dedicated_handles = _spawn_remote_judges(
         suite=suite,
         dedicated=dedicated,
         gradees=gradees,
-        prompts=prompts,
         include_gold=include_gold,
         force=force,
         batch_size=batch_size,
         n_questions=n_questions,
+        question_ids=question_ids,
         primary_judge=prep["primary_judge"],
         dedicated_make_primary=bool(make_primary)
         and any(first_new == entry["label"] for entry in dedicated),
@@ -1194,9 +1512,9 @@ def run_judges_pipeline(
     if n_remote:
         print(f"[run-judges] {n_remote} remote judge(s) running")
     grade_results, dedicated_grades, judge_entries = _collect_remote_judges(
-        suite_handles, dedicated_handles, prompts, include_gold
+        suite_handles, dedicated_handles
     )
-    _ingest, merge, agg = _finish_remote_pack(
+    _ingest, merge, agg, accuracy = _finish_remote_pack(
         suite=suite,
         gradees=gradees,
         judge_entries=judge_entries,
@@ -1211,6 +1529,8 @@ def run_judges_pipeline(
         "dedicated": dedicated_grades,
         "merge": merge,
         "aggregate": agg,
+        "accuracy": accuracy,
+        "prompts": prompts,
     }
 
 
@@ -1222,7 +1542,7 @@ def _run_judges(
     force: bool = False,
     batch_size: int | None = None,
     skip_aggregate: bool = False,
-    include_gold: bool = True,
+    include_gold: bool | None = None,
     n_questions: int | None = None,
     qps: float = 4.0,
     max_workers: int = 8,
@@ -1230,14 +1550,21 @@ def _run_judges(
     retries: int = 20,
     retry_interval: float = 1.0,
 ) -> dict:
-    from grader import compose_judge_key, parse_grade_prompt_list, require_audio_nongold_judge
+    from grader import (
+        compose_judge_key,
+        gold_mode_flags,
+        grade_prompt_name,
+        parse_grade_prompt_list,
+        require_audio_nongold_judge,
+    )
     from mmar_api import grade_pack_with_api_judges
 
     if n_questions is not None and int(n_questions) < 0:
         n_questions = None
 
     suite, dedicated, api, first_new = _select_judges(judge_model_id)
-    if not include_gold:
+    gold_flags = gold_mode_flags(include_gold)
+    if include_gold is False:
         if dedicated:
             for entry in dedicated:
                 require_audio_nongold_judge(entry["model_id"], include_gold=False)
@@ -1248,6 +1575,7 @@ def _run_judges(
     prompts = parse_grade_prompt_list(include_gold=include_gold)
     pack_dir: Path | None = None
     gradees: list[str] = []
+    question_ids: list[str] = []
     existing_primary = None
     mode = "freeform"
     if api or not needs_modal:
@@ -1255,6 +1583,7 @@ def _run_judges(
         manifest = _load_manifest(pack_dir)
         mode = _assert_freeform_run(manifest)
         gradees = _local_model_labels(models)
+        question_ids = _require_labeled_question_ids(pack_dir)
         existing_primary = manifest.get("primary_judge")
     if make_primary:
         primary = first_new
@@ -1268,8 +1597,9 @@ def _run_judges(
         f"suite_judges={suite} dedicated_judges={[d['label'] for d in dedicated]} "
         f"api_judges={api} gradees={gradees or '(modal)'} primary={primary} "
         f"(existing_primary={existing_primary}) "
-        f"prompt={prompts[0] if prompts else 'with_gt'} include_gold={include_gold} "
-        f"n_questions={n_questions} force={force}"
+        f"gold={_gold_mode_note(include_gold)} prompts={prompts} "
+        f"n_questions={n_questions} n_labeled={len(question_ids) or '(modal)'} "
+        f"force={force}"
     )
 
     api_results: list[dict] = []
@@ -1280,32 +1610,41 @@ def _run_judges(
             return
         if pack_dir is None:
             raise SystemExit(
-                "API judges require a local pack at outputs/mmar-freeform-5-shot"
+                "API judges require a local pack at outputs/mmar-freeform"
             )
+        labeled = question_ids or _require_labeled_question_ids(pack_dir)
+        collected: list[dict] = []
+        first_prompt = grade_prompt_name(gold_flags[0])
         first_api_key = compose_judge_key(
-            api[0], prompt=prompts[0], include_gold=include_gold
+            api[0], prompt=first_prompt, include_gold=gold_flags[0]
         )
         set_primary = api_make_primary or (
             not existing_primary and not suite and not dedicated
         )
-        api_results = asyncio.run(
-            grade_pack_with_api_judges(
-                pack_dir,
-                labels=api,
-                model_labels=gradees,
-                prompts=prompts,
-                include_gold=include_gold,
-                force=force,
-                n_questions=n_questions,
-                make_primary=set_primary,
-                primary_judge=first_api_key if set_primary else primary,
-                qps=qps,
-                max_workers=max_workers,
-                timeout=timeout,
-                retries=retries,
-                retry_interval=retry_interval,
+        for gold_flag in gold_flags:
+            mode_prompts = parse_grade_prompt_list(include_gold=gold_flag)
+            collected.extend(
+                asyncio.run(
+                    grade_pack_with_api_judges(
+                        pack_dir,
+                        labels=api,
+                        model_labels=gradees,
+                        prompts=mode_prompts,
+                        include_gold=gold_flag,
+                        force=force,
+                        n_questions=n_questions,
+                        question_ids=labeled,
+                        make_primary=set_primary and gold_flag is gold_flags[0],
+                        primary_judge=first_api_key if set_primary else primary,
+                        qps=qps,
+                        max_workers=max_workers,
+                        timeout=timeout,
+                        retries=retries,
+                        retry_interval=retry_interval,
+                    )
+                )
             )
-        )
+        api_results = collected
         first_key = str(api_results[0].get("judge_key") or first_api_key)
         _merge_api_manifest(
             pack_dir,
@@ -1320,6 +1659,7 @@ def _run_judges(
         if pack_dir is None:
             raise SystemExit(f"Pack not found at {LOCAL_PACK_DIR}")
         agg = None if skip_aggregate else _aggregate_pack(pack_dir)
+        accuracy = report_judge_accuracy(pack_dir)
         return {
             "prepare": None,
             "grade": [],
@@ -1327,6 +1667,7 @@ def _run_judges(
             "api": api_results,
             "merge": None,
             "aggregate": agg,
+            "accuracy": accuracy,
         }
 
     run_judges_pipeline.spawn(
@@ -1372,7 +1713,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--judge-model-id",
         default="",
-        help="Comma-separated judges, or 'api' for both API judges",
+        help="Comma-separated judges, or 'api' for API judges",
     )
     parser.add_argument("--models", default="all")
     parser.add_argument("--make-primary", action="store_true")
@@ -1387,9 +1728,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-gold",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
+        help="Grade with-GT only (--include-gold) or no-GT only "
+        "(--no-include-gold). Default: both.",
     )
     parser.add_argument("--n-questions", type=int, default=None)
+    parser.add_argument(
+        "--accuracy-only",
+        action="store_true",
+        help="Recompute judge_accuracy.json from the local pack; do not grade.",
+    )
     parser.add_argument("--qps", type=float, default=4.0)
     parser.add_argument("--max-workers", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=180.0)
@@ -1399,6 +1747,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run_judges_from_args(args: argparse.Namespace) -> dict:
+    if args.accuracy_only:
+        pack_dir = _require_local_pack()
+        return report_judge_accuracy(pack_dir)
     return _run_judges(
         judge_model_id=args.judge_model_id,
         models=args.models,
@@ -1419,11 +1770,16 @@ def _run_judges_from_args(args: argparse.Namespace) -> dict:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
-    suite, dedicated, _api, _first = _select_judges(args.judge_model_id)
-    if suite or dedicated:
-        with app.run(detach=True):
-            _run_judges_from_args(args)
-    else:
+    if args.accuracy_only:
         _run_judges_from_args(args)
+    else:
+        suite, dedicated, _api, _first = _select_judges(args.judge_model_id)
+        if suite or dedicated:
+            # Show image-build / mount progress; otherwise App.run() is silent.
+            with modal.enable_output():
+                with app.run(detach=True):
+                    _run_judges_from_args(args)
+        else:
+            _run_judges_from_args(args)
 
 

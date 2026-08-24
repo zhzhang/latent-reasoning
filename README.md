@@ -158,17 +158,17 @@ with a freeform run on the same question ids, sorts by
 Δ = MCQ avg − freeform avg, and shows both modes’ per-model shots when a
 question is selected.
 
-## Judge the freeform 5-shot pack
+## Judge the freeform pack
 
-`run_judges.py` grades `outputs/mmar-freeform-5-shot` (from
+`run_judges.py` grades `outputs/mmar-freeform` (from
 `collate_mmar_freeform.py`). With no `--judge-model-id`, every suite model
 grades every other pack model's shots. Pass ids to run only those judges.
 Shots that already have a verdict for the same judge key are skipped. Pass
 `--force` to replace existing verdicts.
 
 vLLM suite / dedicated judges run on Modal (this script starts a detached
-App). API judges (`gpt-audio-mini`, `gemini-3.7-flash`; aliases
-`gemini-3.7-mini`, `gemini`, or `api` for both) run locally against the
+App). API judges (`gemini-3.7-flash`; aliases
+`gemini-3.7-mini`, `gemini`, or `api`) run locally against the
 same pack and do not start Modal. Empty `--judge-model-id` stays
 suite-only so a bare run does not spend API quota. API judges skip their own pack label (round-robin).
 Audio is attached only with `--no-include-gold`; the gold path is text-only.
@@ -198,14 +198,14 @@ uv run run_judges.py \
   --judge-model-id qwen3.6-35b-a3b-fp8 \
   --force
 
-# API judges (local; needs OPENAI_API_KEY / GEMINI_API_KEY)
+# API judges (local; needs GEMINI_API_KEY)
 uv run run_judges.py \
-  --judge-model-id gpt-audio-mini,gemini-3.7-flash
+  --judge-model-id gemini-3.7-flash
 uv run run_judges.py --judge-model-id api --no-include-gold
 
 # Mixed: API locally while Modal vLLM runs detached
 uv run run_judges.py \
-  --judge-model-id gpt-audio-mini,qwen3-omni-instruct
+  --judge-model-id gemini-3.7-flash,qwen3-omni-instruct
 ```
 
 API path knobs: `--qps` (default 4), `--max-workers` (8), `--timeout`
@@ -289,13 +289,13 @@ Freeform shot records store per-judge verdicts under `shots[].judges`:
   "answer_prediction": "…",
   "correct": false,
   "grader": "Qwen/Qwen2.5-3B-Instruct",
-  "grader_output": "Fail",
+  "grader_output": "0",
   "judges": {
     "qwen2.5-3b-instruct": {
       "correct": false,
       "verdict": "fail",
-      "output": "Fail",
-      "generation": "…full judge generation ending in Fail…",
+      "output": "0",
+      "generation": "…full judge generation ending in <answer>0</answer>…",
       "model_id": "Qwen/Qwen2.5-3B-Instruct"
     }
   }
@@ -303,7 +303,7 @@ Freeform shot records store per-judge verdicts under `shots[].judges`:
 ```
 
 `generation` is the full judge reply (up to 4096 tokens); `output` /
-`verdict` are the parsed final `Pass`/`Fail`. Re-running the same judge
+`verdict` are the parsed final `1`/`0` (`pass`/`fail`). Re-running the same judge
 (via `run_judges.py --force` or `--force-grade`) replaces prior entries for
 that label.
 

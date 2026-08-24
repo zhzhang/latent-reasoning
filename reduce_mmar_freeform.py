@@ -1,11 +1,12 @@
-"""Reduce the collated MMAR freeform pack: drop Nemotron, keep 3 shots.
+"""Reduce the collated MMAR freeform pack: drop Nemotron and gpt-audio-mini.
 
-Rewrites ``outputs/mmar-freeform-5-shot`` in place:
+Rewrites ``outputs/mmar-freeform`` in place:
 
-  * delete ``models/nemotron-3-nano-omni``
-  * drop Nemotron judge keys from remaining predictions, sidecars, and the
-    manifest (``nemotron-3-nano-omni__…``)
+  * delete ``models/nemotron-3-nano-omni`` and ``models/gpt-audio-mini``
+  * drop those models' judge keys from remaining predictions, sidecars, and
+    the manifest (``{label}__…``)
   * keep the first ``--n-shots`` attempts per question (by ``shot_index``)
+  * drop those models' rows from ``labels.csv``
   * re-aggregate ``difficulty.jsonl`` / ``scores.json``
 
 Usage::
@@ -17,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
 from datetime import datetime, timezone
@@ -27,8 +29,8 @@ from aggregate import aggregate_difficulty, write_jsonl
 from mmar_common import load_jsonl, recompute_multi_judge_scores, write_json
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_PACK = REPO_ROOT / "outputs" / "mmar-freeform-5-shot"
-DEFAULT_DROP_MODELS = ("nemotron-3-nano-omni",)
+DEFAULT_PACK = REPO_ROOT / "outputs" / "mmar-freeform"
+DEFAULT_DROP_MODELS = ("nemotron-3-nano-omni", "gpt-audio-mini")
 DEFAULT_N_SHOTS = 3
 
 
@@ -68,6 +70,9 @@ def downsample_record(
                     judges.pop(key, None)
     record["shots"] = shots
     record["n_shots"] = len(shots)
+    primary = record.get("primary_judge")
+    if primary and is_dropped_judge(str(primary), drop_models):
+        record["primary_judge"] = None
     if isinstance(record.get("judges"), list):
         record["judges"] = [
             label
@@ -123,6 +128,7 @@ def update_manifest(
     remaining: list[str],
 ) -> dict[str, Any]:
     manifest["n_shots"] = n_shots
+    manifest["name"] = "mmar-freeform"
     manifest["models"] = remaining
     progress = dict(manifest.get("progress") or {})
     for label in list(progress):
@@ -133,6 +139,21 @@ def update_manifest(
         row["n_shots"] = n_shots
         progress[label] = row
     manifest["progress"] = progress
+    sources = []
+    for source in manifest.get("sources") or []:
+        if not isinstance(source, dict):
+            sources.append(source)
+            continue
+        models = [
+            label
+            for label in (source.get("models") or [])
+            if str(label) not in drop_models
+        ]
+        source = dict(source)
+        source["models"] = models
+        sources.append(source)
+    if "sources" in manifest:
+        manifest["sources"] = sources
     if "judges" in manifest:
         judges = []
         for entry in manifest.get("judges") or []:
@@ -144,9 +165,76 @@ def update_manifest(
                 continue
             judges.append(entry)
         manifest["judges"] = judges
+    primary = str(manifest.get("primary_judge") or "")
+    if not primary or is_dropped_judge(primary, drop_models):
+        replacement = None
+        for entry in manifest.get("judges") or []:
+            if isinstance(entry, dict):
+                model_id = str(entry.get("model_id") or "")
+                label = str(entry.get("label") or "")
+            else:
+                model_id = ""
+                label = str(entry or "")
+            if model_id and not is_dropped_judge(model_id, drop_models):
+                replacement = model_id
+                break
+            if label and not is_dropped_judge(label, drop_models):
+                replacement = label
+                break
+        manifest["primary_judge"] = replacement
     now = datetime.now(timezone.utc).isoformat()
     manifest["updated_at"] = now
     return manifest
+
+
+def filter_accuracy_json(path: Path, drop_models: set[str]) -> None:
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    payload["pack"] = "mmar-freeform"
+    payload["labels_path"] = str(path.parent / "labels.csv")
+    for mode in ("with_gt", "free"):
+        bucket = payload.get(mode)
+        if isinstance(bucket, dict):
+            payload[mode] = {
+                key: value
+                for key, value in bucket.items()
+                if not is_dropped_judge(str(key), drop_models)
+            }
+    write_json(path, payload)
+
+
+def filter_labels_csv(path: Path, drop_models: set[str]) -> tuple[int, int]:
+    """Drop labeled rows whose ``model_label`` is a removed test-taker.
+
+    Returns ``(kept, dropped)``.
+    """
+    if not path.is_file():
+        return 0, 0
+
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if not fieldnames:
+        return 0, 0
+    kept = [
+        row
+        for row in rows
+        if str(row.get("model_label") or "") not in drop_models
+    ]
+    dropped = len(rows) - len(kept)
+    if dropped:
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(kept)
+    return len(kept), dropped
 
 
 def reduce_pack(
@@ -174,6 +262,8 @@ def reduce_pack(
         "shots_after": 0,
         "partial_files_removed": 0,
         "partial_rows_dropped": 0,
+        "label_rows_kept": 0,
+        "label_rows_dropped": 0,
     }
 
     if dry_run:
@@ -263,19 +353,23 @@ def reduce_pack(
             ids_payload["n_shots"] = n_shots
             write_json(ids_path, ids_payload)
 
+    kept_labels, dropped_labels = filter_labels_csv(pack_dir / "labels.csv", drop_models)
+    stats["label_rows_kept"] = kept_labels
+    stats["label_rows_dropped"] = dropped_labels
+    filter_accuracy_json(pack_dir / "judge_accuracy.json", drop_models)
     aggregate_difficulty(pack_dir)
     return stats
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Drop Nemotron and downsample freeform pack shots from 5 to 3."
+        description="Drop Nemotron and gpt-audio-mini; keep 3 shots per question."
     )
     parser.add_argument(
         "--pack",
         type=Path,
         default=DEFAULT_PACK,
-        help="Freeform pack directory (default: outputs/mmar-freeform-5-shot).",
+        help="Freeform pack directory (default: outputs/mmar-freeform).",
     )
     parser.add_argument(
         "--n-shots",
@@ -287,7 +381,7 @@ def parse_args() -> argparse.Namespace:
         "--drop-model",
         action="append",
         default=None,
-        help="Model label to delete (repeatable). Default: nemotron-3-nano-omni.",
+        help="Model label to delete (repeatable). Default: nemotron-3-nano-omni, gpt-audio-mini.",
     )
     parser.add_argument(
         "--dry-run",
@@ -323,6 +417,10 @@ def main() -> None:
     print(
         f"judge_partials: removed {stats['partial_files_removed']} files, "
         f"dropped {stats['partial_rows_dropped']} extra-shot rows"
+    )
+    print(
+        f"labels.csv: kept {stats.get('label_rows_kept', 0)}, "
+        f"dropped {stats.get('label_rows_dropped', 0)}"
     )
     if args.dry_run:
         print("dry-run: no files written")

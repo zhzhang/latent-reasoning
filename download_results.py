@@ -8,7 +8,7 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       scores.json
       manifest.json
       models/<label>/predictions.jsonl
-    mmar-freeform-5-shot/                    # run_judges.py (collated pack)
+    mmar-freeform/                           # run_judges.py (collated pack)
     mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
       scores.json
