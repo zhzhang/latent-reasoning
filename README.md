@@ -158,10 +158,12 @@ with a freeform run on the same question ids, sorts by
 Δ = MCQ avg − freeform avg, and shows both modes’ per-model shots when a
 question is selected.
 
-## Judge the freeform pack
+## Judge labeled MMAR generations
 
-`run_judges.py` grades `outputs/mmar-freeform` (from
-`collate_mmar_freeform.py`). With no `--judge-model-id`, every suite model
+`run_judges.py` grades labeled questions from `exports/labels.csv` and
+`exports/generations.csv`, joining question text, gold answers, and audio
+from MMAR-meta. Verdicts are written to `outputs/mmar-judging` (Modal
+volume path `mmar-judging`). With no `--judge-model-id`, every suite model
 grades every other pack model's shots. Pass ids to run only those judges.
 Shots that already have a verdict for the same judge key are skipped. Pass
 `--force` to replace existing verdicts.

@@ -1,10 +1,13 @@
-"""Judge the collated MMAR freeform pack.
+"""Judge labeled MMAR generations from ``exports/``.
 
-Always reads and writes ``outputs/mmar-freeform``. Grades only
-questions present in ``labels.csv``. Default is both with-GT and no-GT
-recipes (one GPU load per judge). Shots that already have a verdict for
-the same judge key are skipped. Regenerates ``difficulty.jsonl`` /
-``scores.json`` after grading, then writes ``judge_accuracy.json``.
+Reads ``exports/labels.csv`` and ``exports/generations.csv``, joins
+question / gold / audio from MMAR-meta, and writes the judged pack to
+``outputs/mmar-judging`` (Modal volume path ``mmar-judging``). Grades
+only questions present in ``labels.csv``. Default is both with-GT and
+no-GT recipes (one GPU load per judge). Shots that already have a
+verdict for the same judge key are skipped. Regenerates
+``difficulty.jsonl`` / ``scores.json`` after grading, then writes
+``judge_accuracy.json``.
 
 vLLM suite / dedicated judges start Modal from this script. API judges
 (gemini-3.7-flash) run locally and never open an App.
@@ -52,14 +55,17 @@ import csv
 import json
 import logging
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import modal
 
-from aggregate import aggregate_difficulty, discover_model_labels
-from mmar_common import judge_label, write_json
+from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
+from mmar_common import judge_label, load_jsonl, resolve_path, write_json, write_jsonl
 from modal_cache import (
+    DEFAULT_MMAR_DATA_ROOT,
+    DEFAULT_MMAR_META,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
     hf_secret,
@@ -68,13 +74,17 @@ from modal_cache import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
-PACK_NAME = "mmar-freeform"
+PACK_NAME = "mmar-judging"
+EXPORTS_DIR = REPO_ROOT / "exports"
 LOCAL_PACK_DIR = REPO_ROOT / "outputs" / PACK_NAME
 REMOTE_PACK_DIR = RESULTS_MOUNT / PACK_NAME
-LOCAL_PACK_MOUNT = Path("/local-pack")
+LOCAL_EXPORTS_MOUNT = Path("/local-exports")
 INGEST_DIR_NAME = "_local_ingest"
 LABELS_CSV_NAME = "labels.csv"
+GENERATIONS_CSV_NAME = "generations.csv"
 ACCURACY_JSON_NAME = "judge_accuracy.json"
+LOCAL_MMAR_DATA_ROOT = REPO_ROOT / "data" / "mmar"
+LOCAL_MMAR_META = LOCAL_MMAR_DATA_ROOT / "MMAR-meta.jsonl"
 
 app = modal.App("run-judges")
 
@@ -140,12 +150,262 @@ def _require_labeled_question_ids(pack_dir: Path) -> list[str]:
     if not path.is_file():
         raise SystemExit(
             f"labels.csv not found at {path}. "
-            f"Expected {LOCAL_PACK_DIR / LABELS_CSV_NAME}."
+            f"Expected {EXPORTS_DIR / LABELS_CSV_NAME}."
         )
     ids = labeled_question_ids(load_pack_label_rows(path))
     if not ids:
         raise SystemExit(f"No labeled questions in {path}")
     return ids
+
+
+def _exports_dir() -> Path:
+    mounted = LOCAL_EXPORTS_MOUNT / LABELS_CSV_NAME
+    if mounted.is_file():
+        return LOCAL_EXPORTS_MOUNT
+    local = EXPORTS_DIR / LABELS_CSV_NAME
+    if local.is_file():
+        return EXPORTS_DIR
+    raise SystemExit(
+        f"Exports not found. Expected {EXPORTS_DIR / LABELS_CSV_NAME} "
+        f"and {EXPORTS_DIR / GENERATIONS_CSV_NAME}."
+    )
+
+
+def _meta_path() -> Path:
+    if DEFAULT_MMAR_META.is_file():
+        return DEFAULT_MMAR_META
+    if LOCAL_MMAR_META.is_file():
+        return LOCAL_MMAR_META
+    raise SystemExit(
+        f"MMAR-meta.jsonl not found at {DEFAULT_MMAR_META} or {LOCAL_MMAR_META}. "
+        "Seed the volume or download MMAR locally under data/mmar/."
+    )
+
+
+def _data_root() -> Path:
+    if DEFAULT_MMAR_DATA_ROOT.is_dir():
+        return DEFAULT_MMAR_DATA_ROOT
+    return LOCAL_MMAR_DATA_ROOT
+
+
+def _load_mmar_meta(meta_path: Path) -> dict[str, dict]:
+    rows = load_jsonl(meta_path)
+    by_id: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        qid = str(row.get("id") or "").strip()
+        if qid:
+            by_id[qid] = row
+    if not by_id:
+        raise SystemExit(f"No MMAR-meta rows in {meta_path}")
+    return by_id
+
+
+def _load_generation_rows(path: Path, labeled_ids: set[str]) -> list[dict]:
+    if not path.is_file():
+        raise SystemExit(f"generations.csv not found at {path}")
+    rows: list[dict] = []
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for raw in reader:
+            qid = str(raw.get("question_id") or "").strip()
+            if not qid or qid not in labeled_ids:
+                continue
+            model = str(raw.get("model_label") or "").strip()
+            prediction = raw.get("answer_prediction")
+            if prediction is None or not model:
+                continue
+            try:
+                shot_index = int(raw.get("shot_index", 0))
+            except (TypeError, ValueError):
+                continue
+            generation_id = str(raw.get("generation_id") or "").strip()
+            rows.append(
+                {
+                    "question_id": qid,
+                    "model_label": model,
+                    "shot_index": shot_index,
+                    "answer_prediction": str(prediction),
+                    "generation_id": generation_id,
+                }
+            )
+    if not rows:
+        raise SystemExit(f"No generation rows for labeled questions in {path}")
+    return rows
+
+
+def _resolve_audio_path(raw: object, data_root: Path) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    resolved = Path(resolve_path(data_root, text))
+    if resolved.is_file():
+        return str(resolved)
+    return text
+
+
+def _question_record(meta: dict, *, qid: str, data_root: Path) -> dict:
+    question = str(meta.get("question") or "").strip()
+    answer = str(meta.get("answer") or "").strip()
+    if not question or not answer:
+        raise SystemExit(
+            f"MMAR-meta row {qid!r} is missing question or answer"
+        )
+    record = dict(meta)
+    record["id"] = qid
+    record["question"] = question
+    record["answer"] = answer
+    record["audio_path"] = _resolve_audio_path(meta.get("audio_path"), data_root)
+    record.pop("model_output", None)
+    return record
+
+
+def _records_from_exports(
+    exports_dir: Path,
+    meta_path: Path,
+    data_root: Path,
+) -> dict[str, list[dict]]:
+    label_rows = load_pack_label_rows(exports_dir / LABELS_CSV_NAME)
+    labeled_ids = set(labeled_question_ids(label_rows))
+    if not labeled_ids:
+        raise SystemExit(f"No labeled questions in {exports_dir / LABELS_CSV_NAME}")
+    gen_rows = _load_generation_rows(exports_dir / GENERATIONS_CSV_NAME, labeled_ids)
+    missing_gen = labeled_ids - {row["question_id"] for row in gen_rows}
+    if missing_gen:
+        sample = ", ".join(sorted(missing_gen)[:5])
+        raise SystemExit(
+            f"{len(missing_gen)} labeled question(s) missing from generations.csv "
+            f"(e.g. {sample})"
+        )
+    meta_by_id = _load_mmar_meta(meta_path)
+    missing_meta = sorted(qid for qid in labeled_ids if qid not in meta_by_id)
+    if missing_meta:
+        sample = ", ".join(missing_meta[:5])
+        raise SystemExit(
+            f"{len(missing_meta)} labeled question(s) missing from MMAR-meta "
+            f"at {meta_path} (e.g. {sample})"
+        )
+
+    grouped: dict[str, dict[str, dict[int, dict]]] = {}
+    for row in gen_rows:
+        model = row["model_label"]
+        qid = row["question_id"]
+        grouped.setdefault(model, {}).setdefault(qid, {})[row["shot_index"]] = row
+
+    by_model: dict[str, list[dict]] = {}
+    for model, by_qid in grouped.items():
+        records: list[dict] = []
+        for qid in labeled_question_ids(label_rows):
+            shots_by_index = by_qid.get(qid)
+            if not shots_by_index:
+                continue
+            shots = []
+            for shot_index in sorted(shots_by_index):
+                src = shots_by_index[shot_index]
+                shot = {
+                    "shot_index": shot_index,
+                    "answer_prediction": src["answer_prediction"],
+                    "correct": None,
+                    "pending_grade": True,
+                }
+                if src["generation_id"]:
+                    shot["generation_id"] = src["generation_id"]
+                shots.append(shot)
+            record = _question_record(meta_by_id[qid], qid=qid, data_root=data_root)
+            primary = shots[0] if shots else {}
+            record.update(
+                {
+                    "model": model,
+                    "n_shots": len(shots),
+                    "shots": shots,
+                    "answer_prediction": primary.get("answer_prediction"),
+                    "correct": None,
+                    "n_shot_correct": None,
+                    "shot_success_rate": None,
+                    "pending_grade": True,
+                }
+            )
+            records.append(record)
+        if records:
+            by_model[model] = records
+    if not by_model:
+        raise SystemExit(
+            "No model generations to grade after joining exports + MMAR-meta"
+        )
+    return by_model
+
+
+def materialize_exports_pack(
+    dest: Path,
+    *,
+    exports_dir: Path | None = None,
+    meta_path: Path | None = None,
+    data_root: Path | None = None,
+) -> dict:
+    """Build/merge a judging pack from exports CSVs + MMAR-meta.
+
+    Writes ``models/<label>/predictions.jsonl`` without ``model_output`` so
+    reuse keys stay on ``answer_prediction``. Merges into ``dest`` so existing
+    ``judges`` survive when shot answers are unchanged.
+    """
+    exports_dir = exports_dir or _exports_dir()
+    meta_path = meta_path or _meta_path()
+    data_root = data_root or _data_root()
+    by_model = _records_from_exports(exports_dir, meta_path, data_root)
+    labels = order_model_labels(list(by_model))
+    question_ids = labeled_question_ids(
+        load_pack_label_rows(exports_dir / LABELS_CSV_NAME)
+    )
+    n_shots = max(
+        (
+            len(record.get("shots") or [])
+            for recs in by_model.values()
+            for record in recs
+        ),
+        default=0,
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    with tempfile.TemporaryDirectory(prefix="mmar-judging-") as tmp:
+        src = Path(tmp)
+        for label in labels:
+            pred = src / "models" / label / "predictions.jsonl"
+            write_jsonl(pred, by_model[label], mode="w")
+        shutil.copy2(exports_dir / LABELS_CSV_NAME, src / LABELS_CSV_NAME)
+        write_json(
+            src / "question_ids.json",
+            {
+                "n": len(question_ids),
+                "ids": question_ids,
+                "n_shots": n_shots,
+                "source": "exports",
+            },
+        )
+        write_json(
+            src / "manifest.json",
+            {
+                "name": PACK_NAME,
+                "mode": "freeform",
+                "n_shots": n_shots,
+                "n_questions": len(question_ids),
+                "models": labels,
+                "source": "exports",
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+        dest.mkdir(parents=True, exist_ok=True)
+        _merge_pack_from(src, dest)
+    print(
+        f"[run-judges] materialized models={len(labels)} "
+        f"questions={len(question_ids)} n_shots={n_shots} from {exports_dir} -> {dest}"
+    )
+    return {
+        "models": labels,
+        "question_ids": question_ids,
+        "n_shots": n_shots,
+        "dest": str(dest),
+    }
 
 
 def _judge_mode_bucket(judge_key: str, entry: dict | None) -> str | None:
@@ -398,9 +658,9 @@ cpu_image = _mount_sources(
         "numpy", "tqdm>=4.67.0"
     )
 )
-if LOCAL_PACK_DIR.is_dir():
+if EXPORTS_DIR.is_dir():
     cpu_image = cpu_image.add_local_dir(
-        str(LOCAL_PACK_DIR), remote_path=str(LOCAL_PACK_MOUNT)
+        str(EXPORTS_DIR), remote_path=str(LOCAL_EXPORTS_MOUNT)
     )
 
 
@@ -554,19 +814,14 @@ def _merge_pack_from(src: Path, dest: Path) -> None:
                     )
 
 
-def _sync_local_pack() -> Path:
-    """Copy the local pack onto the results volume, keeping existing verdicts."""
+def _bootstrap_pack() -> dict:
+    """Materialize exports + MMAR-meta onto the results volume, keeping verdicts."""
     dest = _pack_dir()
-    if LOCAL_PACK_MOUNT.is_dir():
-        _merge_pack_from(LOCAL_PACK_MOUNT, dest)
-        results_volume.commit()
-        print(f"[run-judges] synced {LOCAL_PACK_MOUNT} -> {dest}")
+    built = materialize_exports_pack(dest)
+    results_volume.commit()
     if not dest.is_dir() or not (dest / "manifest.json").is_file():
-        raise SystemExit(
-            f"Pack not found at {dest}. Expected {LOCAL_PACK_DIR} "
-            "(run collate_mmar_freeform.py first)."
-        )
-    return dest
+        raise SystemExit(f"Failed to materialize pack at {dest}")
+    return built
 
 
 def _load_manifest(run_dir: Path) -> dict:
@@ -760,7 +1015,8 @@ def prepare_judges(
     """Validate the pack is freeform and resolve gradees / judges."""
     volume.reload()
     results_volume.reload()
-    pack_dir = _sync_local_pack()
+    built = _bootstrap_pack()
+    pack_dir = _pack_dir()
 
     manifest = _load_manifest(pack_dir)
     mode = _assert_freeform_run(manifest)
@@ -774,11 +1030,7 @@ def prepare_judges(
         if not existing_primary and manifest.get("grader_model_id"):
             existing_primary = judge_label(manifest["grader_model_id"])
 
-    labels = discover_model_labels(pack_dir, manifest=manifest)
-    local_models = LOCAL_PACK_MOUNT / "models"
-    if local_models.is_dir():
-        local_labels = {p.name for p in local_models.iterdir() if p.is_dir()}
-        labels = [label for label in labels if label in local_labels]
+    labels = list(built.get("models") or discover_model_labels(pack_dir, manifest=manifest))
     if models and models.strip().lower() != "all":
         requested = _csv_parts(models)
         missing = [label for label in requested if label not in labels]
@@ -1234,13 +1486,19 @@ def _download_pack() -> None:
     print(f"[run-judges] downloaded pack -> {saved}")
 
 
-def _require_local_pack() -> Path:
-    if not LOCAL_PACK_DIR.is_dir() or not (LOCAL_PACK_DIR / "manifest.json").is_file():
-        raise SystemExit(
-            f"Pack not found at {LOCAL_PACK_DIR}. "
-            "Run collate_mmar_freeform.py first."
-        )
+def _bootstrap_local_pack(*, need_audio: bool = False) -> Path:
+    if need_audio:
+        from view_mmar import DEFAULT_AUDIO_DIR, ensure_mmar_audio
+
+        ensure_mmar_audio(DEFAULT_AUDIO_DIR)
+    materialize_exports_pack(LOCAL_PACK_DIR)
+    if not (LOCAL_PACK_DIR / "manifest.json").is_file():
+        raise SystemExit(f"Failed to materialize pack at {LOCAL_PACK_DIR}")
     return LOCAL_PACK_DIR
+
+
+def _require_local_pack(*, need_audio: bool = False) -> Path:
+    return _bootstrap_local_pack(need_audio=need_audio)
 
 
 def _local_model_labels(models: str) -> list[str]:
@@ -1579,7 +1837,7 @@ def _run_judges(
     existing_primary = None
     mode = "freeform"
     if api or not needs_modal:
-        pack_dir = _require_local_pack()
+        pack_dir = _require_local_pack(need_audio=include_gold is False)
         manifest = _load_manifest(pack_dir)
         mode = _assert_freeform_run(manifest)
         gradees = _local_model_labels(models)
@@ -1610,7 +1868,7 @@ def _run_judges(
             return
         if pack_dir is None:
             raise SystemExit(
-                "API judges require a local pack at outputs/mmar-freeform"
+                "API judges require exports/ plus a local pack at outputs/mmar-judging"
             )
         labeled = question_ids or _require_labeled_question_ids(pack_dir)
         collected: list[dict] = []
