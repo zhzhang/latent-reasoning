@@ -1213,6 +1213,7 @@ def _run_freeform_grade_body(
 ) -> dict:
     """Grade free-form predictions with one local vLLM judge model."""
     from grader import (
+        DEFAULT_GRADE_PROMPT,
         grade_predictions_file,
         load_grader,
         parse_grade_prompt_list,
@@ -1326,7 +1327,7 @@ def _run_freeform_grade_body(
         "judge_label": last_key,
         "primary_judge": manifest.get("primary_judge") or existing_primary,
         "by_model": per_model,
-        "prompt": prompts[-1] if prompts else "with_gt",
+        "prompt": prompts[-1] if prompts else DEFAULT_GRADE_PROMPT,
         "include_gold": include_gold,
         "n_questions": n_questions,
     }

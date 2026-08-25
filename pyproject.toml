@@ -23,6 +23,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "qwen-omni-utils>=0.0.8",
     "safetensors>=0.8.0",
+    "scipy>=1.15.0",
     "torch>=2.12.1",
     "torchaudio>=2.11.0",
     "torchlibrosa>=0.1.0",

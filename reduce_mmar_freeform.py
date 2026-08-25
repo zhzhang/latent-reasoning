@@ -198,9 +198,13 @@ def filter_accuracy_json(path: Path, drop_models: set[str]) -> None:
         return
     payload["pack"] = "mmar-freeform"
     payload["labels_path"] = str(path.parent / "labels.csv")
-    for mode in ("with_gt", "free"):
-        bucket = payload.get(mode)
-        if isinstance(bucket, dict):
+    from grader import ACCURACY_META_KEYS, JUDGE_FORMATS
+
+    known = set(JUDGE_FORMATS)
+    for mode, bucket in list(payload.items()):
+        if mode in ACCURACY_META_KEYS:
+            continue
+        if isinstance(bucket, dict) and (mode in known or bucket):
             payload[mode] = {
                 key: value
                 for key, value in bucket.items()

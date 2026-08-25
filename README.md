@@ -145,6 +145,10 @@ before aggregation.
 uv run modal run download_results.py
 uv run python view_difficulty.py          # single-run UI (:7860)
 uv run python view_mode_compare.py        # MCQ ↔ freeform compare (:7861)
+
+# Judge pack vs human labels in exports/
+uv run modal run download_judges.py
+uv run python view_judges.py              # judge outcomes UI (:7862)
 ```
 
 Open http://127.0.0.1:7860 — questions are ordered hardest-first
@@ -158,12 +162,15 @@ with a freeform run on the same question ids, sorts by
 Δ = MCQ avg − freeform avg, and shows both modes’ per-model shots when a
 question is selected.
 
+Open http://127.0.0.1:7862 for judge outcomes vs the human labels in
+`exports/`.
+
 ## Judge labeled MMAR generations
 
 `run_judges.py` grades labeled questions from `exports/labels.csv` and
 `exports/generations.csv`, joining question text, gold answers, and audio
 from MMAR-meta. Verdicts are written to `outputs/mmar-judging` (Modal
-volume path `mmar-judging`). With no `--judge-model-id`, every suite model
+volume `mmar-judging`). With no `--judge-model-id`, every suite model
 grades every other pack model's shots. Pass ids to run only those judges.
 Shots that already have a verdict for the same judge key are skipped. Pass
 `--force` to replace existing verdicts.
@@ -173,7 +180,9 @@ App). API judges (`gemini-3.7-flash`; aliases
 `gemini-3.7-mini`, `gemini`, or `api`) run locally against the
 same pack and do not start Modal. Empty `--judge-model-id` stays
 suite-only so a bare run does not spend API quota. API judges skip their own pack label (round-robin).
-Audio is attached only with `--no-include-gold`; the gold path is text-only.
+Default runs both `with_gt` (text, sees gold) and `free` (audio, no gold).
+`--grade-prompt` selects any key in `JUDGE_FORMATS` (comma-separated, or
+`all`). Audio is attached when that format sets `audio_included`.
 
 ```bash
 # Seed judge weights first if needed
@@ -205,13 +214,36 @@ uv run run_judges.py \
   --judge-model-id gemini-3.7-flash
 uv run run_judges.py --judge-model-id api --no-include-gold
 
+# Named recipe from JUDGE_FORMATS (or comma-separated / all)
+uv run run_judges.py --grade-prompt neutral_with_gt_no_audio
+uv run run_judges.py --grade-prompt all
+
 # Mixed: API locally while Modal vLLM runs detached
 uv run run_judges.py \
   --judge-model-id gemini-3.7-flash,qwen3-omni-instruct
+
+# Recompute Alt-Test scores from existing local verdicts
+uv run run_judges.py --accuracy-only
+
+# Download the judging pack and inspect vs human labels
+uv run modal run download_judges.py
+uv run python view_judges.py
 ```
 
 API path knobs: `--qps` (default 4), `--max-workers` (8), `--timeout`
 (180s), `--retries` (20).
+
+`view_judges.py` (http://127.0.0.1:7862) joins judge verdicts from
+`outputs/mmar-judging` to `exports/labels.csv` and
+`exports/generations.csv`. Judges are scored with the
+[Alt-Test](https://arxiv.org/abs/2501.10970) on shots that have at least
+three human ratings. The headline number is Average Advantage Probability
+ρ (probability the judge is as good as or better than a randomly chosen
+annotator), one value per composite key
+`{label}__{JUDGE_FORMATS key}__{gold|nongold}`, one table per recipe.
+Winning rate ω
+uses `--epsilon` (default 0.15) and is secondary.
+Per-shot chips use majority vote of those ratings.
 
 ## Tune a judge engine
 
@@ -275,12 +307,24 @@ grid is uniform. Idempotent — safe to re-run.
 ## Output layout
 
 ```
+exports/
+  labels.csv       # question_id, generation_id, model_label, shot_index, ratings
+  generations.csv  # question_id, generation_id, model_label, shot_index, answer_prediction
+
 outputs/exp-mmar-question-difficulty/<run_id>/
   question_ids.json
   manifest.json
   models/<label>/predictions.jsonl
   difficulty.jsonl
   scores.json
+
+outputs/mmar-judging/
+  labels.csv
+  question_ids.json
+  manifest.json
+  judge_accuracy.json  # Alt-Test ρ / ω per judge×format
+  models/<label>/predictions.jsonl
+  models/<label>/judge_partials/<judge_key>.jsonl
 ```
 
 Freeform shot records store per-judge verdicts under `shots[].judges`:

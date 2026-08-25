@@ -122,11 +122,25 @@ ROUND_ROBIN_SUITE: tuple[str, ...] = (
     "nemotron-3-nano-omni",
 )
 
-# Internal names: with_gt (gold shown) vs free (audio judge, no gold).
-# Not a CLI choice — include_gold selects which format in JUDGE_FORMATS.
-GRADE_PROMPT_NAMES = ("with_gt", "free")
+# Named formats live in ``JUDGE_FORMATS`` below. Default runs still use
+# with_gt / free via include_gold; ``--grade-prompt`` selects any table
+# key (comma-separated, or ``all``).
 DEFAULT_GRADE_PROMPT = "with_gt"
 DEFAULT_INCLUDE_GOLD = True
+GRADE_PROMPT_ALIASES = {
+    "permissive": DEFAULT_GRADE_PROMPT,
+    "neutral": "neutral_with_gt",
+}
+ACCURACY_META_KEYS = frozenset(
+    {
+        "pack",
+        "labels_path",
+        "n_label_rows",
+        "n_questions",
+        "epsilon",
+        "modes",
+    }
+)
 
 # Prompt / closer text lives in JUDGE_FORMATS below. Run ``python grader.py``
 # to print every rendered combination with ``{question}`` / ``{answer}`` /
@@ -260,9 +274,40 @@ def _needs_language_model_only(model_id: str) -> bool:
     return any(token in text for token in ("qwen3.5", "qwen3.6", "qwen3_5", "qwen3_6"))
 
 
+def grade_prompt_names() -> tuple[str, ...]:
+    """Insertion-order keys of ``JUDGE_FORMATS``."""
+    return tuple(JUDGE_FORMATS)
+
+
+def grade_mode_title(name: str) -> str:
+    """Human label derived from a format's gold / audio flags."""
+    fmt = JUDGE_FORMATS.get(name)
+    if fmt is None:
+        return str(name or "")
+    gold = "sees gold" if fmt.include_gold else "no gold"
+    audio = "hears audio" if fmt.audio_included else "text"
+    return f"{name} ({audio}, {gold})"
+
+
+def grade_mode_titles() -> dict[str, str]:
+    return {name: grade_mode_title(name) for name in JUDGE_FORMATS}
+
+
 def grade_prompt_name(include_gold: bool = DEFAULT_INCLUDE_GOLD) -> str:
-    """``with_gt`` when gold is shown; ``free`` when the audio judge has no gold."""
-    return "with_gt" if include_gold else "free"
+    """Default boolean gold flag → ``JUDGE_FORMATS`` key (``with_gt`` / ``free``)."""
+    preferred = "with_gt" if include_gold else "free"
+    if preferred in JUDGE_FORMATS:
+        return preferred
+    matches = [
+        name
+        for name, fmt in JUDGE_FORMATS.items()
+        if fmt.include_gold is bool(include_gold)
+    ]
+    if matches:
+        return matches[0]
+    raise ValueError(
+        f"No JUDGE_FORMATS entry with include_gold={bool(include_gold)}"
+    )
 
 
 def normalize_grade_prompt(
@@ -270,19 +315,18 @@ def normalize_grade_prompt(
     *,
     include_gold: bool | None = None,
 ) -> str:
-    """Return ``with_gt`` / ``free``. ``include_gold`` wins when given."""
+    """Return a ``JUDGE_FORMATS`` key. Explicit names win over ``include_gold``."""
+    value = str(name or "").strip().lower()
+    value = GRADE_PROMPT_ALIASES.get(value, value)
+    if value in JUDGE_FORMATS:
+        return value
+    if value:
+        raise ValueError(
+            f"Unknown grade prompt {name!r}; expected one of {grade_prompt_names()}"
+        )
     if include_gold is not None:
         return grade_prompt_name(include_gold)
-    value = str(name or DEFAULT_GRADE_PROMPT).strip().lower()
-    if value in GRADE_PROMPT_NAMES:
-        return value
-    # Legacy permissive/neutral names map onto the gold format; nongold
-    # callers should pass include_gold so this does not matter.
-    if value in {"permissive", "neutral", "all", ""}:
-        return DEFAULT_GRADE_PROMPT
-    raise ValueError(
-        f"Unknown grade prompt {name!r}; expected one of {GRADE_PROMPT_NAMES}"
-    )
+    return DEFAULT_GRADE_PROMPT
 
 
 def gold_mode_flags(include_gold: bool | None) -> list[bool]:
@@ -297,9 +341,31 @@ def parse_grade_prompt_list(
     *,
     include_gold: bool | None = DEFAULT_INCLUDE_GOLD,
 ) -> list[str]:
-    """Return prompt names for the selected gold mode(s). Style lists are ignored."""
-    del value
+    """Return prompt names. An explicit list wins over ``include_gold``.
+
+    ``all`` / ``*`` expands to every key in ``JUDGE_FORMATS``.
+    """
+    if value and str(value).strip():
+        names: list[str] = []
+        for raw in str(value).split(","):
+            item = raw.strip()
+            if not item:
+                continue
+            if item.lower() in {"all", "*"}:
+                return list(grade_prompt_names())
+            names.append(normalize_grade_prompt(item))
+        if names:
+            return names
     return [grade_prompt_name(flag) for flag in gold_mode_flags(include_gold)]
+
+
+def iter_grade_modes(
+    prompt: str | None = None,
+    include_gold: bool | None = None,
+) -> list[tuple[str, bool]]:
+    """``(prompt_name, include_gold)`` pairs for one judging run."""
+    names = parse_grade_prompt_list(prompt, include_gold=include_gold)
+    return [(name, JUDGE_FORMATS[name].include_gold) for name in names]
 
 
 def resolve_grade_allowed_ids(
@@ -337,12 +403,13 @@ def compose_judge_key(
     prompt: str | None = None,
     include_gold: bool = DEFAULT_INCLUDE_GOLD,
 ) -> str:
-    """Stable key: ``{label}__{with_gt|free}__{gold|nongold}``."""
+    """Stable key: ``{label}__{prompt}__{gold|nongold}``."""
     label = str(model_label or "").strip()
     if not label:
         raise ValueError("compose_judge_key requires a model_label")
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
-    return f"{label}__{prompt_name}__{gold_tag(include_gold)}"
+    fmt = JUDGE_FORMATS[prompt_name]
+    return f"{label}__{prompt_name}__{gold_tag(fmt.include_gold)}"
 
 
 def resolve_grade_judge_key(
@@ -352,15 +419,78 @@ def resolve_grade_judge_key(
     include_gold: bool = DEFAULT_INCLUDE_GOLD,
     judge_key: str | None = None,
 ) -> str:
-    """Composite key ``{label}__{with_gt|free}__{gold|nongold}``.
+    """Composite key ``{label}__{prompt}__{gold|nongold}``.
 
-    Always composed (never the bare label) so new with-gt / free verdicts do
-    not collide with older permissive/neutral grades.
+    Always composed (never the bare label) so new with-gt / free / named
+    verdicts do not collide with older permissive/neutral grades.
     """
     if judge_key:
         return str(judge_key)
     label = str(handle.get("judge_label") or judge_label(handle.get("model_id")) or GRADER_LABEL)
     return compose_judge_key(label, prompt=prompt, include_gold=include_gold)
+
+
+def parse_judge_key(key: str) -> dict[str, str]:
+    """Split ``{label}__{prompt}__{gold|nongold}`` (prompt may contain ``_``)."""
+    parts = [p for p in str(key or "").split("__") if p]
+    if len(parts) >= 3:
+        gold_tag = parts[-1]
+        prompt = parts[-2]
+        model = "__".join(parts[:-2])
+        return {
+            "label": str(key),
+            "model": model,
+            "prompt": prompt,
+            "gold_tag": gold_tag,
+        }
+    return {"label": str(key or ""), "model": str(key or ""), "prompt": "", "gold_tag": ""}
+
+
+def judge_mode_bucket(judge_key: str, entry: dict | None = None) -> str | None:
+    """Map a verdict to a ``JUDGE_FORMATS`` key.
+
+    Prefer the stored ``prompt`` / key slot so named gold recipes are not
+    folded into ``with_gt`` just because gold is shown.
+    """
+    prompt = ""
+    if isinstance(entry, dict):
+        prompt = str(entry.get("prompt") or "").strip().lower()
+        prompt = GRADE_PROMPT_ALIASES.get(prompt, prompt)
+        if prompt in JUDGE_FORMATS:
+            return prompt
+    parsed = parse_judge_key(judge_key)
+    slot = GRADE_PROMPT_ALIASES.get(parsed["prompt"].lower(), parsed["prompt"].lower())
+    if slot in JUDGE_FORMATS:
+        return slot
+    if isinstance(entry, dict):
+        if entry.get("include_gold") is True:
+            return "with_gt"
+        if entry.get("include_gold") is False:
+            return "free"
+    gold_tag = parsed["gold_tag"].lower()
+    if gold_tag == "nongold":
+        return "free"
+    if gold_tag == "gold":
+        return "with_gt"
+    key = str(judge_key or "")
+    if key.endswith("__nongold"):
+        return "free"
+    if key.endswith("__gold"):
+        return "with_gt"
+    return None
+
+
+def accuracy_mode_names(payload: dict | None = None) -> list[str]:
+    """Ordered accuracy buckets: ``JUDGE_FORMATS`` keys, then any extra tables."""
+    names = list(grade_prompt_names())
+    if not isinstance(payload, dict):
+        return names
+    for key, value in payload.items():
+        if key in ACCURACY_META_KEYS or key in names:
+            continue
+        if isinstance(value, dict):
+            names.append(str(key))
+    return names
 
 
 def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
@@ -370,9 +500,10 @@ def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
 # ===========================================================================
 # Judge prompt formats
 #
-# Two named formats (no style axis):
-#   with_gt  — text judge sees the benchmark answer; audio_included=False
-#   free     — audio judge hears the clip; no gold; audio_included=True
+# Named formats live in ``JUDGE_FORMATS`` below. Adding a key there is
+# enough for CLIs, grading, accuracy, and the viewer. Gold is inferred
+# from ``FIELD_GOLD`` in ``field_templates``; audio vs text from
+# ``audio_included``.
 #
 # Adapted from nikhilchandak/answer-matching ``gpqa_judge.py``
 # (``get_judge_prompt_with_gt`` / ``get_free_judge_prompt``) for audio:
@@ -426,17 +557,17 @@ def _fill_placeholders(template: str, **values: str) -> str:
 
 @dataclass(frozen=True)
 class JudgeFormat:
-    """One named judge format: prompt and closer segments."""
+    """One named judge format: prompt and optional closer segments."""
 
     prompt: str
-    closer: str
-    audio_included: bool
-    field_templates: tuple[str, ...]
+    closer: str = ""
+    audio_included: bool = False
+    field_templates: tuple[str, ...] = ()
 
     @property
     def include_gold(self) -> bool:
-        """Gold answer is shown when the judge does not hear the clip."""
-        return not self.audio_included
+        """True when the ground-truth answer is in the field block."""
+        return FIELD_GOLD in self.field_templates
 
     def fields(
         self,
@@ -551,16 +682,26 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
     ),
-    "neutral": JudgeFormat(
+    "neutral_with_gt": JudgeFormat(
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
-            "clip, and the response you are judging.\n"
+            "clip, the ground truth answer, and the response you are judging.\n"
             "Reason briefly, then give your judgement of the response in a single "
-            "final line with one word: \"correct\" or \"incorrect\""
+            "final line with one word: \"Correct\" or \"Incorrect\""
         ),
         audio_included=True,
-        field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
+    ),
+    "neutral_with_gt_no_audio": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "is correct or not. You are given an audio clip, a question about that "
+            "clip, the ground truth answer, and the response you are judging.\n"
+            "Reason briefly, then give your judgement of the response in a single "
+            "final line with one word: \"Correct\" or \"Incorrect\""
+        ),
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
 }
 
@@ -578,8 +719,8 @@ def get_judge_format(
 
 
 def iter_judge_formats() -> tuple[tuple[str, JudgeFormat], ...]:
-    """``with_gt`` first, then ``free``."""
-    return tuple((name, JUDGE_FORMATS[name]) for name in GRADE_PROMPT_NAMES)
+    """Every named format in ``JUDGE_FORMATS`` (insertion order)."""
+    return tuple(JUDGE_FORMATS.items())
 
 
 def build_grade_instructions(
@@ -596,10 +737,11 @@ def build_grade_input_fields(
     question: str,
     answer: str,
     prediction: str,
+    prompt: str | None = None,
     include_gold: bool = DEFAULT_INCLUDE_GOLD,
 ) -> str:
     """Question / gold / test-taker answer block (no audio)."""
-    return get_judge_format(include_gold=include_gold).fields(
+    return get_judge_format(prompt, include_gold).fields(
         question=question,
         answer=answer,
         prediction=prediction,
@@ -631,12 +773,24 @@ def build_grade_prompt(
     )
 
 
-def build_grade_gold_prefix(*, question: str, answer: str) -> str:
-    """Cached gold prefix: prompt + question + ground truth (no response)."""
-    fmt = get_judge_format(include_gold=True)
-    question_line = _fill_placeholders(FIELD_QUESTION, question=question)
-    gold_line = _fill_placeholders(FIELD_GOLD, answer=answer)
-    return f"{fmt.prompt}\n\n{question_line}\n{gold_line}\n"
+def build_grade_gold_prefix(
+    *,
+    question: str,
+    answer: str,
+    prompt: str | None = None,
+    include_gold: bool = True,
+) -> str:
+    """Cached gold prefix: prompt plus every field before the response."""
+    fmt = get_judge_format(prompt, include_gold=include_gold)
+    lines = [
+        _fill_placeholders(template, question=question, answer=answer, prediction="")
+        for template in fmt.field_templates
+        if template != FIELD_PREDICTION
+    ]
+    body = "\n".join(lines)
+    if body:
+        return f"{fmt.prompt}\n\n{body}\n"
+    return f"{fmt.prompt}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -644,16 +798,58 @@ def build_grade_gold_prefix(*, question: str, answer: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Final-answer tokens: <answer>0</answer> / <answer>1</answer> (preferred),
-# plus legacy Pass/Fail and YES/NO from older runs.
-# Soft whole-region fallback — keep this narrow so prose like "correct in
-# meaning" does not count as a verdict; token labels above still accept
-# a bare "correct" / "incorrect" final line.
-ANSWER_TAG_RE = re.compile(r"<answer>\s*([01])\s*</answer>", re.IGNORECASE)
+# <answer>Correct</answer> / <answer>Incorrect</answer>, plus legacy Pass/Fail
+# and YES/NO from older runs. Soft whole-region fallback stays narrow so
+# prose like "correct in meaning" does not count as a verdict; token labels
+# and last-line Correct/Incorrect still accept a bare final-line verdict.
+ANSWER_TAG_RE = re.compile(
+    r"<answer>\s*(0|1|correct|incorrect|pass|fail|yes|no|true|false|wrong)\s*</answer>",
+    re.IGNORECASE,
+)
+BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}", re.IGNORECASE)
 PASS_RE = re.compile(r"\b(pass|yes|true)\b", re.IGNORECASE)
 FAIL_RE = re.compile(r"\b(fail|no|false)\b", re.IGNORECASE)
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+# incorrect before correct so the longer token wins as a last-line word.
+VERDICT_LINE_RE = re.compile(
+    r"""
+    ^
+    [\s*`"'*_(\[]*
+    (?:(?:final\s+)?(?:answer|verdict|judgement|judgment|label|decision)\s*[:=]\s*)?
+    (?P<label>incorrect|correct|pass|fail|yes|no|true|false|wrong|[01])
+    [\s.`"'*_!?,;:)\]\\]*
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+LAST_WORD_VERDICT_RE = re.compile(
+    r"\b(?P<label>incorrect|correct|pass|fail|wrong)\b\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
 PASS_LABELS = frozenset({"PASS", "P", "YES", "Y", "TRUE", "CORRECT", "1"})
 FAIL_LABELS = frozenset({"FAIL", "F", "NO", "N", "FALSE", "INCORRECT", "WRONG", "0"})
+
+
+def _label_verdict(raw: str) -> bool | None:
+    token = str(raw or "").strip().upper()
+    if token in PASS_LABELS:
+        return True
+    if token in FAIL_LABELS:
+        return False
+    return None
+
+
+def _clean_verdict_token(raw: str) -> str:
+    token = str(raw or "").strip()
+    boxed = BOXED_RE.search(token)
+    if boxed:
+        token = boxed.group(1).strip()
+    token = token.strip("`\"'*_.!? ,;:()[]")
+    if ":" in token:
+        token = token.split(":")[-1].strip("`\"'*_.!? ,;:()[]")
+    if " " in token:
+        token = token.split()[-1].strip("`\"'*_.!? ,;:()[]")
+    return token.upper()
 
 
 def _answer_region(text: str) -> str:
@@ -670,42 +866,45 @@ def _answer_region(text: str) -> str:
 
 
 def parse_grade_verdict(text: str) -> bool | None:
-    """Parse a 0/1 <answer> tag (or legacy Pass/Fail) reply. None if unparseable."""
+    """Parse a 0/1 tag, Correct/Incorrect, or legacy Pass/Fail reply.
+
+    Returns None if unparseable. ``incorrect`` is matched before ``correct``
+    so a last-line ``Incorrect`` is never read as ``Correct``.
+    """
     region = _answer_region(text)
     if not region:
         return None
     tag_matches = list(ANSWER_TAG_RE.finditer(region))
     if tag_matches:
-        return tag_matches[-1].group(1) == "1"
+        return _label_verdict(tag_matches[-1].group(1))
+    boxed_matches = list(BOXED_RE.finditer(region))
+    if boxed_matches:
+        boxed = _label_verdict(_clean_verdict_token(boxed_matches[-1].group(1)))
+        if boxed is not None:
+            return boxed
     lines = [line.strip() for line in region.splitlines() if line.strip()]
     if not lines:
         return None
 
-    def _token_verdict(raw: str) -> bool | None:
-        token = raw.strip("`\"' .").upper()
-        if ":" in token:
-            token = token.split(":")[-1].strip("`\"' .")
-        # Keep only the last whitespace-separated word (e.g. "Answer Pass").
-        if " " in token:
-            token = token.split()[-1].strip("`\"' .")
-        if token in PASS_LABELS:
-            return True
-        if token in FAIL_LABELS:
-            return False
-        return None
+    def _line_verdict(raw: str) -> bool | None:
+        match = VERDICT_LINE_RE.match(raw.strip())
+        if match:
+            return _label_verdict(match.group("label"))
+        match = LAST_WORD_VERDICT_RE.search(raw.strip())
+        if match:
+            return _label_verdict(match.group("label"))
+        return _label_verdict(_clean_verdict_token(raw))
 
-    # Prefer an explicit Pass/Fail (or legacy YES/NO) on the final line.
-    last = _token_verdict(lines[-1])
+    last = _line_verdict(lines[-1])
     if last is not None:
         return last
-
-    # Scan earlier lines only for a clean Pass/Fail token (ignore prose).
     for line in reversed(lines[:-1]):
-        hit = _token_verdict(line)
+        hit = _line_verdict(line)
         if hit is not None:
             return hit
 
     # Last resort: whole-region exclusive keyword match (legacy YES/NO dumps).
+    # Do not search for correct/incorrect here — those words appear in prose.
     has_pass = bool(PASS_RE.search(region))
     has_fail = bool(FAIL_RE.search(region))
     if has_pass and not has_fail:
@@ -831,9 +1030,11 @@ def require_audio_nongold_judge(
     handle: dict[str, Any] | None = None,
     *,
     include_gold: bool,
+    audio_required: bool | None = None,
 ) -> None:
-    """NO_GOLD grading is audio-only: text judges cannot decide without gold."""
-    if include_gold:
+    """Audio formats (no-gold, or gold+audio) need an audio-capable judge."""
+    needed = bool(audio_required) if audio_required is not None else not include_gold
+    if not needed:
         return
     if judge_is_audio_model(model_id, handle):
         return
@@ -845,10 +1046,9 @@ def require_audio_nongold_judge(
         or "<unknown>"
     )
     raise SystemExit(
-        "NO_GOLD / --no-include-gold grading requires an audio-capable judge "
-        f"that receives the clip (got {shown!r}). Text-only judges cannot "
-        "grade without ground truth; use a suite or API audio model or pass "
-        "--include-gold."
+        "Audio grading requires an audio-capable judge that receives the "
+        f"clip (got {shown!r}). Text-only judges cannot grade this format; "
+        "use a suite or API audio model, or a text-only with-GT recipe."
     )
 
 
@@ -1260,8 +1460,10 @@ def _nongold_audio_chat_messages(
     *,
     audio_type: str = "audio_url",
     closer: str = "",
+    answer: str = "",
+    field_templates: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """User turn: instructions, then audio, question, response, closer."""
+    """User turn: instructions, then audio, then format fields, then closer."""
     if audio_type == "audio":
         audio_part: dict[str, Any] = {"type": "audio", "audio": str(audio_path)}
     else:
@@ -1269,20 +1471,23 @@ def _nongold_audio_chat_messages(
             "type": "audio_url",
             "audio_url": {"url": f"file://{audio_path}"},
         }
+    templates = field_templates or (FIELD_QUESTION, FIELD_PREDICTION)
     content: list[dict[str, Any]] = [
         {"type": "text", "text": instructions},
         audio_part,
-        {
-            "type": "text",
-            "text": _fill_placeholders(FIELD_QUESTION, question=question),
-        },
-        {
-            "type": "text",
-            "text": _fill_placeholders(
-                FIELD_PREDICTION, prediction=prediction
-            ),
-        },
     ]
+    for template in templates:
+        content.append(
+            {
+                "type": "text",
+                "text": _fill_placeholders(
+                    template,
+                    question=question,
+                    answer=answer,
+                    prediction=prediction,
+                ),
+            }
+        )
     if closer:
         content.append({"type": "text", "text": closer})
     return [{"role": "user", "content": content}]
@@ -1317,8 +1522,7 @@ def _grade_results_from_texts(
     include_gold: bool,
 ) -> list[dict]:
     results: list[dict] = []
-    prompt_name = grade_prompt_name(include_gold)
-    del prompt
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     for job, text in zip(jobs, texts):
         verdict = parse_grade_verdict(text)
         short = format_grade_output(verdict)
@@ -1354,15 +1558,17 @@ def _grade_shot_batch_audio(
     *,
     max_tokens: int | None = None,
     prompt: str | None = None,
+    include_gold: bool = False,
 ) -> list[dict]:
-    """NO_GOLD path: audio-capable judges hear the clip, then question + answer."""
+    """Audio path: judges hear the clip, then question / optional gold / response."""
     from mmar_models import _load_audio_tuple
 
-    del prompt
     label = str(handle.get("suite_label") or handle.get("judge_label") or "")
     backend = str(handle.get("backend") or "vllm")
     sampling_rate = int(handle.get("sampling_rate") or 16000)
-    fmt = get_judge_format(include_gold=False)
+    fmt = get_judge_format(prompt, include_gold=include_gold)
+    include_gold = fmt.include_gold
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     instructions = fmt.prompt
     closer = fmt.closer
     sampling = _grade_sampling(handle, max_tokens=max_tokens)
@@ -1375,7 +1581,7 @@ def _grade_shot_batch_audio(
         audio_path = resolve_grade_audio_path(str(job.get("audio_path") or "") or None)
         if audio_path is None:
             raise SystemExit(
-                "NO_GOLD audio grading needs a readable wav for each question; "
+                "Audio grading needs a readable wav for each question; "
                 f"missing audio_path for id={job.get('id')!r} "
                 f"path={job.get('audio_path')!r}"
             )
@@ -1391,6 +1597,8 @@ def _grade_shot_batch_audio(
                 str(job.get("prediction") or ""),
                 audio_path,
                 closer=closer,
+                answer=str(job.get("answer") or ""),
+                field_templates=fmt.field_templates,
             )
             for job, audio_path in resolved
         ]
@@ -1416,6 +1624,8 @@ def _grade_shot_batch_audio(
                 audio_path,
                 audio_type="audio",
                 closer=closer,
+                answer=str(job.get("answer") or ""),
+                field_templates=fmt.field_templates,
             )
             for job, audio_path in resolved
         ]
@@ -1434,6 +1644,7 @@ def _grade_shot_batch_audio(
         for job, audio_path in resolved:
             fields = fmt.fields_with_closer(
                 question=str(job.get("question") or ""),
+                answer=str(job.get("answer") or ""),
                 prediction=str(job.get("prediction") or ""),
             )
             audio = Audio.from_file(str(audio_path), strict=False)
@@ -1467,6 +1678,7 @@ def _grade_shot_batch_audio(
         for job, audio_path in resolved:
             fields = fmt.fields(
                 question=str(job.get("question") or ""),
+                answer=str(job.get("answer") or ""),
                 prediction=str(job.get("prediction") or ""),
             )
             audio = _load_audio_tuple(str(audio_path), sampling_rate)
@@ -1492,6 +1704,7 @@ def _grade_shot_batch_audio(
         for job, audio_path in resolved:
             fields = fmt.fields(
                 question=str(job.get("question") or ""),
+                answer=str(job.get("answer") or ""),
                 prediction=str(job.get("prediction") or ""),
             )
             audio = _load_audio_tuple(str(audio_path), sampling_rate)
@@ -1514,8 +1727,8 @@ def _grade_shot_batch_audio(
         jobs,
         texts,
         model_id=model_id,
-        prompt=grade_prompt_name(False),
-        include_gold=False,
+        prompt=prompt_name,
+        include_gold=include_gold,
     )
 
 
@@ -1539,11 +1752,21 @@ def grade_shot_batch(
     """
     if not jobs:
         return []
-    include_gold = bool(include_gold)
-    require_audio_nongold_judge(handle=handle, include_gold=include_gold)
-    if not include_gold:
+    fmt = get_judge_format(prompt, include_gold=include_gold)
+    include_gold = fmt.include_gold
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    require_audio_nongold_judge(
+        handle=handle,
+        include_gold=include_gold,
+        audio_required=fmt.audio_included,
+    )
+    if fmt.audio_included:
         return _grade_shot_batch_audio(
-            handle, jobs, max_tokens=max_tokens, prompt=prompt
+            handle,
+            jobs,
+            max_tokens=max_tokens,
+            prompt=prompt_name,
+            include_gold=include_gold,
         )
 
     tokenizer = handle["tokenizer"]
@@ -1555,8 +1778,8 @@ def grade_shot_batch(
                 question=str(job.get("question") or ""),
                 answer=str(job.get("answer") or ""),
                 prediction=str(job.get("prediction") or ""),
-                prompt=prompt,
-                include_gold=True,
+                prompt=prompt_name,
+                include_gold=include_gold,
             ),
             chat_template_kwargs=chat_template_kwargs,
         )
@@ -1574,8 +1797,8 @@ def grade_shot_batch(
         jobs,
         [_completion_text(out) for out in outputs],
         model_id=model_id,
-        prompt=prompt,
-        include_gold=True,
+        prompt=prompt_name,
+        include_gold=include_gold,
     )
 
 
@@ -1622,10 +1845,14 @@ def grade_predictions_file(
         }
 
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
-    include_gold = bool(include_gold)
-    prompt_name = grade_prompt_name(include_gold)
-    del prompt
-    require_audio_nongold_judge(handle=handle, include_gold=include_gold)
+    fmt = get_judge_format(prompt, include_gold=include_gold)
+    include_gold = fmt.include_gold
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    require_audio_nongold_judge(
+        handle=handle,
+        include_gold=include_gold,
+        audio_required=fmt.audio_included,
+    )
     key = resolve_grade_judge_key(
         handle, prompt=prompt_name, include_gold=include_gold, judge_key=judge_key
     )
@@ -1944,19 +2171,14 @@ _RULE = "-" * 78
 
 
 def validate_judge_formats() -> None:
-    """Raise if JUDGE_FORMATS is missing a named format or a required segment."""
-    missing = [name for name in GRADE_PROMPT_NAMES if name not in JUDGE_FORMATS]
-    extra = [name for name in JUDGE_FORMATS if name not in GRADE_PROMPT_NAMES]
-    if missing or extra:
-        raise RuntimeError(
-            f"JUDGE_FORMATS keys {tuple(JUDGE_FORMATS)} do not match "
-            f"GRADE_PROMPT_NAMES {GRADE_PROMPT_NAMES}"
-        )
+    """Raise if a ``JUDGE_FORMATS`` entry is missing its prompt."""
+    if not JUDGE_FORMATS:
+        raise RuntimeError("JUDGE_FORMATS is empty")
     for name, fmt in JUDGE_FORMATS.items():
+        if not str(name or "").strip():
+            raise RuntimeError("JUDGE_FORMATS has a blank key")
         if not fmt.prompt.strip():
             raise RuntimeError(f"{name} is missing a prompt segment")
-        if not fmt.closer.strip():
-            raise RuntimeError(f"{name} is missing a closer segment")
 
 
 def _audio_template_groups() -> list[tuple[tuple[str, ...], str]]:
@@ -1974,15 +2196,25 @@ def _audio_template_groups() -> list[tuple[tuple[str, ...], str]]:
 def format_grade_prompt_inspection(
     *,
     include_gold: bool | None = None,
+    prompt: str | None = None,
     audio_wraps: bool = True,
 ) -> str:
-    """Render gold (with_gt) and/or free (nongold) prompts with placeholder inputs."""
+    """Render named ``JUDGE_FORMATS`` with placeholder inputs."""
     validate_judge_formats()
-    if include_gold is None:
+    if prompt and str(prompt).strip():
+        names = parse_grade_prompt_list(prompt, include_gold=include_gold)
+        selected = [(name, JUDGE_FORMATS[name]) for name in names]
+    elif include_gold is None:
         selected = list(iter_judge_formats())
     else:
-        name = grade_prompt_name(include_gold)
-        selected = [(name, JUDGE_FORMATS[name])]
+        flag = bool(include_gold)
+        selected = [
+            (name, fmt)
+            for name, fmt in iter_judge_formats()
+            if fmt.include_gold is flag
+        ]
+    if not selected:
+        raise SystemExit("No judge formats matched the requested filter")
     chunks: list[str] = []
 
     chunks.append(_BANNER)
@@ -1997,7 +2229,7 @@ def format_grade_prompt_inspection(
         chunks.append(fmt.prompt)
         chunks.append("")
         chunks.append("closer:")
-        chunks.append(fmt.closer)
+        chunks.append(fmt.closer or "(none)")
         chunks.append("")
 
     chunks.append(_BANNER)
@@ -2021,10 +2253,13 @@ def format_grade_prompt_inspection(
         chunks.append("  prompt       : preamble")
         if fmt.audio_included:
             chunks.append("  [AUDIO]      : clip inserted here for suite / API audio judges")
-            chunks.append("  fields       : Question + Response")
+            if fmt.include_gold:
+                chunks.append("  fields       : Question + Ground truth + Response")
+            else:
+                chunks.append("  fields       : Question + Response")
         else:
             chunks.append("  fields       : Question + Ground truth + Response")
-        chunks.append("  closer       : 0/1 closer")
+        chunks.append("  closer       : closer" if fmt.closer else "  closer       : (none)")
         chunks.append("")
         chunks.append("rendered text prompt (API judges and gold vLLM):")
         chunks.append(_RULE)
@@ -2083,7 +2318,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Render judge prompts with {question}/{answer}/{prediction} placeholders "
-            "so the with-gt (gold) and free (nongold) formats can be inspected."
+            "for every format in JUDGE_FORMATS."
         )
     )
     gold = parser.add_mutually_exclusive_group()
@@ -2092,13 +2327,18 @@ def main(argv: list[str] | None = None) -> None:
         dest="include_gold",
         action="store_true",
         default=None,
-        help="Only render the with-gt format that includes the benchmark answer.",
+        help="Only render formats that include the benchmark answer.",
     )
     gold.add_argument(
         "--nongold",
         dest="include_gold",
         action="store_false",
-        help="Only render the free format that omits gold (audio judges).",
+        help="Only render formats that omit gold (audio judges).",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="",
+        help="Comma-separated JUDGE_FORMATS keys, or 'all'. Default: every format.",
     )
     parser.add_argument(
         "--no-audio-wraps",
@@ -2109,6 +2349,7 @@ def main(argv: list[str] | None = None) -> None:
     print(
         format_grade_prompt_inspection(
             include_gold=args.include_gold,
+            prompt=(args.prompt or "").strip() or None,
             audio_wraps=not args.no_audio_wraps,
         ),
         end="",

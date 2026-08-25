@@ -10,6 +10,10 @@ Joins:
   (``correct``, ``verdict``, ``output``, ``generation``, ``model_id``,
   ``prompt``, ``include_gold``) and optional ``judge_partials/*.jsonl``
 
+The question list can sort by disagreement or by mean judge-mode
+agreement with the human majority label (one bucket per
+``JUDGE_FORMATS`` key).
+
 Usage::
 
     uv run modal run download_judges.py
@@ -30,6 +34,14 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from aggregate import order_model_labels
+from grader import (
+    accuracy_mode_names,
+    grade_mode_title,
+    grade_mode_titles,
+    grade_prompt_names,
+    judge_mode_bucket,
+    parse_judge_key,
+)
 from alt_test import DEFAULT_EPSILON, score_binary_judge, scoring_gold
 from mmar_common import load_jsonl
 from view_mmar import (
@@ -165,35 +177,6 @@ def _tuple_key(qid: str, model: str, shot_index: int) -> tuple[str, str, int]:
     return (qid, model, shot_index)
 
 
-def judge_mode_bucket(judge_key: str, entry: dict | None) -> str | None:
-    if isinstance(entry, dict):
-        if entry.get("include_gold") is True or entry.get("prompt") == "with_gt":
-            return "with_gt"
-        if entry.get("include_gold") is False or entry.get("prompt") == "free":
-            return "free"
-    key = str(judge_key or "")
-    if "__with_gt__" in key or key.endswith("__gold"):
-        return "with_gt"
-    if "__free__" in key or key.endswith("__nongold"):
-        return "free"
-    return None
-
-
-def parse_judge_key(key: str) -> dict[str, Any]:
-    parts = [p for p in str(key).split("__") if p != ""]
-    if len(parts) >= 3:
-        gold_tag = parts[-1]
-        prompt = parts[-2]
-        model = "__".join(parts[:-2])
-        return {
-            "label": key,
-            "model": model,
-            "prompt": prompt,
-            "gold_tag": gold_tag,
-        }
-    return {"label": key, "model": key, "prompt": "", "gold_tag": ""}
-
-
 def compact_judge_entry(entry: Any) -> dict[str, Any] | None:
     if not isinstance(entry, dict):
         return None
@@ -319,7 +302,9 @@ def compute_accuracy(
     *,
     epsilon: float = DEFAULT_EPSILON,
 ) -> dict[str, Any]:
-    stats: dict[str, dict[str, dict[str, Any]]] = {"with_gt": {}, "free": {}}
+    stats: dict[str, dict[str, dict[str, Any]]] = {
+        name: {} for name in grade_prompt_names()
+    }
     key_mode: dict[str, str] = {}
     for key in judge_keys:
         sample_entry = next(
@@ -347,7 +332,7 @@ def compute_accuracy(
             instances.append((instance_id, ratings, correct))
         scored = score_binary_judge(instances, epsilon=epsilon)
         parsed = parse_judge_key(key)
-        stats[mode][key] = {
+        stats.setdefault(mode, {})[key] = {
             **scored,
             "model": parsed["model"],
             "prompt": parsed["prompt"],
@@ -355,11 +340,36 @@ def compute_accuracy(
             "mode": mode,
         }
 
-    return {
+    payload: dict[str, Any] = {
         "n_label_rows": len(samples),
         "epsilon": float(epsilon),
-        "with_gt": stats["with_gt"],
-        "free": stats["free"],
+        "modes": accuracy_mode_names(stats),
+    }
+    for mode in payload["modes"]:
+        payload[mode] = stats.get(mode) or {}
+    return payload
+
+
+def _average_judge_agreement(
+    per_judge: dict[str, dict[str, int]],
+    judge_keys: list[str],
+) -> dict[str, Any]:
+    """Mean per-judge agreement with human majority on comparable shots."""
+    rates: list[float] = []
+    n = 0
+    n_agree = 0
+    for key in judge_keys:
+        bucket = per_judge.get(key) or {}
+        count = int(bucket.get("n") or 0)
+        agree = int(bucket.get("n_agree") or 0)
+        n += count
+        n_agree += agree
+        if count:
+            rates.append(agree / count)
+    return {
+        "n": n,
+        "n_agree": n_agree,
+        "rate": (sum(rates) / len(rates)) if rates else None,
     }
 
 
@@ -538,6 +548,13 @@ def load_bundle(
         samples, [j["label"] for j in judge_meta], epsilon=epsilon
     )
 
+    mode_keys: dict[str, list[str]] = {name: [] for name in grade_prompt_names()}
+    for judge in judge_meta:
+        mode = judge.get("mode")
+        if mode:
+            mode_keys.setdefault(str(mode), []).append(judge["label"])
+    gt_keys = mode_keys.get("with_gt") or []
+
     questions: list[dict[str, Any]] = []
     for qid in question_ids:
         q_row = by_id[qid]
@@ -572,6 +589,11 @@ def load_bundle(
                         shot_disagree = True
                 if shot_disagree:
                     n_disagree_any += 1
+        gt_agree = _average_judge_agreement(per_judge, gt_keys)
+        agree_by_mode = {
+            mode: _average_judge_agreement(per_judge, keys)
+            for mode, keys in mode_keys.items()
+        }
         questions.append(
             {
                 "id": qid,
@@ -582,6 +604,10 @@ def load_bundle(
                 "n_labeled": n_labeled,
                 "n_human_pass": n_human_pass,
                 "n_disagree_any": n_disagree_any,
+                "n_gt": gt_agree["n"],
+                "n_gt_agree": gt_agree["n_agree"],
+                "avg_gt_agree": gt_agree["rate"],
+                "agree_by_mode": agree_by_mode,
                 "human_pass_rate": (n_human_pass / n_labeled) if n_labeled else None,
                 "per_judge": {
                     key: {
@@ -859,9 +885,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </label>
       <label>Judge mode
         <select id="mode">
-          <option value="">Both</option>
-          <option value="with_gt">with-GT</option>
-          <option value="free">no gold</option>
+          <option value="">All</option>
         </select>
       </label>
       <label>Match
@@ -877,6 +901,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <option value="">All</option>
           <option value="pass">Pass</option>
           <option value="fail">Fail</option>
+        </select>
+      </label>
+      <label>Sort
+        <select id="sort">
+          <option value="disagree">Disagree (high → low)</option>
+          <option value="gt_agree">Judge-mode agree (low → high)</option>
         </select>
       </label>
     </div>
@@ -901,6 +931,8 @@ const state = {
   modelLabels: [],
   judges: [],
   accuracy: {},
+  modeTitles: {},
+  modeOrder: [],
   nLabelRows: 0,
   nQuestions: 0,
   nGenerations: 0,
@@ -935,7 +967,8 @@ function prettyJudge(key) {
     const gold = parts[parts.length - 1] === "nongold" ? "no gold" : parts[parts.length - 1];
     const prompt = parts[parts.length - 2];
     const label = parts.slice(0, -2).join("__");
-    return `${label} · ${prompt} · ${gold}`;
+    const title = (state.modeTitles || {})[prompt];
+    return title ? `${label} · ${title}` : `${label} · ${prompt} · ${gold}`;
   }
   return String(key);
 }
@@ -963,10 +996,55 @@ function shortJudge(key) {
   const parts = String(key || "").split("__");
   const model = parts.length >= 3 ? parts.slice(0, -2).join("__") : String(key || "");
   const prompt = parts.length >= 3 ? parts[parts.length - 2] : "";
-  const gold = parts.length >= 3 ? parts[parts.length - 1] : "";
-  const goldShort = gold === "nongold" ? "free" : gold === "gold" ? "gt" : gold;
+  const promptShort = String(prompt || "").replaceAll("_", "-");
   const base = shortLabel(model);
-  return goldShort ? `${base}/${goldShort}` : base;
+  return promptShort ? `${base}/${promptShort}` : base;
+}
+
+function fillModeSelect() {
+  const sel = document.getElementById("mode");
+  if (!sel) return;
+  const current = sel.value;
+  const titles = state.modeTitles || {};
+  const order = accuracyModeOrder();
+  sel.innerHTML = `<option value="">All</option>` + order.map(mode => {
+    const title = titles[mode] || mode;
+    const label = String(title).split(" (")[0];
+    return `<option value="${escapeHtml(mode)}">${escapeHtml(label)}</option>`;
+  }).join("");
+  if ([...sel.options].some(opt => opt.value === current)) sel.value = current;
+}
+
+function accuracyModeOrder() {
+  const acc = state.accuracy || {};
+  const fallback = state.modeOrder || [];
+  const named = Array.isArray(acc.modes) && acc.modes.length ? acc.modes : fallback;
+  const extra = Object.keys(acc).filter(key => {
+    if (named.includes(key)) return false;
+    if (["n_label_rows", "epsilon", "modes"].includes(key)) return false;
+    return acc[key] && typeof acc[key] === "object" && !Array.isArray(acc[key]);
+  });
+  return named.concat(extra);
+}
+
+function rowModeAgree(row) {
+  const mode = document.getElementById("mode").value;
+  const byMode = row.agree_by_mode || {};
+  if (mode && byMode[mode] && typeof byMode[mode].rate === "number") {
+    return byMode[mode].rate;
+  }
+  if (typeof byMode.with_gt?.rate === "number") return byMode.with_gt.rate;
+  for (const bucket of Object.values(byMode)) {
+    if (bucket && typeof bucket.rate === "number") return bucket.rate;
+  }
+  return row.avg_gt_agree;
+}
+
+function modeAgreeLabel() {
+  const mode = document.getElementById("mode").value;
+  if (!mode) return "judge-mode agree";
+  const title = (state.modeTitles || {})[mode] || mode;
+  return `${String(title).split(" (")[0]} agree`;
 }
 
 function visibleJudges() {
@@ -1007,7 +1085,19 @@ function filteredQuestions() {
       || String(row.answer || "").toLowerCase().includes(q);
   });
   const judge = state.selectedJudge;
+  const sort = (document.getElementById("sort") || {}).value || "disagree";
   return items.slice().sort((a, b) => {
+    if (sort === "gt_agree") {
+      const ar = rowModeAgree(a);
+      const br = rowModeAgree(b);
+      const aOk = typeof ar === "number" && Number.isFinite(ar);
+      const bOk = typeof br === "number" && Number.isFinite(br);
+      if (!aOk && !bOk) return String(a.id).localeCompare(String(b.id));
+      if (!aOk) return 1;
+      if (!bOk) return -1;
+      if (ar !== br) return ar - br;
+      return String(a.id).localeCompare(String(b.id));
+    }
     const statsA = judge ? (a.per_judge || {})[judge] : null;
     const statsB = judge ? (b.per_judge || {})[judge] : null;
     const discA = judge
@@ -1052,18 +1142,24 @@ function passLabel(passed) {
 }
 
 function renderAccuracy() {
+  const filter = document.getElementById("mode").value;
+  if (state.selectedJudge && filter) {
+    const meta = (state.judges || []).find(j => j.label === state.selectedJudge);
+    if (meta && meta.mode && meta.mode !== filter) {
+      state.selectedJudge = null;
+    }
+  }
   const wrap = document.getElementById("accuracy");
   const acc = state.accuracy || {};
-  const modes = [
-    ["with_gt", "with-GT (sees gold)"],
-    ["free", "no gold (hears audio)"],
-  ];
+  const titles = state.modeTitles || {};
   const selected = state.selectedJudge;
   let html = "";
-  for (const [mode, title] of modes) {
+  for (const mode of accuracyModeOrder()) {
+    if (filter && mode !== filter) continue;
     const byJudge = acc[mode] || {};
     const keys = sortJudgeKeys(byJudge);
     if (!keys.length) continue;
+    const title = titles[mode] || mode;
     html += `<div class="mode-label">${escapeHtml(title)}</div>`;
     html += `<div class="acc-wrap"><table class="acc-table"><thead>
       <tr><th>Judge</th><th>n</th><th>miss</th><th>ρ</th><th>ω</th><th>pass</th></tr>
@@ -1107,9 +1203,12 @@ function renderList() {
     const disc = judge
       ? (Number(stats?.n || 0) - Number(stats?.n_agree || 0))
       : Number(row.n_disagree_any || 0);
-    const rateLabel = judge
-      ? `${fmtRate(acc)} agree · ${disc} disagree`
-      : `${fmtRate(row.human_pass_rate)} human pass · ${disc} any disagree`;
+    const sort = (document.getElementById("sort") || {}).value || "disagree";
+    const rateLabel = sort === "gt_agree"
+      ? `${fmtRate(rowModeAgree(row))} ${modeAgreeLabel()}`
+      : judge
+        ? `${fmtRate(acc)} agree · ${disc} disagree`
+        : `${fmtRate(row.human_pass_rate)} human pass · ${disc} any disagree`;
     const active = row.id === state.selectedId ? "active" : "";
     return `<li class="${active}" data-id="${escapeHtml(row.id)}">
       <div class="qid">${escapeHtml(row.id)}</div>
@@ -1262,6 +1361,13 @@ async function init() {
   state.modelLabels = pack.model_labels || [];
   state.judges = pack.judges || [];
   state.accuracy = pack.accuracy || {};
+  if (pack.mode_titles && typeof pack.mode_titles === "object") {
+    state.modeTitles = pack.mode_titles;
+  }
+  if (Array.isArray(pack.mode_order) && pack.mode_order.length) {
+    state.modeOrder = pack.mode_order;
+  }
+  fillModeSelect();
   state.nLabelRows = pack.n_label_rows || 0;
   state.nQuestions = pack.n_questions || 0;
   state.nGenerations = pack.n_generations || 0;
@@ -1270,7 +1376,7 @@ async function init() {
   sel.innerHTML = `<option value="">All</option>` + state.modelLabels.map(m =>
     `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`
   ).join("");
-  ["search", "model", "mode", "match", "human"].forEach(id => {
+  ["search", "model", "mode", "match", "human", "sort"].forEach(id => {
     document.getElementById(id).addEventListener("input", () => {
       renderAccuracy();
       renderList();
@@ -1347,6 +1453,8 @@ class Handler(BaseHTTPRequestHandler):
                         "model_labels": bundle["model_labels"],
                         "judges": bundle["judges"],
                         "accuracy": bundle["accuracy"],
+                        "mode_titles": grade_mode_titles(),
+                        "mode_order": list(grade_prompt_names()),
                         "n_label_rows": bundle["n_label_rows"],
                         "n_questions": bundle["n_questions"],
                         "n_generations": bundle["n_generations"],
@@ -1480,11 +1588,12 @@ def main() -> None:
     )
     if not bundle["pack_present"]:
         print("No local judging predictions; viewer will show exports/ only.")
-    for mode in ("with_gt", "free"):
+    for mode in accuracy_mode_names(bundle.get("accuracy") or {}):
         by_judge = (bundle["accuracy"] or {}).get(mode) or {}
         if not by_judge:
             continue
-        print(f"  {mode}:")
+        title = grade_mode_title(mode)
+        print(f"  {title}:")
 
         def _rho_key(name: str, table: dict = by_judge) -> tuple[float, str]:
             rho = (table.get(name) or {}).get("advantage_prob")

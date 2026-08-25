@@ -444,8 +444,9 @@ class _PendingJob:
 def _gold_prefix(question: str, answer: str, prompt_name: str | None = None) -> str:
     from grader import build_grade_gold_prefix
 
-    del prompt_name
-    return build_grade_gold_prefix(question=question, answer=answer)
+    return build_grade_gold_prefix(
+        question=question, answer=answer, prompt=prompt_name
+    )
 
 
 def _verdict_entry(
@@ -510,7 +511,8 @@ async def grade_pack_with_api_judge(
     """Grade pack predictions with one API judge; writes ``predictions.jsonl``."""
     from grader import (
         compose_judge_key,
-        grade_prompt_name,
+        get_judge_format,
+        normalize_grade_prompt,
         require_audio_nongold_judge,
         resolve_grade_allowed_ids,
         resolve_grade_audio_path,
@@ -524,10 +526,15 @@ async def grade_pack_with_api_judge(
     resolved = resolve_api_judge_label(label) or label
     spec = API_SPECS[resolved]
     model_id = spec["model_id"]
-    include_gold = bool(include_gold)
-    prompt_name = grade_prompt_name(include_gold)
-    del prompt
-    require_audio_nongold_judge(model_id=resolved, include_gold=include_gold)
+    fmt = get_judge_format(prompt, include_gold=include_gold)
+    include_gold = fmt.include_gold
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    require_audio_nongold_judge(
+        model_id=resolved,
+        include_gold=include_gold,
+        audio_required=fmt.audio_included,
+    )
+    use_gold_prefix = include_gold and not fmt.audio_included
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
     gradees = [item for item in model_labels if item != resolved]
     files: dict[str, list[dict]] = {}
@@ -674,12 +681,12 @@ async def grade_pack_with_api_judge(
                 include_gold=include_gold,
             )
             send = full
-            if cached_content and prefix and include_gold and full.startswith(prefix):
+            if cached_content and prefix and use_gold_prefix and full.startswith(prefix):
                 send = full[len(prefix) :]
             async with shot_sem:
                 result = await taker.complete(
                     send,
-                    None if include_gold else audio,
+                    audio if fmt.audio_included else None,
                     0,
                     question_id=job.qid,
                     cached_content=cached_content,
@@ -691,17 +698,17 @@ async def grade_pack_with_api_judge(
             nonlocal graded, reused, total_cached, total_prompt, n_api, done_questions
             jobs = by_qid[qid]
             audio: str | None = None
-            if not include_gold:
+            if fmt.audio_included:
                 raw = next((job.audio_path for job in jobs if job.audio_path), None)
                 resolved_audio = resolve_grade_audio_path(raw)
                 if resolved_audio is None:
                     raise SystemExit(
-                        f"NO_GOLD API judge {resolved!r} missing audio for id={qid!r} "
+                        f"Audio API judge {resolved!r} missing audio for id={qid!r} "
                         f"path={raw!r}"
                     )
                 audio = str(resolved_audio)
             prefix = None
-            if include_gold:
+            if use_gold_prefix:
                 sample = jobs[0]
                 prefix = _gold_prefix(sample.question, sample.answer, prompt_name)
             cache_name = None
@@ -709,7 +716,7 @@ async def grade_pack_with_api_judge(
                 try:
                     if len(jobs) > 1:
                         cache_name = await taker.begin_prefix(
-                            None if include_gold else audio,
+                            audio if fmt.audio_included else None,
                             prefix or "",
                         )
                     pairs = list(
