@@ -10,9 +10,10 @@ Joins:
   (``correct``, ``verdict``, ``output``, ``generation``, ``model_id``,
   ``prompt``, ``include_gold``) and optional ``judge_partials/*.jsonl``
 
-The question list can sort by disagreement or by mean judge-mode
-agreement with the human majority label (one bucket per
-``JUDGE_FORMATS`` key).
+The viewer requires a ``JUDGE_FORMATS`` key first (first key on load).
+Accuracy, question sorting, and shot verdicts then render only for that
+format. The list can sort by disagreement or by mean agreement with the
+human majority label within the selected format.
 
 Usage::
 
@@ -549,10 +550,12 @@ def load_bundle(
     )
 
     mode_keys: dict[str, list[str]] = {name: [] for name in grade_prompt_names()}
+    label_mode: dict[str, str] = {}
     for judge in judge_meta:
         mode = judge.get("mode")
         if mode:
             mode_keys.setdefault(str(mode), []).append(judge["label"])
+            label_mode[str(judge["label"])] = str(mode)
     gt_keys = mode_keys.get("with_gt") or []
 
     questions: list[dict[str, Any]] = []
@@ -561,6 +564,7 @@ def load_bundle(
         n_labeled = 0
         n_human_pass = 0
         n_disagree_any = 0
+        n_disagree_by_mode: dict[str, int] = {mode: 0 for mode in mode_keys}
         per_judge: dict[str, dict[str, int]] = {
             key: {"n": 0, "n_agree": 0, "n_missing": 0} for key in seen_keys
         }
@@ -571,6 +575,7 @@ def load_bundle(
                 if gold:
                     n_human_pass += 1
                 shot_disagree = False
+                shot_disagree_by_mode = {mode: False for mode in mode_keys}
                 for key in seen_keys:
                     entry = (shot.get("judges") or {}).get(key)
                     bucket = per_judge[key]
@@ -587,8 +592,14 @@ def load_bundle(
                         bucket["n_agree"] += 1
                     else:
                         shot_disagree = True
+                        mode = label_mode.get(key)
+                        if mode:
+                            shot_disagree_by_mode[mode] = True
                 if shot_disagree:
                     n_disagree_any += 1
+                for mode, disagreed in shot_disagree_by_mode.items():
+                    if disagreed:
+                        n_disagree_by_mode[mode] = n_disagree_by_mode.get(mode, 0) + 1
         gt_agree = _average_judge_agreement(per_judge, gt_keys)
         agree_by_mode = {
             mode: _average_judge_agreement(per_judge, keys)
@@ -604,6 +615,7 @@ def load_bundle(
                 "n_labeled": n_labeled,
                 "n_human_pass": n_human_pass,
                 "n_disagree_any": n_disagree_any,
+                "n_disagree_by_mode": n_disagree_by_mode,
                 "n_gt": gt_agree["n"],
                 "n_gt_agree": gt_agree["n_agree"],
                 "avg_gt_agree": gt_agree["rate"],
@@ -701,8 +713,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 8px; padding: 0.45rem 0.65rem;
   }
   select, input[type="search"] { min-width: 11rem; }
+  #mode { min-width: 14rem; font-weight: 500; }
   button { cursor: pointer; }
   button.active { background: #e2eef6; border-color: #8fb3c9; }
+  #app-body[hidden] { display: none; }
+  .toolbar {
+    max-width: 1480px; margin: 0 auto; padding: 0.85rem 1.25rem 0;
+    display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end;
+  }
   main {
     max-width: 1480px; margin: 0 auto; padding: 1.25rem;
     display: grid; grid-template-columns: 380px 1fr; gap: 1rem;
@@ -875,56 +893,59 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span class="mode-badge">vs human labels</span>
       </div>
       <p>Judge verdicts joined to <code>exports/labels.csv</code> and <code>exports/generations.csv</code></p>
+      <p id="format-hint" class="muted" hidden>Select a judge format to open the rest of the viewer.</p>
     </div>
     <div class="controls">
-      <label>Search
-        <input id="search" type="search" placeholder="id / question / answer" />
-      </label>
-      <label>Model
-        <select id="model"><option value="">All</option></select>
-      </label>
-      <label>Judge mode
-        <select id="mode">
-          <option value="">All</option>
-        </select>
-      </label>
-      <label>Match
-        <select id="match">
-          <option value="">All</option>
-          <option value="disagree">Disagree</option>
-          <option value="agree">Agree</option>
-          <option value="missing">Missing verdict</option>
-        </select>
-      </label>
-      <label>Human
-        <select id="human">
-          <option value="">All</option>
-          <option value="pass">Pass</option>
-          <option value="fail">Fail</option>
-        </select>
-      </label>
-      <label>Sort
-        <select id="sort">
-          <option value="disagree">Disagree (high → low)</option>
-          <option value="gt_agree">Judge-mode agree (low → high)</option>
-        </select>
+      <label>Judge format
+        <select id="mode" required></select>
       </label>
     </div>
   </div>
 </header>
-<main>
-  <section class="panel">
-    <h2>Alt-Test vs human</h2>
-    <div class="stats" id="stats">Loading…</div>
-    <div id="accuracy"></div>
-    <h2>Questions</h2>
-    <ul id="qlist"></ul>
-  </section>
-  <section class="panel">
-    <h2>Detail</h2>
-    <div id="detail"><p class="muted">Select a question.</p></div>
-  </section>
-</main>
+<div id="app-body" hidden>
+  <div class="toolbar">
+    <label>Search
+      <input id="search" type="search" placeholder="id / question / answer" />
+    </label>
+    <label>Model
+      <select id="model"><option value="">All</option></select>
+    </label>
+    <label>Match
+      <select id="match">
+        <option value="">All</option>
+        <option value="disagree">Disagree</option>
+        <option value="agree">Agree</option>
+        <option value="missing">Missing verdict</option>
+      </select>
+    </label>
+    <label>Human
+      <select id="human">
+        <option value="">All</option>
+        <option value="pass">Pass</option>
+        <option value="fail">Fail</option>
+      </select>
+    </label>
+    <label>Sort
+      <select id="sort">
+        <option value="disagree">Disagree (high → low)</option>
+        <option value="gt_agree">Judge-format agree (low → high)</option>
+      </select>
+    </label>
+  </div>
+  <main>
+    <section class="panel">
+      <h2>Alt-Test vs human</h2>
+      <div class="stats" id="stats">Loading…</div>
+      <div id="accuracy"></div>
+      <h2>Questions</h2>
+      <ul id="qlist"></ul>
+    </section>
+    <section class="panel">
+      <h2>Detail</h2>
+      <div id="detail"><p class="muted">Select a question.</p></div>
+    </section>
+  </main>
+</div>
 <script>
 const state = {
   questions: [],
@@ -1001,18 +1022,45 @@ function shortJudge(key) {
   return promptShort ? `${base}/${promptShort}` : base;
 }
 
+function formatOrder() {
+  const named = Array.isArray(state.modeOrder) ? state.modeOrder.filter(Boolean) : [];
+  if (named.length) {
+    const extra = accuracyModeOrder().filter(mode => !named.includes(mode));
+    return named.concat(extra);
+  }
+  return accuracyModeOrder();
+}
+
+function selectedMode() {
+  return String((document.getElementById("mode") || {}).value || "");
+}
+
+function formatTitle(mode) {
+  if (!mode) return "";
+  const title = (state.modeTitles || {})[mode] || mode;
+  return String(title).split(" (")[0];
+}
+
+function syncAppVisibility() {
+  const mode = selectedMode();
+  const body = document.getElementById("app-body");
+  if (body) body.hidden = !mode;
+  const hint = document.getElementById("format-hint");
+  if (hint) hint.hidden = !!mode;
+}
+
 function fillModeSelect() {
   const sel = document.getElementById("mode");
   if (!sel) return;
   const current = sel.value;
-  const titles = state.modeTitles || {};
-  const order = accuracyModeOrder();
-  sel.innerHTML = `<option value="">All</option>` + order.map(mode => {
-    const title = titles[mode] || mode;
-    const label = String(title).split(" (")[0];
+  const order = formatOrder();
+  sel.innerHTML = order.map(mode => {
+    const label = formatTitle(mode) || mode;
     return `<option value="${escapeHtml(mode)}">${escapeHtml(label)}</option>`;
   }).join("");
-  if ([...sel.options].some(opt => opt.value === current)) sel.value = current;
+  const preferred = (current && order.includes(current)) ? current : (order[0] || "");
+  sel.value = preferred;
+  syncAppVisibility();
 }
 
 function accuracyModeOrder() {
@@ -1028,28 +1076,31 @@ function accuracyModeOrder() {
 }
 
 function rowModeAgree(row) {
-  const mode = document.getElementById("mode").value;
+  const mode = selectedMode();
   const byMode = row.agree_by_mode || {};
   if (mode && byMode[mode] && typeof byMode[mode].rate === "number") {
     return byMode[mode].rate;
   }
-  if (typeof byMode.with_gt?.rate === "number") return byMode.with_gt.rate;
-  for (const bucket of Object.values(byMode)) {
-    if (bucket && typeof bucket.rate === "number") return bucket.rate;
-  }
-  return row.avg_gt_agree;
+  return null;
+}
+
+function rowModeDisagree(row) {
+  const mode = selectedMode();
+  const byMode = row.n_disagree_by_mode || {};
+  if (mode && typeof byMode[mode] === "number") return byMode[mode];
+  return 0;
 }
 
 function modeAgreeLabel() {
-  const mode = document.getElementById("mode").value;
-  if (!mode) return "judge-mode agree";
-  const title = (state.modeTitles || {})[mode] || mode;
-  return `${String(title).split(" (")[0]} agree`;
+  const mode = selectedMode();
+  if (!mode) return "judge-format agree";
+  return `${formatTitle(mode) || mode} agree`;
 }
 
 function visibleJudges() {
-  const mode = document.getElementById("mode").value;
-  return (state.judges || []).filter(j => !mode || j.mode === mode);
+  const mode = selectedMode();
+  if (!mode) return [];
+  return (state.judges || []).filter(j => j.mode === mode);
 }
 
 function questionMatch(row) {
@@ -1062,7 +1113,11 @@ function questionMatch(row) {
   if (human === "fail" && !(row.n_labeled - (row.n_human_pass || 0) > 0)) return false;
   if (!match) return true;
   if (!judge) {
-    if (match === "disagree") return (row.n_disagree_any || 0) > 0;
+    if (match === "disagree") return rowModeDisagree(row) > 0;
+    if (match === "agree") return rowModeDisagree(row) === 0;
+    if (match === "missing") {
+      return visibleJudges().some(j => Number((row.per_judge || {})[j.label]?.n_missing || 0) > 0);
+    }
     return true;
   }
   const stats = (row.per_judge || {})[judge] || {};
@@ -1102,10 +1157,10 @@ function filteredQuestions() {
     const statsB = judge ? (b.per_judge || {})[judge] : null;
     const discA = judge
       ? (Number(statsA?.n || 0) - Number(statsA?.n_agree || 0))
-      : Number(a.n_disagree_any || 0);
+      : rowModeDisagree(a);
     const discB = judge
       ? (Number(statsB?.n || 0) - Number(statsB?.n_agree || 0))
-      : Number(b.n_disagree_any || 0);
+      : rowModeDisagree(b);
     if (discA !== discB) return discB - discA;
     return String(a.id).localeCompare(String(b.id));
   });
@@ -1118,7 +1173,7 @@ function renderStats() {
     `<span>${state.nQuestions} questions</span>`,
     `<span>${state.nLabelRows} labeled shots</span>`,
     `<span>${state.nGenerations} generations</span>`,
-    `<span>${(state.judges || []).length} judges</span>`,
+    `<span>${visibleJudges().length} judges</span>`,
   ];
   document.getElementById("stats").innerHTML = parts.join(" · ");
 }
@@ -1142,8 +1197,12 @@ function passLabel(passed) {
 }
 
 function renderAccuracy() {
-  const filter = document.getElementById("mode").value;
-  if (state.selectedJudge && filter) {
+  const filter = selectedMode();
+  if (!filter) {
+    document.getElementById("accuracy").innerHTML = "";
+    return;
+  }
+  if (state.selectedJudge) {
     const meta = (state.judges || []).find(j => j.label === state.selectedJudge);
     if (meta && meta.mode && meta.mode !== filter) {
       state.selectedJudge = null;
@@ -1151,15 +1210,12 @@ function renderAccuracy() {
   }
   const wrap = document.getElementById("accuracy");
   const acc = state.accuracy || {};
-  const titles = state.modeTitles || {};
   const selected = state.selectedJudge;
   let html = "";
-  for (const mode of accuracyModeOrder()) {
-    if (filter && mode !== filter) continue;
-    const byJudge = acc[mode] || {};
-    const keys = sortJudgeKeys(byJudge);
-    if (!keys.length) continue;
-    const title = titles[mode] || mode;
+  const byJudge = acc[filter] || {};
+  const keys = sortJudgeKeys(byJudge);
+  if (keys.length) {
+    const title = (state.modeTitles || {})[filter] || filter;
     html += `<div class="mode-label">${escapeHtml(title)}</div>`;
     html += `<div class="acc-wrap"><table class="acc-table"><thead>
       <tr><th>Judge</th><th>n</th><th>miss</th><th>ρ</th><th>ω</th><th>pass</th></tr>
@@ -1179,7 +1235,7 @@ function renderAccuracy() {
     html += `</tbody></table></div>`;
   }
   if (!html) {
-    html = `<p class="muted" style="padding:0.6rem 1rem">No judge verdicts in the pack yet. Download with <code>uv run modal run download_judges.py</code>.</p>`;
+    html = `<p class="muted" style="padding:0.6rem 1rem">No judge verdicts for <code>${escapeHtml(filter)}</code> in the pack yet. Download with <code>uv run modal run download_judges.py</code>.</p>`;
   }
   wrap.innerHTML = html;
   wrap.querySelectorAll("tr[data-judge]").forEach(tr => {
@@ -1202,7 +1258,7 @@ function renderList() {
     const acc = stats ? stats.accuracy : null;
     const disc = judge
       ? (Number(stats?.n || 0) - Number(stats?.n_agree || 0))
-      : Number(row.n_disagree_any || 0);
+      : rowModeDisagree(row);
     const sort = (document.getElementById("sort") || {}).value || "disagree";
     const rateLabel = sort === "gt_agree"
       ? `${fmtRate(rowModeAgree(row))} ${modeAgreeLabel()}`
@@ -1266,11 +1322,8 @@ function shotJudgeBlock(shot, gold) {
   const judges = visibleJudges();
   const onShot = shot.judges || {};
   const keys = judges.map(j => j.label).filter(k => k in onShot);
-  for (const key of Object.keys(onShot)) {
-    if (!keys.includes(key)) keys.push(key);
-  }
   if (!keys.length) {
-    return `<div class="judge-chips"><span class="chip">no judge verdicts</span></div>`;
+    return `<div class="judge-chips"><span class="chip">no ${escapeHtml(formatTitle(selectedMode()) || "format")} verdicts</span></div>`;
   }
   const chips = keys.map(key => {
     const entry = onShot[key] || {};
@@ -1376,20 +1429,32 @@ async function init() {
   sel.innerHTML = `<option value="">All</option>` + state.modelLabels.map(m =>
     `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`
   ).join("");
-  ["search", "model", "mode", "match", "human", "sort"].forEach(id => {
-    document.getElementById(id).addEventListener("input", () => {
-      renderAccuracy();
-      renderList();
-    });
-    document.getElementById(id).addEventListener("change", () => {
-      renderAccuracy();
-      renderList();
-      const items = filteredQuestions();
-      if (items.length && !items.some(row => row.id === state.selectedId)) {
-        selectQuestion(items[0].id);
-      }
-    });
+  const onFilter = () => {
+    renderAccuracy();
+    renderList();
+    const items = filteredQuestions();
+    if (items.length && !items.some(row => row.id === state.selectedId)) {
+      selectQuestion(items[0].id);
+    }
+  };
+  ["search", "model", "match", "human", "sort"].forEach(id => {
+    document.getElementById(id).addEventListener("input", onFilter);
+    document.getElementById(id).addEventListener("change", onFilter);
   });
+  document.getElementById("mode").addEventListener("change", () => {
+    syncAppVisibility();
+    if (!selectedMode()) return;
+    state.selectedJudge = null;
+    renderAccuracy();
+    renderList();
+    const items = filteredQuestions();
+    if (state.selectedId && items.some(row => row.id === state.selectedId)) {
+      selectQuestion(state.selectedId);
+      return;
+    }
+    if (items.length) selectQuestion(items[0].id);
+  });
+  if (!selectedMode()) return;
   renderAccuracy();
   if (!state.questions.length) {
     document.getElementById("stats").textContent = "No labeled questions in exports/.";
@@ -1405,7 +1470,10 @@ async function init() {
 }
 
 init().catch(err => {
-  document.getElementById("stats").textContent = String(err);
+  const body = document.getElementById("app-body");
+  if (body) body.hidden = false;
+  const stats = document.getElementById("stats");
+  if (stats) stats.textContent = String(err);
 });
 </script>
 </body>
