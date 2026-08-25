@@ -8,8 +8,10 @@ import modal
 
 VOLUME_NAME = "latent-reasoning"
 RESULTS_VOLUME_NAME = "latent-reasoning-results"
+JUDGING_VOLUME_NAME = "mmar-judging"
 VOLUME_MOUNT = Path("/cache")
 RESULTS_MOUNT = Path("/results")
+JUDGING_MOUNT = Path("/judging")
 DATA_ROOT = VOLUME_MOUNT / "data"
 MODELS_ROOT = VOLUME_MOUNT / "models"
 
@@ -18,6 +20,7 @@ DEFAULT_MMAR_META = DEFAULT_MMAR_DATA_ROOT / "MMAR-meta.jsonl"
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
+judging_volume = modal.Volume.from_name(JUDGING_VOLUME_NAME, create_if_missing=True)
 
 hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
 

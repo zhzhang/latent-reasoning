@@ -8,12 +8,14 @@ Volume layout (mirrors locally under ``<repo>/outputs/``):
       scores.json
       manifest.json
       models/<label>/predictions.jsonl
-    mmar-judging/                            # run_judges.py (exports-backed pack)
     mmar/af3/<run_id>/
       predictions.jsonl              # generations + CoT + answers
       scores.json
       manifest.json
     mmar/af-next-think/<run_id>/     # legacy single-model AF-Next runs
+
+Judge packs live on the separate ``mmar-judging`` volume; use
+``download_judges.py``.
 
 ``modal volume get`` places the last path component under the local
 destination, so nested downloads must target the parent directory to

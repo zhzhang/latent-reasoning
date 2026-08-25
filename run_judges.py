@@ -2,12 +2,12 @@
 
 Reads ``exports/labels.csv`` and ``exports/generations.csv``, joins
 question / gold / audio from MMAR-meta, and writes the judged pack to
-``outputs/mmar-judging`` (Modal volume path ``mmar-judging``). Grades
+``outputs/mmar-judging`` (Modal volume ``mmar-judging``). Grades
 only questions present in ``labels.csv``. Default is both with-GT and
 no-GT recipes (one GPU load per judge). Shots that already have a
 verdict for the same judge key are skipped. Regenerates
 ``difficulty.jsonl`` / ``scores.json`` after grading, then writes
-``judge_accuracy.json``.
+``judge_accuracy.json`` (Alt-Test Average Advantage Probability).
 
 vLLM suite / dedicated judges start Modal from this script. API judges
 (gemini-3.7-flash) run locally and never open an App.
@@ -31,7 +31,7 @@ vLLM suite / dedicated judges start Modal from this script. API judges
       --judge-model-id qwen3-omni-instruct \\
       --no-include-gold
 
-    # Recompute accuracy from existing local verdicts
+    # Recompute Alt-Test scores from existing local verdicts
     uv run run_judges.py --accuracy-only
 
 Local API judges::
@@ -45,6 +45,10 @@ Mixed (API locally while Modal vLLM runs detached)::
 
     uv run run_judges.py \\
       --judge-model-id gemini-3.7-flash,qwen3-omni-instruct
+
+    # Download remote verdicts and inspect vs exports/ labels
+    uv run modal run download_judges.py
+    uv run python view_judges.py
 """
 
 from __future__ import annotations
@@ -62,14 +66,15 @@ from pathlib import Path
 import modal
 
 from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
+from alt_test import DEFAULT_EPSILON, score_binary_judge
 from mmar_common import judge_label, load_jsonl, resolve_path, write_json, write_jsonl
 from modal_cache import (
     DEFAULT_MMAR_DATA_ROOT,
     DEFAULT_MMAR_META,
-    RESULTS_MOUNT,
+    JUDGING_MOUNT,
     VOLUME_MOUNT,
     hf_secret,
-    results_volume,
+    judging_volume,
     volume,
 )
 
@@ -77,7 +82,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 PACK_NAME = "mmar-judging"
 EXPORTS_DIR = REPO_ROOT / "exports"
 LOCAL_PACK_DIR = REPO_ROOT / "outputs" / PACK_NAME
-REMOTE_PACK_DIR = RESULTS_MOUNT / PACK_NAME
+REMOTE_PACK_DIR = JUDGING_MOUNT
 LOCAL_EXPORTS_MOUNT = Path("/local-exports")
 INGEST_DIR_NAME = "_local_ingest"
 LABELS_CSV_NAME = "labels.csv"
@@ -448,8 +453,29 @@ def _shot_for_index(record: dict, shot_index: int) -> dict | None:
     return None
 
 
-def report_judge_accuracy(pack_dir: Path) -> dict:
-    """Compare judge verdicts to the first human rating in labels.csv."""
+def _instance_id(row: dict) -> str:
+    return f"{row['question_id']}\t{row['model_label']}\t{row['shot_index']}"
+
+
+def _entry_correct(entry: object) -> bool | None:
+    if isinstance(entry, dict) and entry.get("correct") is not None:
+        return bool(entry.get("correct"))
+    return None
+
+
+def _sort_judge_keys(by_judge: dict) -> list[str]:
+    def _key(name: str) -> tuple[float, str]:
+        rho = (by_judge.get(name) or {}).get("advantage_prob")
+        rank = -float(rho) if isinstance(rho, (int, float)) else 1.0
+        return (rank, name)
+
+    return sorted(by_judge, key=_key)
+
+
+def report_judge_accuracy(
+    pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON
+) -> dict:
+    """Alt-Test scores vs human ratings (Average Advantage Probability)."""
     labels_path = _labels_path(pack_dir)
     if not labels_path.is_file():
         raise SystemExit(f"labels.csv not found at {labels_path}")
@@ -458,11 +484,10 @@ def report_judge_accuracy(pack_dir: Path) -> dict:
         raise SystemExit(f"No labeled rows in {labels_path}")
 
     pred_cache: dict[str, dict[str, dict]] = {}
-    samples: list[tuple[bool, dict[str, dict] | None]] = []
+    samples: list[tuple[str, list[bool], dict[str, dict] | None]] = []
     judge_keys: set[str] = set()
 
     for row in rows:
-        gold = bool(row["ratings"][0])
         model = row["model_label"]
         if model not in pred_cache:
             pred_cache[model] = _load_predictions_by_id(
@@ -478,63 +503,41 @@ def report_judge_accuracy(pack_dir: Path) -> dict:
                 if key
             }
             judge_keys.update(judges)
-        samples.append((gold, judges))
+        samples.append((_instance_id(row), list(row["ratings"]), judges))
 
-    stats: dict[str, dict[str, dict[str, int]]] = {
-        "with_gt": {},
-        "free": {},
-    }
     key_mode: dict[str, str] = {}
     for key in sorted(judge_keys):
         sample_entry = next(
             (
                 (judges or {}).get(key)
-                for _gold, judges in samples
+                for _iid, _ratings, judges in samples
                 if judges and key in judges
             ),
             None,
         )
-        mode = _judge_mode_bucket(key, sample_entry if isinstance(sample_entry, dict) else None)
+        mode = _judge_mode_bucket(
+            key, sample_entry if isinstance(sample_entry, dict) else None
+        )
         if mode is None:
             continue
         key_mode[key] = mode
-        stats[mode][key] = {"n": 0, "n_agree": 0, "n_missing": 0}
 
-    for gold, judges in samples:
-        for key, mode in key_mode.items():
-            bucket = stats[mode][key]
-            entry = (judges or {}).get(key) if judges else None
-            correct = None
-            if isinstance(entry, dict) and entry.get("correct") is not None:
-                correct = bool(entry.get("correct"))
-            if correct is None:
-                bucket["n_missing"] += 1
-                continue
-            bucket["n"] += 1
-            if correct == gold:
-                bucket["n_agree"] += 1
-
-    def _mode_payload(mode: str) -> dict:
-        by_judge: dict[str, dict] = {}
-        for key, bucket in stats[mode].items():
-            n = int(bucket["n"])
-            agree = int(bucket["n_agree"])
-            missing = int(bucket["n_missing"])
-            by_judge[key] = {
-                "n": n,
-                "n_agree": agree,
-                "n_missing": missing,
-                "accuracy": (agree / n) if n else None,
-            }
-        return by_judge
+    stats: dict[str, dict[str, dict]] = {"with_gt": {}, "free": {}}
+    for key, mode in key_mode.items():
+        instances = [
+            (instance_id, ratings, _entry_correct((judges or {}).get(key)))
+            for instance_id, ratings, judges in samples
+        ]
+        stats[mode][key] = score_binary_judge(instances, epsilon=epsilon)
 
     payload = {
         "pack": PACK_NAME,
         "labels_path": str(labels_path),
         "n_label_rows": len(rows),
         "n_questions": len(labeled_question_ids(rows)),
-        "with_gt": _mode_payload("with_gt"),
-        "free": _mode_payload("free"),
+        "epsilon": float(epsilon),
+        "with_gt": stats["with_gt"],
+        "free": stats["free"],
     }
     dest = pack_dir / ACCURACY_JSON_NAME
     write_json(dest, payload)
@@ -543,21 +546,43 @@ def report_judge_accuracy(pack_dir: Path) -> dict:
     return payload
 
 
+def _fmt_rate(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"{float(value):.3f}"
+
+
 def _print_judge_accuracy(payload: dict) -> None:
+    epsilon = payload.get("epsilon")
+    eps_s = _fmt_rate(epsilon)
     for mode in ("with_gt", "free"):
-        print(f"\n=== judge accuracy ({mode}) ===")
-        print(f"{'judge':<52} {'n':>6} {'agree':>7} {'miss':>6} {'acc':>8}")
+        print(f"\n=== judge Alt-Test ({mode}, ε={eps_s}) ===")
+        print("llm = judge agreement with the other two labelers (leave-one-out ACC)")
+        print("hum = excluded labeler's agreement with those same two")
+        print(
+            f"{'judge':<52} {'n':>6} {'miss':>6} {'<3':>6} "
+            f"{'ρ':>8} {'llm':>8} {'hum':>8} {'ω':>8} {'pass':>5}"
+        )
         by_judge = payload.get(mode) or {}
         if not by_judge:
             print("(no verdicts)")
             continue
-        for key in sorted(by_judge):
+        for key in _sort_judge_keys(by_judge):
             row = by_judge[key]
-            acc = row.get("accuracy")
-            acc_s = f"{acc:.3f}" if isinstance(acc, float) else "—"
+            passed = row.get("passed")
+            if passed is True:
+                pass_s = "yes"
+            elif passed is False:
+                pass_s = "no"
+            else:
+                pass_s = "—"
             print(
-                f"{key:<52} {row.get('n', 0):>6} {row.get('n_agree', 0):>7} "
-                f"{row.get('n_missing', 0):>6} {acc_s:>8}"
+                f"{key:<52} {row.get('n', 0):>6} {row.get('n_missing', 0):>6} "
+                f"{row.get('n_skipped_lt3', 0):>6} "
+                f"{_fmt_rate(row.get('advantage_prob')):>8} "
+                f"{_fmt_rate(row.get('loo_agree_judge')):>8} "
+                f"{_fmt_rate(row.get('loo_agree_human')):>8} "
+                f"{_fmt_rate(row.get('winning_rate')):>8} {pass_s:>5}"
             )
     print()
 
@@ -586,6 +611,7 @@ def _mount_sources(image: modal.Image) -> modal.Image:
         "mmar_api",
         "audio_flamingo_runtime",
         "aggregate",
+        "alt_test",
         "grader",
         "mmar_models",
     )
@@ -655,7 +681,7 @@ large_mm_image = _mount_sources(
 
 cpu_image = _mount_sources(
     modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-        "numpy", "tqdm>=4.67.0"
+        "numpy", "scipy", "tqdm>=4.67.0"
     )
 )
 if EXPORTS_DIR.is_dir():
@@ -815,10 +841,10 @@ def _merge_pack_from(src: Path, dest: Path) -> None:
 
 
 def _bootstrap_pack() -> dict:
-    """Materialize exports + MMAR-meta onto the results volume, keeping verdicts."""
+    """Materialize exports + MMAR-meta onto the judging volume, keeping verdicts."""
     dest = _pack_dir()
     built = materialize_exports_pack(dest)
-    results_volume.commit()
+    judging_volume.commit()
     if not dest.is_dir() or not (dest / "manifest.json").is_file():
         raise SystemExit(f"Failed to materialize pack at {dest}")
     return built
@@ -1005,7 +1031,7 @@ def _select_judges(
 @app.function(
     image=cpu_image,
     timeout=10 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def prepare_judges(
     judge_model_id: str = "",
@@ -1014,7 +1040,7 @@ def prepare_judges(
 ) -> dict:
     """Validate the pack is freeform and resolve gradees / judges."""
     volume.reload()
-    results_volume.reload()
+    judging_volume.reload()
     built = _bootstrap_pack()
     pack_dir = _pack_dir()
 
@@ -1080,7 +1106,7 @@ def prepare_judges(
     image=grader_image,
     gpu="H100",
     timeout=6 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
     secrets=[hf_secret],
     memory=32768,
 )
@@ -1108,7 +1134,7 @@ def grade_with_judge(
     )
 
     volume.reload()
-    results_volume.reload()
+    judging_volume.reload()
 
     pack_dir = _pack_dir()
     if not pack_dir.is_dir():
@@ -1164,7 +1190,7 @@ def grade_with_judge(
                 n_questions=n_questions,
                 question_ids=question_ids,
             )
-            results_volume.commit()
+            judging_volume.commit()
             print(f"[run-judges] {label}:", per_model[f"{label}/{key}"])
         manifest = _merge_judge_manifest(
             manifest,
@@ -1176,7 +1202,7 @@ def grade_with_judge(
             include_gold=gold_flag,
         )
     write_json(pack_dir / "manifest.json", manifest)
-    results_volume.commit()
+    judging_volume.commit()
     return {
         "status": "ok",
         "pack": PACK_NAME,
@@ -1212,7 +1238,7 @@ def _grade_suite_judge(
     )
 
     volume.reload()
-    results_volume.reload()
+    judging_volume.reload()
     pack_dir = _pack_dir()
     if not pack_dir.is_dir():
         raise SystemExit(f"Pack not found: {pack_dir}")
@@ -1259,7 +1285,7 @@ def _grade_suite_judge(
                 n_questions=n_questions,
                 question_ids=question_ids,
             )
-            results_volume.commit()
+            judging_volume.commit()
             print(f"[run-judges-rr] {gradee}/{key}:", per_model[f"{gradee}/{key}"])
     return {
         "status": "ok",
@@ -1279,7 +1305,7 @@ def _grade_suite_judge(
 _SUITE_GRADE_KW = dict(
     image=large_mm_image,
     timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
     secrets=[hf_secret],
     memory=65536,
 )
@@ -1360,7 +1386,7 @@ _SUITE_GRADE_FNS = {
 @app.function(
     image=cpu_image,
     timeout=30 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def merge_round_robin(
     model_labels: list[str],
@@ -1371,7 +1397,7 @@ def merge_round_robin(
     """Fold judge sidecars into predictions.jsonl and append manifest entries."""
     from grader import apply_judge_partials
 
-    results_volume.reload()
+    judging_volume.reload()
     pack_dir = _pack_dir()
     manifest = _load_manifest(pack_dir)
     _assert_freeform_run(manifest)
@@ -1400,7 +1426,7 @@ def merge_round_robin(
             include_gold=entry.get("include_gold"),
         )
     write_json(pack_dir / "manifest.json", manifest)
-    results_volume.commit()
+    judging_volume.commit()
     return {
         "status": "ok",
         "pack": PACK_NAME,
@@ -1413,18 +1439,18 @@ def merge_round_robin(
 @app.function(
     image=cpu_image,
     timeout=30 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def ingest_local_pack() -> dict:
     """Merge a local-entrypoint upload of API verdicts into the volume pack."""
-    results_volume.reload()
+    judging_volume.reload()
     dest = _pack_dir()
     src = dest / INGEST_DIR_NAME
     if not src.is_dir():
         return {"status": "missing", "pack": PACK_NAME}
     _merge_pack_from(src, dest)
     shutil.rmtree(src, ignore_errors=True)
-    results_volume.commit()
+    judging_volume.commit()
     print(f"[run-judges] ingested local pack -> {dest}")
     return {"status": "ok", "pack": PACK_NAME}
 
@@ -1452,37 +1478,37 @@ def _aggregate_pack(pack_dir: Path) -> dict:
 @app.function(
     image=cpu_image,
     timeout=30 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def run_aggregate() -> dict:
-    results_volume.reload()
+    judging_volume.reload()
     pack_dir = _pack_dir()
     if not pack_dir.is_dir():
         raise SystemExit(f"Pack not found: {pack_dir}")
     result = _aggregate_pack(pack_dir)
-    results_volume.commit()
+    judging_volume.commit()
     return result
 
 
 @app.function(
     image=cpu_image,
     timeout=30 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
-def run_accuracy() -> dict:
-    results_volume.reload()
+def run_accuracy(epsilon: float = DEFAULT_EPSILON) -> dict:
+    judging_volume.reload()
     pack_dir = _pack_dir()
     if not pack_dir.is_dir():
         raise SystemExit(f"Pack not found: {pack_dir}")
-    result = report_judge_accuracy(pack_dir)
-    results_volume.commit()
+    result = report_judge_accuracy(pack_dir, epsilon=epsilon)
+    judging_volume.commit()
     return result
 
 
 def _download_pack() -> None:
-    from download_results import download_results
+    from download_judges import download_judges
 
-    saved = download_results(remote_path=PACK_NAME, local_dir=REPO_ROOT / "outputs")
+    saved = download_judges(local_dir=LOCAL_PACK_DIR)
     print(f"[run-judges] downloaded pack -> {saved}")
 
 
@@ -1526,7 +1552,7 @@ def _upload_local_ingest(pack_dir: Path) -> None:
     ``add_local_dir`` is snapshotted when the first remote function runs, so API
     verdicts written later must be pushed onto the volume separately.
     """
-    prefix = f"/{PACK_NAME}/{INGEST_DIR_NAME}"
+    prefix = f"/{INGEST_DIR_NAME}"
     uploads: list[tuple[str, str]] = []
     manifest = pack_dir / "manifest.json"
     if manifest.is_file():
@@ -1541,7 +1567,7 @@ def _upload_local_ingest(pack_dir: Path) -> None:
                 )
     if not uploads:
         return
-    with results_volume.batch_upload(force=True) as batch:
+    with judging_volume.batch_upload(force=True) as batch:
         for local_path, remote_path in uploads:
             batch.put_file(local_path, remote_path)
     print(f"[run-judges] uploaded {len(uploads)} files -> {prefix}")
@@ -1690,6 +1716,7 @@ def _finish_remote_pack(
     primary_judge: str | None,
     skip_aggregate: bool,
     ingest: bool,
+    epsilon: float = DEFAULT_EPSILON,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     ingest_result = None
     if ingest:
@@ -1710,15 +1737,15 @@ def _finish_remote_pack(
     if not skip_aggregate:
         agg = run_aggregate.remote()
         print("Aggregated:", agg)
-    accuracy = run_accuracy.remote()
-    print("Judge accuracy:", accuracy)
+    accuracy = run_accuracy.remote(epsilon=epsilon)
+    print("Judge Alt-Test:", accuracy)
     return ingest_result, merge, agg, accuracy
 
 
 @app.function(
     image=cpu_image,
     timeout=24 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
+    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def run_judges_pipeline(
     judge_model_id: str = "",
@@ -1730,6 +1757,7 @@ def run_judges_pipeline(
     include_gold: bool | None = None,
     n_questions: int | None = None,
     ingest_local: bool = False,
+    epsilon: float = DEFAULT_EPSILON,
 ) -> dict:
     """Remote orchestrator so a detached App stays alive across GPU phases."""
     from grader import parse_grade_prompt_list
@@ -1780,6 +1808,7 @@ def run_judges_pipeline(
         primary_judge=prep.get("primary_judge"),
         skip_aggregate=skip_aggregate,
         ingest=ingest_local,
+        epsilon=epsilon,
     )
     return {
         "prepare": prep,
@@ -1807,6 +1836,7 @@ def _run_judges(
     timeout: float = 180.0,
     retries: int = 20,
     retry_interval: float = 1.0,
+    epsilon: float = DEFAULT_EPSILON,
 ) -> dict:
     from grader import (
         compose_judge_key,
@@ -1917,7 +1947,7 @@ def _run_judges(
         if pack_dir is None:
             raise SystemExit(f"Pack not found at {LOCAL_PACK_DIR}")
         agg = None if skip_aggregate else _aggregate_pack(pack_dir)
-        accuracy = report_judge_accuracy(pack_dir)
+        accuracy = report_judge_accuracy(pack_dir, epsilon=epsilon)
         return {
             "prepare": None,
             "grade": [],
@@ -1938,6 +1968,7 @@ def _run_judges(
         include_gold=include_gold,
         n_questions=n_questions,
         ingest_local=bool(api),
+        epsilon=epsilon,
     )
     dashboard = app.get_dashboard_url()
     if dashboard:
@@ -1994,7 +2025,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--accuracy-only",
         action="store_true",
-        help="Recompute judge_accuracy.json from the local pack; do not grade.",
+        help="Recompute judge_accuracy.json (Alt-Test) from the local pack; "
+        "do not grade.",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=DEFAULT_EPSILON,
+        help="Alt-Test cost-benefit penalty for winning rate (default: 0.15). "
+        "Average advantage probability ρ does not use this.",
     )
     parser.add_argument("--qps", type=float, default=4.0)
     parser.add_argument("--max-workers", type=int, default=8)
@@ -2007,7 +2046,7 @@ def parse_args() -> argparse.Namespace:
 def _run_judges_from_args(args: argparse.Namespace) -> dict:
     if args.accuracy_only:
         pack_dir = _require_local_pack()
-        return report_judge_accuracy(pack_dir)
+        return report_judge_accuracy(pack_dir, epsilon=args.epsilon)
     return _run_judges(
         judge_model_id=args.judge_model_id,
         models=args.models,
@@ -2022,6 +2061,7 @@ def _run_judges_from_args(args: argparse.Namespace) -> dict:
         timeout=args.timeout,
         retries=args.retries,
         retry_interval=args.retry_interval,
+        epsilon=args.epsilon,
     )
 
 
