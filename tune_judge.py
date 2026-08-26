@@ -111,7 +111,7 @@ def _cuda_base_image(python_version: str = "3.12") -> modal.Image:
 judge_image = (
     _cuda_base_image()
     .uv_pip_install(
-        "vllm==0.26.0",
+        "vllm==0.28.0",
         "transformers>=5.5.3",
         "huggingface-hub>=0.30.0",
         "numpy",

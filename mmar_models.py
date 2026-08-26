@@ -1268,18 +1268,9 @@ def generate_batch(
             for seed in seeds
         ]
         chat_kwargs = dict(handle.get("chat_kwargs") or {})
-        # Gemma-4's audio encoder treats mixed-length batches as a Python list
-        # and then calls .squeeze(); one conversation at a time (n=shots) is safe.
-        if label in {"gemma-4-e4b", "nemotron-3-nano-omni"}:
-            outputs = []
-            for msgs, sp in zip(messages, sampling):
-                outputs.extend(
-                    handle["llm"].chat([msgs], sampling_params=sp, **chat_kwargs)
-                )
-        else:
-            outputs = handle["llm"].chat(
-                messages, sampling_params=sampling, **chat_kwargs
-            )
+        outputs = handle["llm"].chat(
+            messages, sampling_params=sampling, **chat_kwargs
+        )
         return _expand_n_outputs(
             samples, outputs, n_completions=n_completions, parse_fn=parse_fn
         )

@@ -654,11 +654,11 @@ _FUSED_MOE_CONFIG_CMD = (
     "done; fi"
 )
 
-# 0.26+ recommended for Qwen3.6 gated-delta hybrid / FP8 checkpoints.
+# 0.28+ recommended for Qwen3.6 gated-delta hybrid / FP8 checkpoints.
 grader_image = _mount_sources(
     _cuda_base_image()
     .uv_pip_install(
-        "vllm==0.26.0",
+        "vllm==0.28.0",
         "transformers>=5.5.3",
         "huggingface-hub>=0.30.0",
         "librosa>=0.11.0",
@@ -679,7 +679,7 @@ grader_image = _mount_sources(
 large_mm_image = _mount_sources(
     _cuda_base_image()
     .uv_pip_install(
-        "vllm[audio]==0.26.0",
+        "vllm[audio]==0.28.0",
         "transformers>=5.5.3",
         "mistral-common[audio]",
         "huggingface-hub>=0.30.0",

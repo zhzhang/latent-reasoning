@@ -26,8 +26,8 @@ one prefill; Omni/HF duplicate the prompt per shot and rely on prefix caching.
 | `af-next-think` | `nvidia/audio-flamingo-next-think-hf` | vLLM 0.24 MusicFlamingo (HF fallback); `T=0.2, max_tokens=2048, rep=1.2` |
 | `mimo-audio-7b` | `XiaomiMiMo/MiMo-Audio-7B-Instruct` (+ tokenizer) | vLLM-Omni; `T=0.3, top_p=0.95, max_tokens=512, rep=1.1` |
 | `interactive-omni-8b` | `sensenova/InteractiveOmni-8B` | HF `.chat` (vLLM transformers backend incompatible); `T=1.0, max_tokens=1024` |
-| `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.26 thinker-only (A100-80GB); `T=0.6, top_p=0.95, top_k=20, max_tokens=2048` |
-| `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.26 Mistral audio (A100-80GB); `T=0.2, top_p=0.95, max_tokens=512` |
+| `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.28 thinker-only (A100-80GB); `T=0.6, top_p=0.95, top_k=20, max_tokens=2048` |
+| `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.28 Mistral audio (A100-80GB); `T=0.2, top_p=0.95, max_tokens=512` |
 
 `step-audio-2-mini` is temporarily excluded from difficulty aggregation.
 

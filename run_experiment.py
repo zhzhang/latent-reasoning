@@ -12,10 +12,10 @@ Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
   - mimo-audio-7b: vLLM-Omni 0.24
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
-  - qwen3-omni: vLLM 0.26 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
+  - qwen3-omni: vLLM 0.28 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
   - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
-    nemotron-3-nano-omni: vLLM 0.26 audio
-  - voxtral-small-24b: vLLM 0.26 Mistral-format audio
+    nemotron-3-nano-omni: vLLM 0.28 audio
+  - voxtral-small-24b: vLLM 0.28 Mistral-format audio
 
 Results layout on ``latent-reasoning-results``:
 
@@ -247,7 +247,7 @@ omni_image = _mount_local_sources(
 interactive_omni_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
-        "vllm==0.26.0",
+        "vllm==0.28.0",
         "transformers>=5.5.3",
         "torch",
         "torchaudio",
@@ -273,7 +273,7 @@ interactive_omni_image = _mount_local_sources(
 
 # Qwen3-Omni thinker + Voxtral Small (A100-80GB); needs mistral-common[audio] + PyAV.
 # Install E=128,N=768 fused-MoE Triton config under both A100 device names
-# Modal may assign (PCIe or SXM4). vLLM 0.26 ships no A100 variant for this
+# Modal may assign (PCIe or SXM4). vLLM 0.28 ships no A100 variant for this
 # shape — use H200 bf16 as the best available stand-in vs untuned defaults.
 _FUSED_MOE_CONFIG_CMD = (
     "D=/usr/local/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs && "
@@ -289,7 +289,7 @@ _FUSED_MOE_CONFIG_CMD = (
 large_mm_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
-        "vllm[audio]==0.26.0",
+        "vllm[audio]==0.28.0",
         "transformers>=5.5.3",
         "mistral-common[audio]",
         "huggingface-hub>=0.30.0",
@@ -315,8 +315,8 @@ cpu_image = _mount_local_sources(
 )
 
 # Text-only freeform grader (Qwen2.5-3B / Qwen3.6-35B-A3B-FP8 via vLLM).
-# 0.26+ recommended for Qwen3.6 gated-delta hybrid checkpoints.
-grader_image = _vllm_image(vllm_version="0.26.0")
+# 0.28+ recommended for Qwen3.6 gated-delta hybrid checkpoints.
+grader_image = _vllm_image(vllm_version="0.28.0")
 
 app = modal.App("exp-mmar-question-difficulty")
 
