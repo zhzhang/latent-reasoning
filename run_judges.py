@@ -10,7 +10,9 @@ verdict for the same judge key are skipped. Regenerates
 ``judge_accuracy.json`` (Alt-Test Average Advantage Probability).
 
 vLLM suite / dedicated judges start Modal from this script. API judges
-(gemini-3.7-flash) run locally and never open an App.
+(gemini-3.7-flash) run locally and never open an App. Batch API judges
+(gpt-5.6-luna, claude-sonnet-5) also run locally: they grade ``with_gt``
+on shots in ``exports/labels.csv`` that have all three reviewer ratings.
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
@@ -50,6 +52,15 @@ Local API judges::
     uv run run_judges.py --judge-model-id gemini-3.7-flash
     uv run run_judges.py --judge-model-id api --no-include-gold
 
+OpenAI / Anthropic Batch API (with_gt, triple-labeled shots)::
+
+    export OPENAI_API_KEY=...
+    uv run run_judges.py --judge-model-id gpt-5.6-luna
+
+    export ANTHROPIC_API_KEY=...
+    uv run run_judges.py --judge-model-id claude-sonnet-5
+    uv run run_judges.py --judge-model-id sonnet --batch-id msgbatch_abc123
+
 Mixed (API locally while Modal vLLM runs detached)::
 
     uv run run_judges.py \\
@@ -75,7 +86,7 @@ from pathlib import Path
 import modal
 
 from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
-from alt_test import DEFAULT_EPSILON, score_binary_judge
+from alt_test import DEFAULT_EPSILON, MIN_HUMANS_PER_INSTANCE, score_binary_judge
 from mmar_common import judge_label, load_jsonl, resolve_path, write_json, write_jsonl
 from modal_cache import (
     DEFAULT_MMAR_DATA_ROOT,
@@ -154,6 +165,15 @@ def load_pack_label_rows(labels_path: Path) -> list[dict]:
 
 def labeled_question_ids(rows: list[dict]) -> list[str]:
     return list(dict.fromkeys(str(row["question_id"]) for row in rows))
+
+
+def triple_labeled_rows(rows: list[dict]) -> list[dict]:
+    """Rows with at least three reviewer ratings (Alt-Test sample)."""
+    return [
+        row
+        for row in rows
+        if len(row.get("ratings") or []) >= MIN_HUMANS_PER_INSTANCE
+    ]
 
 
 def _labels_path(pack_dir: Path) -> Path:
@@ -1854,6 +1874,8 @@ def _run_judges(
     retries: int = 20,
     retry_interval: float = 1.0,
     epsilon: float = DEFAULT_EPSILON,
+    batch_id: str = "",
+    batch_poll_interval: float = 30.0,
 ) -> dict:
     from grader import (
         JUDGE_FORMATS,
@@ -1861,15 +1883,24 @@ def _run_judges(
         iter_grade_modes,
         parse_grade_prompt_list,
         require_audio_nongold_judge,
+        resolve_grade_allowed_ids,
     )
-    from mmar_api import grade_pack_with_api_judges
+    from mmar_api import (
+        BATCH_API_GRADE_PROMPT,
+        grade_pack_with_api_judges,
+        grade_pack_with_batch_api,
+        split_api_judges,
+    )
 
     if n_questions is not None and int(n_questions) < 0:
         n_questions = None
 
     suite, dedicated, api, first_new = _select_judges(judge_model_id)
+    live_api, batch_api = split_api_judges(api)
     modes = iter_grade_modes(prompt=prompt, include_gold=include_gold)
     needs_audio = any(JUDGE_FORMATS[name].audio_included for name, _ in modes)
+    if not live_api and not suite and not dedicated:
+        needs_audio = False
     audio_only = bool(modes) and all(
         JUDGE_FORMATS[name].audio_included for name, _ in modes
     )
@@ -1881,7 +1912,7 @@ def _run_judges(
                     include_gold=False,
                     audio_required=True,
                 )
-        elif not suite and not api:
+        elif not suite and not live_api:
             raise SystemExit(
                 "Audio-only formats need an audio-capable judge "
                 f"(selected: {', '.join(name for name, _ in modes)})"
@@ -1894,8 +1925,9 @@ def _run_judges(
     question_ids: list[str] = []
     existing_primary = None
     mode = "freeform"
-    if api or not needs_modal:
-        pack_dir = _require_local_pack(need_audio=needs_audio and bool(api))
+    local_api = bool(live_api or batch_api)
+    if local_api or not needs_modal:
+        pack_dir = _require_local_pack(need_audio=needs_audio and bool(live_api))
         manifest = _load_manifest(pack_dir)
         mode = _assert_freeform_run(manifest)
         gradees = _local_model_labels(models)
@@ -1911,7 +1943,8 @@ def _run_judges(
     print(
         f"[run-judges] pack={PACK_NAME} mode={mode} "
         f"suite_judges={suite} dedicated_judges={[d['label'] for d in dedicated]} "
-        f"api_judges={api} gradees={gradees or '(modal)'} primary={primary} "
+        f"api_judges={live_api} batch_judges={batch_api} "
+        f"gradees={gradees or '(modal)'} primary={primary} "
         f"(existing_primary={existing_primary}) "
         f"gold={_run_mode_note(prompt, include_gold)} prompts={prompts} "
         f"n_questions={n_questions} n_labeled={len(question_ids) or '(modal)'} "
@@ -1922,7 +1955,7 @@ def _run_judges(
 
     def _run_api() -> None:
         nonlocal api_results
-        if not api:
+        if not live_api:
             return
         if pack_dir is None:
             raise SystemExit(
@@ -1932,17 +1965,17 @@ def _run_judges(
         collected: list[dict] = []
         first_prompt, first_gold = modes[0]
         first_api_key = compose_judge_key(
-            api[0], prompt=first_prompt, include_gold=first_gold
+            live_api[0], prompt=first_prompt, include_gold=first_gold
         )
         set_primary = api_make_primary or (
-            not existing_primary and not suite and not dedicated
+            not existing_primary and not suite and not dedicated and not batch_api
         )
         for prompt_name, gold_flag in modes:
             collected.extend(
                 asyncio.run(
                     grade_pack_with_api_judges(
                         pack_dir,
-                        labels=api,
+                        labels=live_api,
                         model_labels=gradees,
                         prompts=[prompt_name],
                         include_gold=gold_flag,
@@ -1959,11 +1992,74 @@ def _run_judges(
                     )
                 )
             )
-        api_results = collected
-        first_key = str(api_results[0].get("judge_key") or first_api_key)
+        api_results.extend(collected)
+        first_key = str(collected[0].get("judge_key") or first_api_key)
         _merge_api_manifest(
             pack_dir,
-            api_results,
+            collected,
+            make_primary=set_primary,
+            primary_judge=first_key or primary,
+            update_primary=set_primary,
+        )
+
+    def _run_batch() -> None:
+        nonlocal api_results
+        if not batch_api:
+            return
+        if pack_dir is None:
+            raise SystemExit(
+                "Batch API judges require exports/ plus a local pack "
+                "at outputs/mmar-judging"
+            )
+        rows = triple_labeled_rows(load_pack_label_rows(_labels_path(pack_dir)))
+        if not rows:
+            raise SystemExit(
+                f"No {LABELS_CSV_NAME} rows with {MIN_HUMANS_PER_INSTANCE} "
+                "reviewer ratings"
+            )
+        qids = labeled_question_ids(rows)
+        allowed = resolve_grade_allowed_ids(
+            qids, n_questions=n_questions
+        )
+        if allowed is not None:
+            rows = [row for row in rows if row["question_id"] in allowed]
+        if not rows:
+            raise SystemExit(
+                "No triple-labeled shots remain after --n-questions filtering"
+            )
+        if prompt and str(prompt).strip() not in {"", BATCH_API_GRADE_PROMPT}:
+            print(
+                f"[run-judges] Batch API judges use {BATCH_API_GRADE_PROMPT} "
+                "only; ignoring other --grade-prompt values"
+            )
+        first_batch_key = compose_judge_key(
+            batch_api[0], prompt=BATCH_API_GRADE_PROMPT, include_gold=True
+        )
+        set_primary = api_make_primary or (
+            not existing_primary and not suite and not dedicated and not live_api
+        )
+        collected: list[dict] = []
+        for index, label in enumerate(batch_api):
+            this_primary = set_primary and index == 0
+            result = grade_pack_with_batch_api(
+                pack_dir,
+                label=label,
+                model_labels=gradees,
+                labeled_rows=rows,
+                prompt=BATCH_API_GRADE_PROMPT,
+                force=force,
+                make_primary=this_primary,
+                primary_judge=first_batch_key if set_primary else primary,
+                poll_interval=batch_poll_interval,
+                batch_id=(batch_id or "").strip() or None,
+            )
+            collected.append(result)
+            print("Batch graded:", result)
+        api_results.extend(collected)
+        first_key = str(collected[0].get("judge_key") or first_batch_key)
+        _merge_api_manifest(
+            pack_dir,
+            collected,
             make_primary=set_primary,
             primary_judge=first_key or primary,
             update_primary=set_primary,
@@ -1971,6 +2067,7 @@ def _run_judges(
 
     if not needs_modal:
         _run_api()
+        _run_batch()
         if pack_dir is None:
             raise SystemExit(f"Pack not found at {LOCAL_PACK_DIR}")
         agg = None if skip_aggregate else _aggregate_pack(pack_dir)
@@ -1995,7 +2092,7 @@ def _run_judges(
         include_gold=include_gold,
         prompt=prompt,
         n_questions=n_questions,
-        ingest_local=bool(api),
+        ingest_local=local_api,
         epsilon=epsilon,
     )
     dashboard = app.get_dashboard_url()
@@ -2005,7 +2102,8 @@ def _run_judges(
         print("[run-judges] Modal GPU pipeline started (detached)")
 
     _run_api()
-    if api and pack_dir is not None:
+    _run_batch()
+    if local_api and pack_dir is not None:
         _upload_local_ingest(pack_dir)
         ingest = ingest_local_pack.remote()
         print("Ingested local API pack:", ingest)
@@ -2030,7 +2128,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--judge-model-id",
         default="",
-        help="Comma-separated judges, or 'api' for API judges",
+        help="Comma-separated judges, 'api' for live API judges, "
+        "or 'batch' for OpenAI/Anthropic Batch API judges",
     )
     parser.add_argument("--models", default="all")
     parser.add_argument("--make-primary", action="store_true")
@@ -2078,6 +2177,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--retries", type=int, default=20)
     parser.add_argument("--retry-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--batch-id",
+        default="",
+        help="Resume an existing OpenAI (`batch_…`) or Anthropic "
+        "(`msgbatch_…`) Batch API job instead of submitting a new one",
+    )
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between Batch API status polls (default: 30)",
+    )
     return parser.parse_args()
 
 
@@ -2101,6 +2212,8 @@ def _run_judges_from_args(args: argparse.Namespace) -> dict:
         retries=args.retries,
         retry_interval=args.retry_interval,
         epsilon=args.epsilon,
+        batch_id=args.batch_id,
+        batch_poll_interval=args.batch_poll_interval,
     )
 
 

@@ -280,7 +280,10 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "max_model_len": 4096,
             "max_num_seqs": 64,
             "max_num_batched_tokens": 8192,
-            "limit_mm_per_prompt": {"audio": 1},
+            # Unspecified modalities default to 999. Dummy video profiling then
+            # runs the FP8 vision MLP (hidden 4304) which is not divisible by
+            # the 128-wide block size and asserts in per_token_group_quant_fp8.
+            "limit_mm_per_prompt": {"audio": 1, "image": 0, "video": 0},
             "enforce_eager": True,
             "trust_remote_code": True,
             "enable_prefix_caching": True,

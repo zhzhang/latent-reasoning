@@ -1,6 +1,6 @@
-"""One-off: LLM-as-judge with gold, first shot, all 1000 MMAR questions.
+"""One-off: LLM-as-judge with gold, 5 shots, all 1000 MMAR questions.
 
-Grades ``shot_index == 0`` for every test-taker model that has a freeform
+Grades ``shot_index`` 0–4 for every test-taker model that has a freeform
 generation on the full MMAR set. Judge is ``qwen3.6-35b-a3b-fp8`` with the
 ``neutral_with_gt_no_audio`` recipe. Each answer is sampled 3 times
 (``SamplingParams(n=3)`` shared prefill) and majority-voted.
@@ -16,9 +16,9 @@ Sources, later runs only add models that are not already present:
     exp-mmar-question-difficulty/20260816T050944Z   # extra models × 784 q
     mmar-freeform-5-shot                            # API models
 
-Resume is the default: existing first-shot verdicts for this judge are
+Resume is the default: existing per-shot verdicts for this judge are
 kept, the H100 is not started when nothing is left, and only ungraded
-examples are sent to the model. Pass ``--force`` to replace them.
+generations are sent to the model. Pass ``--force`` to replace them.
 
 Usage::
 
@@ -36,7 +36,7 @@ from typing import Any
 import modal
 
 from aggregate import aggregate_difficulty, order_model_labels
-from mmar_common import write_json, write_jsonl
+from mmar_common import recompute_multi_judge_scores, write_json, write_jsonl
 from modal_cache import (
     JUDGING_MOUNT,
     RESULTS_MOUNT,
@@ -58,6 +58,8 @@ COLLATED_PACK = RESULTS_MOUNT / "mmar-freeform-5-shot"
 
 JUDGE_MODEL_ID = "qwen3.6-35b-a3b-fp8"
 GRADE_PROMPT = "neutral_with_gt_no_audio"
+N_SHOTS = 5
+SHOT_INDICES = tuple(range(N_SHOTS))
 N_SAMPLES = 3
 # Qwen3.6 thinking-mode default. T=0 would make the 3 shots identical.
 JUDGE_TEMPERATURE = 1.0
@@ -146,30 +148,35 @@ def _shot_index(shot: dict[str, Any]) -> int:
 
 def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
     out = {key: value for key, value in shot.items() if key not in DROP_SHOT_KEYS}
-    out["shot_index"] = 0
+    out["shot_index"] = _shot_index(shot)
     out["correct"] = None
     out["pending_grade"] = True
     return out
 
 
-def _first_shot_record(record: dict[str, Any], *, model: str) -> dict[str, Any] | None:
-    shots = list(record.get("shots") or [])
-    shots.sort(key=_shot_index)
-    chosen = next((shot for shot in shots if _shot_index(shot) == 0), None)
-    if chosen is None and shots:
-        chosen = shots[0]
-    if chosen is None:
+def _shots_record(record: dict[str, Any], *, model: str) -> dict[str, Any] | None:
+    raw_shots = list(record.get("shots") or [])
+    raw_shots.sort(key=_shot_index)
+    kept: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for shot in raw_shots:
+        idx = _shot_index(shot)
+        if idx not in SHOT_INDICES or idx in seen:
+            continue
+        seen.add(idx)
+        kept.append(_compact_shot(shot))
+    if not kept:
         return None
-    shot = _compact_shot(chosen)
+    first = next((shot for shot in kept if _shot_index(shot) == 0), kept[0])
     out = {key: value for key, value in record.items() if key not in DROP_RECORD_KEYS}
     out["id"] = str(record.get("id") or "")
     out["model"] = model
-    out["n_shots"] = 1
-    out["shots"] = [shot]
-    out["answer_prediction"] = shot.get("answer_prediction")
-    out["model_output"] = shot.get("model_output")
-    out["thinking_prediction"] = shot.get("thinking_prediction")
-    out["raw_tokens"] = shot.get("raw_tokens")
+    out["n_shots"] = len(kept)
+    out["shots"] = kept
+    out["answer_prediction"] = first.get("answer_prediction")
+    out["model_output"] = first.get("model_output")
+    out["thinking_prediction"] = first.get("thinking_prediction")
+    out["raw_tokens"] = first.get("raw_tokens")
     out["correct"] = None
     out["n_shot_correct"] = None
     out["shot_success_rate"] = None
@@ -190,7 +197,7 @@ def _load_question_ids(path: Path) -> list[str]:
     return [str(qid) for qid in ids if str(qid).strip()]
 
 
-def _iter_first_shots(predictions_path: Path, *, model: str) -> dict[str, dict[str, Any]]:
+def _iter_shots(predictions_path: Path, *, model: str) -> dict[str, dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
     if not predictions_path.is_file():
         return found
@@ -203,7 +210,7 @@ def _iter_first_shots(predictions_path: Path, *, model: str) -> dict[str, dict[s
                 record = json.loads(text)
             except json.JSONDecodeError:
                 continue
-            compact = _first_shot_record(record, model=model)
+            compact = _shots_record(record, model=model)
             if compact is None or not compact["id"]:
                 continue
             found[compact["id"]] = compact
@@ -226,7 +233,7 @@ def _source_model_dirs() -> list[tuple[str, Path]]:
 
 
 def _merge_shot_judges(local: dict, prior: dict) -> dict:
-    """Keep prior verdicts when the first-shot answer is unchanged."""
+    """Keep prior per-shot verdicts when that shot's answer is unchanged."""
     prior_shots = {
         _shot_index(shot): shot for shot in (prior.get("shots") or [])
     }
@@ -253,6 +260,12 @@ def _merge_shot_judges(local: dict, prior: dict) -> dict:
     return merged
 
 
+def _has_shot_judges(record: dict[str, Any]) -> bool:
+    if record.get("judges"):
+        return True
+    return any((shot.get("judges") or {}) for shot in (record.get("shots") or []))
+
+
 def _write_predictions(path: Path, records: list[dict[str, Any]]) -> None:
     prior_by_id: dict[str, dict] = {}
     if path.is_file():
@@ -268,7 +281,10 @@ def _write_predictions(path: Path, records: list[dict[str, Any]]) -> None:
     merged = []
     for record in records:
         prior = prior_by_id.get(str(record.get("id") or ""))
-        merged.append(_merge_shot_judges(record, prior) if prior else record)
+        row = _merge_shot_judges(record, prior) if prior else record
+        if _has_shot_judges(row):
+            recompute_multi_judge_scores(row, row.get("primary_judge"))
+        merged.append(row)
     write_jsonl(path, merged, mode="w")
 
 
@@ -320,7 +336,7 @@ def _stamp_manifest(
     },
 )
 def prepare_pack(models: str = "all") -> dict:
-    """Copy first-shot freeform answers onto ``mmar-judging/llm-judge-gt``."""
+    """Copy 5-shot freeform answers onto ``mmar-judging/llm-judge-gt``."""
     results_volume.reload()
     judging_volume.reload()
 
@@ -345,16 +361,17 @@ def prepare_pack(models: str = "all") -> dict:
             if label in by_model:
                 continue
             pred = model_dir / "predictions.jsonl"
-            rows = _iter_first_shots(pred, model=label)
+            rows = _iter_shots(pred, model=label)
             kept = {qid: rows[qid] for qid in question_ids if qid in rows}
             if not kept:
-                print(f"[llm-judge-gt] {tag}/{label}: no first-shot overlap")
+                print(f"[llm-judge-gt] {tag}/{label}: no shot overlap")
                 continue
             by_model[label] = kept
             sources[label] = tag
+            n_shot_rows = sum(len(row.get("shots") or []) for row in kept.values())
             print(
                 f"[llm-judge-gt] {tag}/{label}: {len(kept)}/{len(question_ids)} "
-                f"first shots"
+                f"questions, {n_shot_rows} shots"
             )
 
     requested = [part.strip() for part in str(models or "all").split(",") if part.strip()]
@@ -369,7 +386,7 @@ def prepare_pack(models: str = "all") -> dict:
 
     labels = order_model_labels(list(by_model))
     if not labels:
-        raise SystemExit("No test-taker first-shot generations found")
+        raise SystemExit("No test-taker generations found")
 
     pack_dir = REMOTE_PACK_DIR
     pack_dir.mkdir(parents=True, exist_ok=True)
@@ -383,7 +400,7 @@ def prepare_pack(models: str = "all") -> dict:
         {
             "n": len(question_ids),
             "ids": question_ids,
-            "n_shots": 1,
+            "n_shots": N_SHOTS,
             "source": FULL_MMAR_RUN_ID,
         },
     )
@@ -392,7 +409,7 @@ def prepare_pack(models: str = "all") -> dict:
         {
             "name": PACK_NAME,
             "mode": "freeform",
-            "n_shots": 1,
+            "n_shots": N_SHOTS,
             "n_questions": len(question_ids),
             "models": labels,
             "sources": sources,
@@ -421,7 +438,7 @@ def prepare_pack(models: str = "all") -> dict:
 @app.function(
     image=grader_image,
     gpu="H100",
-    timeout=12 * 60 * 60,
+    timeout=24 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
     secrets=[hf_secret],
     memory=32768,
@@ -432,7 +449,7 @@ def grade_pack(
     force: bool = False,
     batch_size: int | None = None,
 ) -> dict:
-    """Grade first-shot answers with 3-sample majority vote on one H100."""
+    """Grade all 5 shots with 3-sample majority vote on one H100."""
     from grader import (
         compose_judge_key,
         grade_predictions_file,
@@ -458,13 +475,13 @@ def grade_pack(
         model_labels,
         judge_key,
         question_ids=question_ids,
-        shot_indices=(0,),
+        shot_indices=SHOT_INDICES,
     )
     for label in model_labels:
         n_left = len(question_ids) if force else len(remaining.get(label) or [])
         print(
             f"[llm-judge-gt] {label}: {n_left}/{len(question_ids)} "
-            f"first shots still need {judge_key}"
+            f"questions still need {judge_key}"
         )
     if not force:
         done = [label for label in model_labels if label not in remaining]
@@ -507,7 +524,7 @@ def grade_pack(
             force=force,
             prompt=GRADE_PROMPT,
             include_gold=True,
-            shot_indices=(0,),
+            shot_indices=SHOT_INDICES,
             make_primary=True,
             question_ids=question_ids,
             n_samples=N_SAMPLES,
@@ -605,7 +622,7 @@ def run_pipeline(
         list(prep["model_labels"]),
         judge_key,
         question_ids=list(prep["question_ids"]),
-        shot_indices=(0,),
+        shot_indices=SHOT_INDICES,
     )
     if not force:
         for label in prep["model_labels"]:
@@ -615,7 +632,7 @@ def run_pipeline(
                 f"ungraded before GPU"
             )
         if not remaining:
-            print("[llm-judge-gt] skip GPU: every first shot already graded")
+            print("[llm-judge-gt] skip GPU: every generation already graded")
             grade = {
                 "status": "skipped",
                 "pack": PACK_NAME,
@@ -651,12 +668,12 @@ def main(
     batch_size: int | None = None,
     skip_aggregate: bool = False,
 ) -> None:
-    """Materialize first shots, grade with 3-sample majority, aggregate.
+    """Materialize 5-shot answers, grade with 3-sample majority, aggregate.
 
     Args:
         models: Comma-separated test-taker labels, or ``all``.
         force: Replace existing verdicts for this judge key. Without
-            this flag, already-graded first shots are skipped.
+            this flag, already-graded generations are skipped.
         batch_size: Concurrent sequence budget (default: per-judge spec 512).
             Prompt batch is ``batch_size // 3``.
         skip_aggregate: Skip difficulty.jsonl / scores.json.
