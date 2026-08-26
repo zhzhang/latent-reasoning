@@ -109,6 +109,8 @@ from modal_cache import (
     DEFAULT_MMAR_META,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
+    VLLM_VERSION,
+    VLLM_WHEEL_INDEX,
     hf_secret,
     results_volume,
     volume,
@@ -184,6 +186,7 @@ def _vllm_image(
     *,
     vllm_version: str,
     extra_packages: list[str] | None = None,
+    extra_index_url: str | None = None,
 ) -> modal.Image:
     packages = [
         f"vllm=={vllm_version}",
@@ -196,8 +199,11 @@ def _vllm_image(
         "accelerate>=1.14.0",
         *(extra_packages or []),
     ]
+    install_kw: dict = {}
+    if extra_index_url:
+        install_kw["extra_index_url"] = extra_index_url
     return _mount_local_sources(
-        _cuda_base_image().uv_pip_install(*packages).env(_VLLM_CACHE_ENV)
+        _cuda_base_image().uv_pip_install(*packages, **install_kw).env(_VLLM_CACHE_ENV)
     )
 
 
@@ -267,6 +273,7 @@ interactive_omni_image = _mount_local_sources(
         "numpy",
         "tqdm>=4.67.0",
         "accelerate>=1.14.0",
+        extra_index_url=VLLM_WHEEL_INDEX,
     )
     .env(_VLLM_CACHE_ENV)
 )
@@ -302,6 +309,7 @@ large_mm_image = _mount_local_sources(
         "accelerate>=1.14.0",
         "torch",
         "torchaudio",
+        extra_index_url=VLLM_WHEEL_INDEX,
     )
     .run_commands(_FUSED_MOE_CONFIG_CMD)
     .env(_INPROC_VLLM_ENV)
@@ -316,7 +324,9 @@ cpu_image = _mount_local_sources(
 
 # Text-only freeform grader (Qwen2.5-3B / Qwen3.6-35B-A3B-FP8 via vLLM).
 # 0.28+ recommended for Qwen3.6 gated-delta hybrid checkpoints.
-grader_image = _vllm_image(vllm_version="0.28.0")
+grader_image = _vllm_image(
+    vllm_version=VLLM_VERSION, extra_index_url=VLLM_WHEEL_INDEX
+)
 
 app = modal.App("exp-mmar-question-difficulty")
 
@@ -965,7 +975,7 @@ def run_gemma_4_e4b(**kwargs) -> dict:
 
 @app.function(
     image=large_mm_image,
-    gpu="A100-80GB",
+    gpu="H100",
     timeout=12 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
     secrets=[hf_secret],
@@ -1350,11 +1360,6 @@ def run_freeform_grade_l40s(**kwargs) -> dict:
     return _run_freeform_grade_body(**kwargs)
 
 
-@app.function(image=large_mm_image, gpu="A100-80GB", memory=65536, **_GRADE_FN_KW)
-def run_freeform_grade_a100(**kwargs) -> dict:
-    return _run_freeform_grade_body(**kwargs)
-
-
 @app.function(image=large_mm_image, gpu="H100", memory=65536, **_GRADE_FN_KW)
 def run_freeform_grade_suite_h100(**kwargs) -> dict:
     return _run_freeform_grade_body(**kwargs)
@@ -1366,9 +1371,7 @@ def _grade_worker_for(model_id: str):
     label = _suite_label_for(model_id)
     if label in {"qwen2.5-omni-7b", "phi-4-multimodal", "gemma-4-e4b"}:
         return run_freeform_grade_l40s
-    if label == "qwen3-omni-instruct":
-        return run_freeform_grade_a100
-    if label == "nemotron-3-nano-omni":
+    if label in {"qwen3-omni-instruct", "nemotron-3-nano-omni"}:
         return run_freeform_grade_suite_h100
     return run_freeform_grade
 

@@ -269,13 +269,14 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
-    # Same MoE thinker path as qwen3-omni Thinking; official Instruct eval is greedy.
+    # Block-wise FP8 of Qwen3-Omni Instruct (thinker+talker MoE); H100 native FP8.
+    # Official Instruct eval is greedy.
     "qwen3-omni-instruct": {
-        "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        "gpu": "A100-80GB",
+        "model_id": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
+        "gpu": "H100",
         "backend": "vllm",
         "engine": {
-            "dtype": "bfloat16",
+            "dtype": "auto",
             "max_model_len": 4096,
             "max_num_seqs": 64,
             "max_num_batched_tokens": 8192,

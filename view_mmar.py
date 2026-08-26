@@ -118,10 +118,10 @@ SAMPLING_SOURCES: dict[str, dict[str, str]] = {
         "note": "Card Best Practices: temperature=1.0, top_p=0.95, top_k=64.",
     },
     "qwen3-omni-instruct": {
-        "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "url": "https://huggingface.co/marksverdhei/Qwen3-Omni-30B-A3B-FP8",
         "label": "Hugging Face model card",
         "note": (
-            "Qwen3-Omni eval protocol: Instruct models decode greedily. "
+            "Block-wise FP8 of Qwen3-Omni Instruct. Official Instruct eval is greedy. "
             "T=0.2 added for n-shot variance."
         ),
     },

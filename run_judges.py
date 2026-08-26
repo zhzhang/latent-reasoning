@@ -82,6 +82,7 @@ from modal_cache import (
     DEFAULT_MMAR_META,
     JUDGING_MOUNT,
     VOLUME_MOUNT,
+    VLLM_WHEEL_INDEX,
     hf_secret,
     judging_volume,
     volume,
@@ -666,6 +667,7 @@ grader_image = _mount_sources(
         "numpy",
         "tqdm>=4.67.0",
         "accelerate>=1.14.0",
+        extra_index_url=VLLM_WHEEL_INDEX,
     )
     .env(
         {
@@ -692,6 +694,7 @@ large_mm_image = _mount_sources(
         "accelerate>=1.14.0",
         "torch",
         "torchaudio",
+        extra_index_url=VLLM_WHEEL_INDEX,
     )
     .run_commands(_FUSED_MOE_CONFIG_CMD)
     .env(_INPROC_VLLM_ENV)
@@ -1358,29 +1361,6 @@ def grade_suite_l40s(
     )
 
 
-@app.function(gpu="A100-80GB", **_SUITE_GRADE_KW)
-def grade_suite_a100(
-    judge_label: str,
-    model_labels: list[str],
-    include_gold: bool | None = None,
-    prompt: str | None = None,
-    force: bool = False,
-    batch_size: int | None = None,
-    n_questions: int | None = None,
-    question_ids: list[str] | None = None,
-) -> dict:
-    return _grade_suite_judge(
-        judge_label,
-        model_labels=model_labels,
-        include_gold=include_gold,
-        prompt=prompt,
-        force=force,
-        batch_size=batch_size,
-        n_questions=n_questions,
-        question_ids=question_ids,
-    )
-
-
 @app.function(gpu="H100", **_SUITE_GRADE_KW)
 def grade_suite_h100(
     judge_label: str,
@@ -1408,7 +1388,7 @@ _SUITE_GRADE_FNS = {
     "qwen2.5-omni-7b": grade_suite_l40s,
     "phi-4-multimodal": grade_suite_l40s,
     "gemma-4-e4b": grade_suite_l40s,
-    "qwen3-omni-instruct": grade_suite_a100,
+    "qwen3-omni-instruct": grade_suite_h100,
     "nemotron-3-nano-omni": grade_suite_h100,
 }
 

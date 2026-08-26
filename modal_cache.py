@@ -24,3 +24,9 @@ judging_volume = modal.Volume.from_name(JUDGING_VOLUME_NAME, create_if_missing=T
 
 hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
 
+# GitHub tag v0.28.0 is not on PyPI yet. vLLM publishes that tag's wheels at
+# wheels.vllm.ai/<full sha> (uv prefers extra-index-url over PyPI).
+VLLM_VERSION = "0.28.0"
+VLLM_GIT_SHA = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
+VLLM_WHEEL_INDEX = f"https://wheels.vllm.ai/{VLLM_GIT_SHA}"
+

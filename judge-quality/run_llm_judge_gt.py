@@ -41,6 +41,7 @@ from modal_cache import (
     JUDGING_MOUNT,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
+    VLLM_WHEEL_INDEX,
     hf_secret,
     judging_volume,
     results_volume,
@@ -118,6 +119,7 @@ grader_image = _mount_sources(
         "numpy",
         "tqdm>=4.67.0",
         "accelerate>=1.14.0",
+        extra_index_url=VLLM_WHEEL_INDEX,
     )
     .env(
         {

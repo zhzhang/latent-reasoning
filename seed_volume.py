@@ -71,7 +71,7 @@ MODEL_ALIASES: dict[str, str] = {
     "audio-flamingo-2": "nvidia/audio-flamingo-2",
     "qwen3-omni": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
     "qwen3-omni-thinking": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
-    "qwen3-omni-instruct": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "qwen3-omni-instruct": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
     "qwen2.5-omni-7b": "Qwen/Qwen2.5-Omni-7B",
     "qwen2.5-omni": "Qwen/Qwen2.5-Omni-7B",
     "phi-4-multimodal": "microsoft/Phi-4-multimodal-instruct",

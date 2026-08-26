@@ -43,6 +43,7 @@ import modal
 from modal_cache import (
     RESULTS_MOUNT,
     VOLUME_MOUNT,
+    VLLM_WHEEL_INDEX,
     hf_secret,
     results_volume,
     volume,
@@ -116,6 +117,7 @@ judge_image = (
         "huggingface-hub>=0.30.0",
         "numpy",
         "tqdm>=4.67.0",
+        extra_index_url=VLLM_WHEEL_INDEX,
     )
     .env(
         {
