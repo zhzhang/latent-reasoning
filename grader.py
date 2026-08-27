@@ -1607,7 +1607,7 @@ NONGOLD_AUDIO_PROMPT_TEMPLATES: dict[str, str] = {
         "<|sosp|><|empty|><|eosp|>{fields}<|im_end|>\n"
         "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
     ),
-    "step-audio-2-mini-think": (
+    "step-audio-r1.1": (
         "<|BOT|>system\n{instructions}<|EOT|>"
         "<|BOT|>human\n<audio_patch>{fields}<|EOT|>"
         "<|BOT|>assistant\n\n" + ASSISTANT_THINK_OPEN
@@ -2174,9 +2174,9 @@ def _grade_shot_batch_audio(
 
     label = str(handle.get("suite_label") or handle.get("judge_label") or "")
     backend = str(handle.get("backend") or "vllm")
-    if label == "step-audio-2-mini-think" or backend == "hf_step":
+    if label == "step-audio-r1.1" or backend == "hf_step":
         raise ValueError(
-            "step-audio-2-mini-think is a test-taker, not a supported audio judge"
+            "step-audio-r1.1 is a test-taker, not a supported audio judge"
         )
     sampling_rate = int(handle.get("sampling_rate") or 16000)
     fmt = get_judge_format(prompt, include_gold=include_gold)

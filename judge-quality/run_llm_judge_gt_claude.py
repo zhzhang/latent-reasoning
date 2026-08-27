@@ -1,9 +1,20 @@
-"""LLM-as-judge with gold, first shot, all 1000 MMAR questions — Claude batch.
+"""LLM-as-judge with gold, 5 shots, all 1000 MMAR questions — Claude.
 
 Same setup as ``run_llm_judge_gt.py`` (``neutral_with_gt_no_audio``,
 3-sample majority vote) but the judge is ``claude-sonnet-5`` via
-Anthropic's Message Batches API and only ``shot_index`` 0 is graded.
+Anthropic's live Messages API. Grades ``shot_index`` 0–4.
 Runs locally; no Modal container is started.
+
+Prompt caching: each request marks the gold prefix (instructions +
+question + ground truth) and the full prompt with ``cache_control``.
+The prefix is reused across shots of the same question; the full prompt
+is reused across the 3 samples. Sample 0 streams until the response
+begins so samples 1–2 can hit the cache.
+
+Scheduling is question × model, not a pass over every question for
+shot 0 and then a second pass for shot 1. For each question, each model
+finishes all of its shots (and all 3 samples per shot) before the next
+model; the next question starts only after every model is done.
 
 Before grading, copies test-taker generations into the local pack from
 ``outputs/mmar-freeform-thinking`` only (existing per-shot verdicts are
@@ -19,8 +30,8 @@ a second judge and does not steal ``primary_judge`` unless you pass
 ``--make-primary``.
 
 Resume is the default: already-graded shots for this judge key are
-skipped. Pass ``--force`` to replace them. ``--batch-id`` resumes an
-in-flight Anthropic batch.
+skipped. Pass ``--force`` to replace them. Verdicts are checkpointed
+after each question.
 
 Usage::
 
@@ -29,8 +40,6 @@ Usage::
     uv run python judge-quality/run_llm_judge_gt_claude.py
     uv run python judge-quality/run_llm_judge_gt_claude.py --force
     uv run python judge-quality/run_llm_judge_gt_claude.py --models qwen3-omni
-    uv run python judge-quality/run_llm_judge_gt_claude.py \\
-      --batch-id msgbatch_abc123
 """
 
 from __future__ import annotations
@@ -50,7 +59,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from aggregate import aggregate_difficulty, order_model_labels
 from grader import compose_judge_key, remaining_grade_work
-from mmar_api import grade_pack_with_batch_api
+from mmar_api import grade_pack_with_anthropic
 from mmar_common import recompute_multi_judge_scores, write_json, write_jsonl
 from modal_cache import JUDGING_VOLUME_NAME
 
@@ -60,8 +69,7 @@ LOCAL_FREEFORM_THINKING_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-thinking"
 JUDGE_LABEL = "claude-sonnet-5"
 GRADE_PROMPT = "neutral_with_gt_no_audio"
 N_SHOTS = 5
-PACK_SHOT_INDICES = tuple(range(N_SHOTS))
-SHOT_INDICES = (0,)
+SHOT_INDICES = tuple(range(N_SHOTS))
 N_SAMPLES = 3
 # Same as run_llm_judge_gt.py: T=0 would collapse the 3 votes.
 JUDGE_TEMPERATURE = 1.0
@@ -136,7 +144,7 @@ def _shots_record(record: dict[str, Any], *, model: str) -> dict[str, Any] | Non
     seen: set[int] = set()
     for shot in raw_shots:
         idx = _shot_index(shot)
-        if idx not in PACK_SHOT_INDICES or idx in seen:
+        if idx not in SHOT_INDICES or idx in seen:
             continue
         seen.add(idx)
         kept.append(_compact_shot(shot))
@@ -502,8 +510,8 @@ def run_claude_judge(
     skip_aggregate: bool = False,
     make_primary: bool = False,
     pack_dir: Path | None = None,
-    batch_id: str | None = None,
-    poll_interval: float = 30.0,
+    qps: float = 8.0,
+    max_workers: int = 8,
     download: bool = True,
 ) -> dict[str, Any]:
     dest = Path(pack_dir or DEFAULT_PACK_DIR).expanduser().resolve()
@@ -516,7 +524,8 @@ def run_claude_judge(
     )
     print(
         f"[llm-judge-gt-claude] judge={judge_key} shot_indices={list(SHOT_INDICES)} "
-        f"n_samples={N_SAMPLES} models={model_labels}"
+        f"n_samples={N_SAMPLES} qps={qps} max_workers={max_workers} "
+        f"group=question×model models={model_labels}"
     )
     remaining = remaining_grade_work(
         dest,
@@ -539,7 +548,7 @@ def run_claude_judge(
             print(f"[llm-judge-gt-claude] already graded: {done}")
         model_labels = [label for label in model_labels if label in remaining]
         if not model_labels:
-            print("[llm-judge-gt-claude] skip batch: nothing left to grade")
+            print("[llm-judge-gt-claude] skip: nothing left to grade")
             grade = {
                 "status": "skipped",
                 "pack": PACK_NAME,
@@ -548,34 +557,34 @@ def run_claude_judge(
                 "n_samples": N_SAMPLES,
             }
         else:
-            grade = grade_pack_with_batch_api(
+            grade = grade_pack_with_anthropic(
                 dest,
                 label=JUDGE_LABEL,
                 model_labels=model_labels,
                 prompt=GRADE_PROMPT,
                 force=force,
                 make_primary=make_primary,
-                poll_interval=poll_interval,
-                batch_id=batch_id,
                 n_samples=N_SAMPLES,
                 temperature=JUDGE_TEMPERATURE,
                 shot_indices=SHOT_INDICES,
                 question_ids=question_ids,
+                qps=qps,
+                max_workers=max_workers,
             )
     else:
-        grade = grade_pack_with_batch_api(
+        grade = grade_pack_with_anthropic(
             dest,
             label=JUDGE_LABEL,
             model_labels=model_labels,
             prompt=GRADE_PROMPT,
             force=force,
             make_primary=make_primary,
-            poll_interval=poll_interval,
-            batch_id=batch_id,
             n_samples=N_SAMPLES,
             temperature=JUDGE_TEMPERATURE,
             shot_indices=SHOT_INDICES,
             question_ids=question_ids,
+            qps=qps,
+            max_workers=max_workers,
         )
 
     print("[llm-judge-gt-claude] graded:", grade)
@@ -628,15 +637,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--batch-id",
-        default="",
-        help="Resume an existing Anthropic batch (`msgbatch_…`) instead of submitting.",
+        "--qps",
+        type=float,
+        default=8.0,
+        help="Target Anthropic request rate (default: 8).",
     )
     parser.add_argument(
-        "--batch-poll-interval",
-        type=float,
-        default=30.0,
-        help="Seconds between Batch API status polls (default: 30).",
+        "--max-workers",
+        type=int,
+        default=8,
+        help=(
+            "Concurrent leftover shots of the same model+question after the "
+            "first shot warms the cache (default: 8). Questions and models "
+            "stay sequential so work is not a first pass over every question."
+        ),
     )
     parser.add_argument(
         "--no-download",
@@ -655,8 +669,8 @@ def main() -> None:
         skip_aggregate=args.skip_aggregate,
         make_primary=args.make_primary,
         pack_dir=args.pack_dir,
-        batch_id=(args.batch_id or "").strip() or None,
-        poll_interval=args.batch_poll_interval,
+        qps=args.qps,
+        max_workers=args.max_workers,
         download=not args.no_download,
     )
 

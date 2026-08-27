@@ -91,6 +91,8 @@ MODEL_ALIASES: dict[str, str] = {
     "qwen3.6-35b-a3b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "step-audio-r1.1": "stepfun-ai/Step-Audio-R1.1",
+    "step-audio-r1": "stepfun-ai/Step-Audio-R1.1",
     "step-audio-2-mini-think": "stepfun-ai/Step-Audio-2-mini-Think",
     "step-audio-2-mini": "stepfun-ai/Step-Audio-2-mini-Think",
     "step-audio-2": "stepfun-ai/Step-Audio-2-mini-Think",
@@ -126,7 +128,7 @@ ALL_MODELS = (
     "nemotron-3-nano-omni",
     "qwen2.5-3b",
     "qwen3.6-35b-a3b-fp8",
-    "step-audio-2-mini-think",
+    "step-audio-r1.1",
     "mimo-audio-7b",
     "interactive-omni-8b",
     "voxtral-small-24b",
@@ -145,7 +147,7 @@ EVAL_MODELS = (
     "gemma-4-e4b",
     "qwen3-omni-instruct",
     "nemotron-3-nano-omni",
-    "step-audio-2-mini-think",
+    "step-audio-r1.1",
 )
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)

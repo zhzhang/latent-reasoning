@@ -1009,7 +1009,7 @@ function shortLabel(label) {
     "nemotron-3-nano-omni": "nemotron",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
-    "step-audio-2-mini-think": "step",
+    "step-audio-r1.1": "step",
   };
   return map[label] || label;
 }

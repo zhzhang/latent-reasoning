@@ -44,7 +44,7 @@ PREFIX_ASSISTANT_THINK_LABELS = frozenset(
     {
         "af-next-think",
         "music-flamingo",
-        "step-audio-2-mini-think",
+        "step-audio-r1.1",
         "mimo-audio-7b",
     }
 )

@@ -10,7 +10,7 @@ Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
   - music-flamingo: vLLM 0.24 AudioFlamingo3 (HF fallback)
   - mimo-audio-7b: vLLM-Omni 0.24
-  - step-audio-2-mini-think: vLLM-Omni 0.26 thinker-only (step_audio_2_asr)
+  - step-audio-r1.1: StepFun custom vLLM (Step-Audio-R1.1 thinker)
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
   - qwen3-omni: vLLM 0.28 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
   - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /

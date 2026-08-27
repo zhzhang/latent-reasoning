@@ -23,7 +23,7 @@ Usage::
     uv run modal run --detach run_llm_judge_gt.py
     uv run modal run --detach run_llm_judge_gt.py --force
 
-Claude Sonnet 5 (Anthropic batch, no Modal container)::
+Claude Sonnet 5 (Anthropic Messages API, no Modal container)::
 
     uv run python judge-quality/run_llm_judge_gt_claude.py
 """

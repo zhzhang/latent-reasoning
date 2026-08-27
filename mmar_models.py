@@ -139,23 +139,38 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     #     },
     # },
     # CONFIRMED
-    # Thinker-only Omni 0.26 (0.24 did not register step_audio_2).
-    # https://github.com/stepfun-ai/Step-Audio2/blob/main/examples-think.py
-    "step-audio-2-mini-think": {
-        "model_id": "stepfun-ai/Step-Audio-2-mini-Think",
-        "gpu": "L40S",
-        "backend": "vllm_omni",
-        "deploy_config": str(DEPLOY_DIR / "step_audio_2_thinker.yaml"),
+    # StepFun custom vLLM (stepfun2025/vllm:step-audio-2-v20250909), thinker-only.
+    # https://huggingface.co/stepfun-ai/Step-Audio-R1.1
+    # https://github.com/stepfun-ai/Step-Audio-R1/blob/main/examples-vllm_r1.py
+    "step-audio-r1.1": {
+        "model_id": "stepfun-ai/Step-Audio-R1.1",
+        "gpu": "A100-80GB",
+        "backend": "vllm_chat",
         "sampling_rate": 16000,
         "native_thinking": True,
         "enable_thinking": True,
-        # examples-think.py: T=0.7, max_new_tokens=2048. top_p=0.9 and
-        # repetition_penalty=1.05 match stepaudio2.py conversation defaults.
+        "engine": {
+            "dtype": "bfloat16",
+            # Docker serve default; source path uses 65536 but TP=1 on 80GB
+            # cannot hold that KV budget after ~62 GiB weights.
+            "max_model_len": 16384,
+            "max_num_seqs": 4,
+            "tensor_parallel_size": 1,
+            "trust_remote_code": True,
+            "gpu_memory_utilization": 0.90,
+            "limit_mm_per_prompt": {"audio": 3},
+            "interleave_mm_strings": True,
+            "allowed_local_media_path": "/",
+        },
+        # MMAR in examples-vllm_r1.py: T=0.7, max_tokens=32000, rep=1.07,
+        # stop_token_ids=[151665]. Cap max_tokens for 16k context on one A100.
         "sampling": {
             "temperature": 0.7,
             "top_p": 1.0,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.05,
+            "max_tokens": 8192,
+            "repetition_penalty": 1.07,
+            "stop": ["<|EOT|>"],
+            "stop_token_ids": [151665],
         },
     },
     # CONFIRMED
@@ -422,7 +437,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "native_thinking": True,
         "enable_thinking": True,
         # Card: extra_body thinking_token_budget = reasoning_budget + grace_period.
-        "reasoning_budget": 1024,
+        "reasoning_budget": 2048,
         "reasoning_parser": "nemotron_v3",
         "grace_period": 512,
         "sampling": {
@@ -747,6 +762,8 @@ def render_prompt(
     if backend == "vllm_chat":
         if label == "interactive-omni-8b":
             messages = _interactive_omni_messages(sample, ns)
+        elif label == "step-audio-r1.1":
+            messages = _step_audio_r11_messages(sample, ns)
         else:
             messages = _audio_text_messages(sample, ns)
         return _format_chat_messages(messages)
@@ -873,7 +890,7 @@ def _step_audio_placeholders(n_chunks: int) -> str:
 
 
 def _step_audio_messages(sample: dict, args: SimpleNamespace | None = None) -> list[dict]:
-    """Official StepAudio2 chat turns (examples-think.py / MMAU text)."""
+    """Legacy HF StepAudio2 chat turns (examples-think.py / MMAU text)."""
     ns = args or SimpleNamespace(prompt_mode="mc")
     question = _build_prompt(sample, ns)
     return [
@@ -889,12 +906,59 @@ def _step_audio_messages(sample: dict, args: SimpleNamespace | None = None) -> l
     ]
 
 
+def _step_audio_chunk_audio_items(
+    audio_path: str,
+    *,
+    sampling_rate: int = 16000,
+) -> list[dict[str, Any]]:
+    """Return Step-Audio chat audio parts, splitting long clips at 25s."""
+    import os
+    import tempfile
+
+    import soundfile as sf
+
+    audio, sr = _load_audio_tuple(audio_path, sampling_rate)
+    chunks = _step_audio_chunk_waveforms(audio[0], audio[1])
+    if len(chunks) == 1:
+        return [{"type": "audio", "audio": audio_path}]
+    items: list[dict[str, Any]] = []
+    for index, (chunk_wav, chunk_sr) in enumerate(chunks):
+        fd, chunk_path = tempfile.mkstemp(
+            suffix=".wav",
+            prefix=f"step_audio_{index}_",
+        )
+        os.close(fd)
+        sf.write(chunk_path, chunk_wav, chunk_sr)
+        items.append({"type": "audio", "audio": chunk_path})
+    return items
+
+
+def _step_audio_r11_messages(
+    sample: dict, args: SimpleNamespace | None = None
+) -> list[dict]:
+    """Step-Audio-R1.1 vLLM chat turns (examples-vllm_r1.py / mmar_test)."""
+    ns = args or SimpleNamespace(prompt_mode="mc")
+    question = _build_prompt(sample, ns)
+    return [
+        {"role": "system", "content": STEP_AUDIO_SYSTEM},
+        {
+            "role": "human",
+            "content": [
+                {"type": "text", "text": question},
+                *_step_audio_chunk_audio_items(
+                    str(sample["audio_path"]),
+                    sampling_rate=16000,
+                ),
+            ],
+        },
+        {"role": "assistant", "content": ASSISTANT_THINK_OPEN, "eot": False},
+    ]
+
+
 def _omni_prompt_fn(label: str) -> Callable[[dict, SimpleNamespace | None], str]:
     """Offline Omni prompt builder for ``label``."""
     if label == "mimo-audio-7b":
         return _mimo_audio_prompt
-    if label == "step-audio-2-mini-think":
-        return _step_audio_prompt
     raise ValueError(f"No Omni prompt builder for {label}")
 
 
@@ -1187,32 +1251,23 @@ def _ensure_stepaudio2_path() -> None:
 
 
 def load_step_audio(args: SimpleNamespace):
-    from vllm_omni.entrypoints.omni import Omni
+    from vllm import LLM
 
-    spec = MODEL_SPECS["step-audio-2-mini-think"]
+    spec = MODEL_SPECS["step-audio-r1.1"]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    deploy_config = _resolve_deploy_path(
-        getattr(args, "deploy_config", None) or spec["deploy_config"]
-    )
-    omni = Omni(
-        model=local_id,
-        deploy_config=deploy_config,
-        trust_remote_code=True,
-        async_chunk=False,
-        init_timeout=1800,
-        stage_init_timeout=900,
-    )
-    n_stages = _count_deploy_stages(deploy_config)
-    print(
-        f"Step-Audio-2-mini-Think Omni ready from {local_id} "
-        f"deploy={deploy_config} stages={n_stages}"
-    )
+    engine = _apply_engine_overrides(spec["engine"], args)
+    llm = LLM(model=local_id, **engine)
+    print(f"Step-Audio-R1.1 vLLM chat ready from {local_id} engine={engine}")
     return {
-        "backend": "vllm_omni",
-        "llm": omni,
-        "sampling_rate": int(spec["sampling_rate"]),
+        "backend": "vllm_chat",
+        "llm": llm,
         "parse_fn": parse_think_tagged_output,
-        "stages": n_stages,
+        "messages_fn": "step_audio",
+        "sampling_rate": int(spec["sampling_rate"]),
+        "chat_kwargs": {
+            "continue_final_message": True,
+            "add_generation_prompt": False,
+        },
     }
 
 
@@ -1568,7 +1623,6 @@ def _build_vllm_audio_inputs(
 ) -> tuple[list[dict], list[Any]]:
     prompts: list[dict] = []
     sampling: list[Any] = []
-    n_step_split = 0
     for sample, seed in zip(samples, seeds):
         audio = _load_audio_tuple(
             sample["audio_path"],
@@ -1576,25 +1630,7 @@ def _build_vllm_audio_inputs(
             max_samples=max_audio_samples,
         )
         mm_audio: Any = audio
-        if label == "step-audio-2-mini-think":
-            n_samples = int(audio[0].shape[0])
-            needed = _step_audio_chunk_count(n_samples, audio[1])
-            chunks = _step_audio_chunk_waveforms(audio[0], audio[1])
-            n_chunks = len(chunks)
-            if needed > STEP_AUDIO_MAX_CHUNKS:
-                print(
-                    f"[{label}] {Path(str(sample['audio_path'])).name} needs "
-                    f"{needed} {STEP_AUDIO_CHUNK_SECONDS}s chunks; "
-                    f"keeping first {n_chunks}"
-                )
-            if n_chunks > 1:
-                n_step_split += 1
-            mm_audio = chunks
-            prompt_text = ensure_assistant_think_open(
-                label, _step_audio_prompt(sample, args, n_chunks=n_chunks)
-            )
-        else:
-            prompt_text = ensure_assistant_think_open(label, prompt_fn(sample))
+        prompt_text = ensure_assistant_think_open(label, prompt_fn(sample))
         prompts.append(
             {
                 "prompt": prompt_text,
@@ -1610,12 +1646,6 @@ def _build_vllm_audio_inputs(
                 stop_token_ids=stop_token_ids,
                 repetition_penalty=repetition_penalty,
             )
-        )
-    if n_step_split:
-        print(
-            f"[{label}] split {n_step_split}/{len(samples)} clips into "
-            f"{STEP_AUDIO_CHUNK_SECONDS}s encoder windows "
-            f"(max {STEP_AUDIO_MAX_CHUNKS} per prompt)"
         )
     return prompts, sampling
 
@@ -1777,7 +1807,9 @@ def generate_batch(
         ]
 
     if backend == "vllm_chat":
-        if handle.get("messages_fn") == "audio_text":
+        if handle.get("messages_fn") == "step_audio":
+            messages = [_step_audio_r11_messages(sample, args) for sample in samples]
+        elif handle.get("messages_fn") == "audio_text":
             messages = [_audio_text_messages(sample, args) for sample in samples]
         else:
             messages = [_interactive_omni_messages(sample, args) for sample in samples]
@@ -2006,7 +2038,7 @@ def _generate_step_audio_hf(
     args: SimpleNamespace,
     seed: int,
     *,
-    label: str = "step-audio-2-mini-think",
+    label: str = "step-audio-r1.1",
 ) -> dict:
     from audio_flamingo_runtime import seed_everything
 
@@ -2089,7 +2121,7 @@ _LOADERS = {
     "af-next-think": load_af_next,
     "music-flamingo": load_music_flamingo,
     "mimo-audio-7b": load_mimo_audio,
-    "step-audio-2-mini-think": load_step_audio,
+    "step-audio-r1.1": load_step_audio,
     "interactive-omni-8b": load_interactive_omni,
     "qwen3-omni": load_qwen3_omni,
     "qwen3-omni-instruct": load_qwen3_omni_instruct,
@@ -2289,7 +2321,9 @@ def generate_raw_trace(
             prompt_fallback = str(outputs[0].prompt)
 
     elif backend == "vllm_chat":
-        if handle.get("messages_fn") == "audio_text":
+        if handle.get("messages_fn") == "step_audio":
+            messages = [_step_audio_r11_messages(sample, args)]
+        elif handle.get("messages_fn") == "audio_text":
             messages = [_audio_text_messages(sample, args)]
         else:
             messages = [_interactive_omni_messages(sample, args)]

@@ -104,25 +104,19 @@ omni_image = mount_local_sources(
     .env(_VLLM_CACHE_ENV)
 )
 
-# Step-Audio-2-mini-Think: vLLM-Omni 0.26 registers step_audio_2 (0.24 did not).
-# Keep a separate image from MiMo's 0.24 Omni stack.
+# Step-Audio-R1.1: StepFun custom vLLM fork (registers step_audio_2).
 step_audio_image = mount_local_sources(
-    cuda_base_image()
+    modal.Image.from_registry("stepfun2025/vllm:step-audio-2-v20250909")
+    .entrypoint([])
+    .apt_install("ffmpeg", "git")
     .uv_pip_install(
-        "vllm==0.26.0",
-        "vllm-omni==0.26.0",
-        "transformers>=5.5.3",
-        "huggingface-hub>=0.30.0",
         "librosa>=0.11.0",
         "soundfile",
         "numpy",
         "tqdm>=4.67.0",
-        "accelerate==1.12.0",
-        "einops",
-        "torchaudio",
-        "onnxruntime",
+        "huggingface-hub>=0.30.0",
     )
-    .env(_VLLM_CACHE_ENV)
+    .env(_INPROC_VLLM_ENV)
 )
 
 # InteractiveOmni: newer vLLM transformers-audio backend + HF chat fallback.
@@ -204,7 +198,7 @@ EVAL_IMAGES: dict[str, modal.Image] = {
     "af-next-think": af_next_image,
     "music-flamingo": af_next_image,
     "mimo-audio-7b": omni_image,
-    "step-audio-2-mini-think": step_audio_image,
+    "step-audio-r1.1": step_audio_image,
     "interactive-omni-8b": interactive_omni_image,
     "qwen3-omni": large_mm_image,
     "voxtral-small-24b": large_mm_image,

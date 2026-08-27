@@ -1,13 +1,14 @@
-"""Local viewer for the collated MMAR freeform pack.
+"""Local viewer for the MMAR freeform-thinking pack.
 
-Shows every question in ``outputs/mmar-freeform`` with audio, gold
-reference, and all stored shots from every model.
+Shows questions from ``outputs/mmar-freeform-thinking`` with audio, gold
+reference, and stored shots. Only models that have generations in that
+pack are listed.
 
 Usage::
 
     uv run python view_mmar.py
     uv run python view_mmar.py --port 7860
-    uv run python view_mmar.py --pack-dir ./outputs/mmar-freeform
+    uv run python view_mmar.py --pack-dir ./outputs/mmar-freeform-thinking
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from aggregate import MODEL_LABEL_ORDER
-from collate_mmar_freeform import ALL_API_LABELS, DEFAULT_OUT_DIR
+from collate_mmar_freeform import ALL_API_LABELS
 from mmar_common import (
     ASSISTANT_THINK_OPEN,
     MUSIC_FLAMINGO_THINK_SUFFIX,
@@ -37,6 +38,7 @@ from mmar_common import (
 from mmar_models import MODEL_SPECS, resolve_sampling
 
 REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_PACK_DIR = REPO_ROOT / "outputs" / "mmar-freeform-thinking"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
 DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
 MMAR_REPO = "BoJack/MMAR"
@@ -460,7 +462,8 @@ def discover_model_labels(pack_dir: Path, manifest: dict[str, Any] | None = None
     found: list[str] = []
     if models_root.is_dir():
         for child in sorted(models_root.iterdir()):
-            if child.is_dir() and (child / "predictions.jsonl").is_file():
+            pred = child / "predictions.jsonl"
+            if child.is_dir() and pred.is_file() and pred.stat().st_size > 0:
                 found.append(child.name)
     if not found and manifest:
         found = [str(label) for label in (manifest.get("models") or []) if label]
@@ -833,7 +836,7 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
             "<|im_start|>assistant\n"
         ),
         "voxtral-small-24b": f"[audio attached]\n{base}",
-        "step-audio-2-mini-think": (
+        "step-audio-r1.1": (
             f"<|BOT|>system\n{step_system}<|EOT|>"
             f"<|BOT|>human\n<audio_patch>{base}<|EOT|>"
             f"<|BOT|>assistant\n\n{ASSISTANT_THINK_OPEN}"
@@ -906,6 +909,13 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "shots": shots,
             }
         predictions[label] = by_id
+
+    model_labels = [
+        label
+        for label in model_labels
+        if any((record.get("shots") or []) for record in predictions.get(label, {}).values())
+    ]
+    predictions = {label: predictions[label] for label in model_labels}
 
     judge_entries, primary_judge = _pack_judge_entries(manifest, predictions)
 
@@ -1735,6 +1745,7 @@ function shortLabel(label) {
     "nemotron-3-nano-omni": "nemotron",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
+    "step-audio-r1.1": "step",
     "step-audio-2-mini-think": "step",
   };
   return map[label] || label;
@@ -2195,8 +2206,8 @@ def main() -> None:
     parser.add_argument(
         "--pack-dir",
         type=Path,
-        default=DEFAULT_OUT_DIR,
-        help="Collated freeform pack (default: outputs/mmar-freeform)",
+        default=DEFAULT_PACK_DIR,
+        help="Freeform-thinking pack (default: outputs/mmar-freeform-thinking)",
     )
     parser.add_argument(
         "--audio-dir",
@@ -2234,7 +2245,7 @@ def main() -> None:
     print(f"Pack:  {pack_dir}")
     print(f"Audio: {audio_dir}")
     if not pack_dir.is_dir():
-        print("Pack directory not found. Run collate_mmar_freeform.py first.")
+        print("Pack directory not found. Run download_results.py first.")
     else:
         bundle = load_pack(str(pack_dir))
         print(

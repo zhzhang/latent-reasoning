@@ -107,11 +107,15 @@ JUDGE_SAMPLING: dict[str, Any] = {"temperature": 0.0, "max_tokens": 2048}
 JUDGE_CACHE_KEY_PREFIX = "mmar-judge"
 
 
+ANTHROPIC_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
+
+
 @dataclass(frozen=True)
 class CompletionResult:
     text: str
     cached_tokens: int | None = None
     prompt_tokens: int | None = None
+    cache_creation_tokens: int | None = None
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -133,6 +137,27 @@ def _openai_usage(response: Any) -> tuple[int | None, int | None]:
     if details is not None:
         cached_tokens = _int_or_none(getattr(details, "cached_tokens", None))
     return cached_tokens, prompt_tokens
+
+
+def _anthropic_usage(
+    message: Any,
+) -> tuple[int | None, int | None, int | None]:
+    usage = getattr(message, "usage", None)
+    payload: dict[str, Any]
+    if usage is None:
+        payload = _as_dict(message) if not isinstance(message, dict) else message
+        usage = payload.get("usage")
+    if usage is None:
+        return None, None, None
+    if isinstance(usage, dict):
+        cached = _int_or_none(usage.get("cache_read_input_tokens"))
+        prompt = _int_or_none(usage.get("input_tokens"))
+        created = _int_or_none(usage.get("cache_creation_input_tokens"))
+        return cached, prompt, created
+    cached = _int_or_none(getattr(usage, "cache_read_input_tokens", None))
+    prompt = _int_or_none(getattr(usage, "input_tokens", None))
+    created = _int_or_none(getattr(usage, "cache_creation_input_tokens", None))
+    return cached, prompt, created
 
 
 def _gemini_usage(response: Any) -> tuple[int | None, int | None]:
@@ -531,6 +556,221 @@ class GeminiAudioTaker:
             logger.warning("gemini attempt %s empty response", attempt)
             await asyncio.sleep(self.retry_interval)
         raise RuntimeError(f"Gemini retries exhausted: {last_exc}")
+
+
+def _anthropic_judge_content(
+    *,
+    question: str,
+    answer: str,
+    prediction: str,
+    prompt_name: str,
+    include_gold: bool,
+) -> list[dict[str, Any]]:
+    """Split the gold judge prompt so the shared prefix and the full prompt cache.
+
+    Anthropic writes a cache entry only at an explicit ``cache_control``
+    breakpoint. The gold prefix (instructions + question + ground truth) is
+    reused across shots of the same item; the full prompt is reused across
+    ``n_samples`` draws of the same generation. Blocks concatenate to the
+    same text as ``build_grade_prompt``.
+    """
+    from grader import build_grade_gold_prefix, build_grade_prompt
+
+    full = build_grade_prompt(
+        question=question,
+        answer=answer,
+        prediction=prediction,
+        prompt=prompt_name,
+        include_gold=include_gold,
+    )
+    prefix = ""
+    if include_gold:
+        prefix = build_grade_gold_prefix(
+            question=question, answer=answer, prompt=prompt_name
+        )
+    blocks: list[dict[str, Any]] = []
+    if prefix and full.startswith(prefix):
+        suffix = full[len(prefix) :]
+        if prefix.strip():
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": prefix,
+                    "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+                }
+            )
+        if suffix.strip():
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": suffix,
+                    "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+                }
+            )
+    if not blocks:
+        blocks.append(
+            {
+                "type": "text",
+                "text": full,
+                "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+            }
+        )
+    return blocks
+
+
+class AnthropicJudgeTaker:
+    """Live Messages API judge with explicit prompt-cache breakpoints."""
+
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        qps: float,
+        timeout: float,
+        retries: int,
+        retry_interval: float,
+        effort: str | None = "medium",
+    ):
+        from anthropic import AsyncAnthropic
+
+        if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            raise SystemExit("Set ANTHROPIC_API_KEY to call Anthropic models.")
+        self.client = AsyncAnthropic()
+        self.model_id = model_id
+        self.temperature = float(temperature)
+        self.max_tokens = int(max_tokens)
+        self.timeout = timeout
+        self.retries = retries
+        self.retry_interval = retry_interval
+        self.effort = str(effort).strip() if effort else None
+        self._interval = 1.0 / max(float(qps), 0.1)
+        self._next_time = 0.0
+        self._lock = asyncio.Lock()
+
+    async def _throttle(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._next_time:
+                await asyncio.sleep(self._next_time - now)
+                now = time.monotonic()
+            self._next_time = now + self._interval
+
+    def _is_rate_limit(self, exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        if status in (429, 529):
+            return True
+        text = str(exc).lower()
+        return "rate" in text or "overloaded" in text or "429" in text or "529" in text
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        retry_after = getattr(exc, "retry_after", None)
+        try:
+            if retry_after is not None:
+                return max(float(retry_after), self.retry_interval)
+        except (TypeError, ValueError):
+            pass
+        return self.retry_interval * attempt
+
+    def _request_kwargs(self, content: list[dict[str, Any]]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self.model_id,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": [{"role": "user", "content": content}],
+        }
+        if self.effort:
+            kwargs["output_config"] = {"effort": self.effort}
+        return kwargs
+
+    def _result_from_message(self, message: Any) -> CompletionResult:
+        cached, prompt, created = _anthropic_usage(message)
+        return CompletionResult(
+            text=_anthropic_message_text(message),
+            cached_tokens=cached,
+            prompt_tokens=prompt,
+            cache_creation_tokens=created,
+        )
+
+    async def _stream_once(
+        self,
+        content: list[dict[str, Any]],
+        *,
+        started: asyncio.Event | None = None,
+    ) -> CompletionResult:
+        kwargs = self._request_kwargs(content)
+
+        async def _run() -> Any:
+            async with self.client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    if (
+                        started is not None
+                        and getattr(event, "type", None) == "message_start"
+                    ):
+                        started.set()
+                        break
+                return await stream.get_final_message()
+
+        message = await asyncio.wait_for(_run(), timeout=self.timeout)
+        return self._result_from_message(message)
+
+    async def complete(
+        self,
+        content: list[dict[str, Any]],
+        *,
+        started: asyncio.Event | None = None,
+    ) -> CompletionResult:
+        last_exc: Exception | None = None
+        try:
+            for attempt in range(1, self.retries + 1):
+                try:
+                    await self._throttle()
+                    result = await self._stream_once(content, started=started)
+                except TimeoutError as exc:
+                    last_exc = exc
+                    logger.warning("anthropic attempt %s timeout: %s", attempt, exc)
+                    await asyncio.sleep(self.retry_interval)
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if self._is_rate_limit(exc):
+                        delay = self._retry_delay(exc, attempt)
+                        logger.warning(
+                            "anthropic attempt %s rate limit: %s", attempt, exc
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.warning("anthropic attempt %s failed: %s", attempt, exc)
+                    await asyncio.sleep(self.retry_interval * attempt)
+                    continue
+                if result.text:
+                    return result
+                logger.warning("anthropic attempt %s empty response", attempt)
+                await asyncio.sleep(self.retry_interval)
+            raise RuntimeError(f"Anthropic retries exhausted: {last_exc}")
+        finally:
+            if started is not None:
+                started.set()
+
+    async def complete_n(
+        self, content: list[dict[str, Any]], n: int
+    ) -> list[CompletionResult]:
+        """Draw ``n`` samples. Sample 0 writes the cache; 1..n-1 start after
+        that response begins so they can hit it."""
+        n = max(1, int(n))
+        if n == 1:
+            return [await self.complete(content)]
+        started = asyncio.Event()
+        first_task = asyncio.create_task(self.complete(content, started=started))
+        await started.wait()
+        if first_task.done() and first_task.exception() is not None:
+            await first_task
+        rest = await asyncio.gather(
+            *[self.complete(content) for _ in range(n - 1)]
+        )
+        first = await first_task
+        return [first, *rest]
 
 
 @dataclass
@@ -1019,6 +1259,482 @@ async def grade_pack_with_api_judges(
             results.append(result)
             print("API graded:", result)
     return results
+
+
+def grade_pack_with_anthropic(
+    pack_dir: Path,
+    *,
+    label: str,
+    model_labels: list[str],
+    prompt: str | None = None,
+    force: bool = False,
+    make_primary: bool = False,
+    primary_judge: str | None = None,
+    n_samples: int = 1,
+    temperature: float | None = None,
+    shot_indices: tuple[int, ...] | list[int] | None = None,
+    question_ids: list[str] | None = None,
+    qps: float = 8.0,
+    max_workers: int = 8,
+    timeout: float = 300.0,
+    retries: int = 20,
+    retry_interval: float = 1.0,
+    print_every: int = 5,
+) -> dict[str, Any]:
+    """Grade shots with the live Anthropic Messages API and prompt caching.
+
+    Work is clustered by question, then model, then shot. All samples of a
+    shot run together; all shots of a model+question finish before the next
+    model; all models of a question finish before the next question. This
+    avoids a first pass over every question (shot 0 / sample 0) before a
+    second pass comes back for the rest.
+
+    Explicit ``cache_control`` breakpoints mark the gold prefix (shared
+    across shots of a question) and the full prompt (shared across
+    ``n_samples``). Sample 0 of each job streams until ``message_start`` so
+    later samples can hit the cache. Verdicts are written after each
+    question.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            _grade_pack_with_anthropic_async(
+                pack_dir,
+                label=label,
+                model_labels=model_labels,
+                prompt=prompt,
+                force=force,
+                make_primary=make_primary,
+                primary_judge=primary_judge,
+                n_samples=n_samples,
+                temperature=temperature,
+                shot_indices=shot_indices,
+                question_ids=question_ids,
+                qps=qps,
+                max_workers=max_workers,
+                timeout=timeout,
+                retries=retries,
+                retry_interval=retry_interval,
+                print_every=print_every,
+            )
+        )
+    raise SystemExit(
+        "grade_pack_with_anthropic() cannot run inside an event loop"
+    )
+
+
+async def _grade_pack_with_anthropic_async(
+    pack_dir: Path,
+    *,
+    label: str,
+    model_labels: list[str],
+    prompt: str | None = None,
+    force: bool = False,
+    make_primary: bool = False,
+    primary_judge: str | None = None,
+    n_samples: int = 1,
+    temperature: float | None = None,
+    shot_indices: tuple[int, ...] | list[int] | None = None,
+    question_ids: list[str] | None = None,
+    qps: float = 8.0,
+    max_workers: int = 8,
+    timeout: float = 300.0,
+    retries: int = 20,
+    retry_interval: float = 1.0,
+    print_every: int = 5,
+) -> dict[str, Any]:
+    from grader import (
+        compose_judge_key,
+        get_judge_format,
+        normalize_grade_prompt,
+        _grade_reuse_key,
+        _shot_needs_grade,
+        _shot_prediction_text,
+        _shot_judge_entry,
+    )
+
+    resolved = resolve_api_judge_label(label) or label
+    spec = API_SPECS.get(resolved)
+    if spec is None:
+        raise SystemExit(f"Unknown API model label: {label!r}")
+    backend = str(spec.get("backend") or "")
+    if not backend.startswith("anthropic"):
+        raise SystemExit(f"{label!r} is not an Anthropic judge")
+    model_id = str(spec["model_id"])
+    sampling = dict(spec.get("sampling") or {})
+    n_samples = max(1, int(n_samples))
+    temp = (
+        float(temperature)
+        if temperature is not None
+        else float(sampling.get("temperature") or 1.0)
+    )
+    max_tokens = int(sampling.get("max_tokens") or 8192)
+    effort = sampling.get("effort") or sampling.get("reasoning_effort")
+    fmt = get_judge_format(prompt, include_gold=True)
+    if fmt.audio_included:
+        raise SystemExit(
+            f"Anthropic judge {resolved!r} only supports text formats "
+            f"(got {prompt!r})"
+        )
+    include_gold = fmt.include_gold
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
+
+    gradees = [item for item in model_labels if item != resolved]
+    files: dict[str, list[dict]] = {}
+    for gradee in gradees:
+        records = _load_prediction_records(
+            pack_dir / "models" / gradee / "predictions.jsonl"
+        )
+        files[gradee] = records
+        for record in records:
+            ensure_judge_schema(
+                record, fallback_label=key, fallback_model_id=model_id
+            )
+
+    wanted = _pack_shot_keys(
+        files, question_ids=question_ids, shot_indices=shot_indices
+    )
+    if not wanted:
+        raise SystemExit("No shots to grade")
+
+    reuse_cache: dict[tuple[str, str, str], dict] = {}
+    if not force:
+        for gradee, records in files.items():
+            for record in records:
+                qid = str(record.get("id") or "")
+                question = str(record.get("question") or "")
+                answer = str(record.get("answer") or "")
+                for shot in record.get("shots") or []:
+                    shot_index = int(shot.get("shot_index", 0))
+                    if (gradee, qid, shot_index) not in wanted:
+                        continue
+                    entry = _shot_judge_entry(shot, key)
+                    if entry is None:
+                        continue
+                    reuse_cache.setdefault(
+                        _grade_reuse_key(
+                            question,
+                            answer,
+                            _shot_prediction_text(shot, model_label=gradee),
+                            include_gold=include_gold,
+                        ),
+                        dict(entry),
+                    )
+
+    pending_by_key: dict[tuple[str, str, str], _PendingJob] = {}
+    reuse_owners: list[tuple[str, str, int, dict]] = []
+    n_labeled = 0
+    for gradee, records in files.items():
+        for record in records:
+            qid = str(record.get("id") or "")
+            question = str(record.get("question") or "")
+            answer = str(record.get("answer") or "")
+            for shot in record.get("shots") or []:
+                shot_index = int(shot.get("shot_index", 0))
+                if (gradee, qid, shot_index) not in wanted:
+                    continue
+                n_labeled += 1
+                if not force and not _shot_needs_grade(shot, key):
+                    continue
+                prediction = _shot_prediction_text(shot, model_label=gradee)
+                cache_key = _grade_reuse_key(
+                    question, answer, prediction, include_gold=include_gold
+                )
+                cached = reuse_cache.get(cache_key)
+                if cached is not None and not force:
+                    reuse_owners.append((gradee, qid, shot_index, cached))
+                    continue
+                job = pending_by_key.get(cache_key)
+                if job is None:
+                    job = _PendingJob(
+                        qid=qid,
+                        question=question,
+                        answer=answer,
+                        prediction=prediction,
+                        audio_path=None,
+                        reuse_key=cache_key,
+                    )
+                    pending_by_key[cache_key] = job
+                job.owners.append((gradee, qid, shot_index))  # type: ignore[arg-type]
+
+    graded = 0
+    reused = 0
+    n_api = 0
+    n_failed = 0
+    total_cached = 0
+    total_prompt = 0
+    total_created = 0
+    dirty: set[str] = set()
+
+    def _find_shot(gradee: str, qid: str, shot_index: int) -> dict | None:
+        for record in files.get(gradee) or []:
+            if str(record.get("id") or "") != qid:
+                continue
+            for shot in record.get("shots") or []:
+                if int(shot.get("shot_index", -1)) == shot_index:
+                    return shot
+        return None
+
+    def _apply(gradee: str, qid: str, shot_index: int, entry: dict) -> None:
+        nonlocal graded
+        shot = _find_shot(gradee, qid, shot_index)
+        if shot is None:
+            return
+        shot.setdefault("judges", {})[key] = dict(entry)
+        graded += 1
+        dirty.add(gradee)
+
+    def _stamp_record(gradee: str, record: dict) -> None:
+        qid = str(record.get("id") or "")
+        if not any(
+            (gradee, qid, int(shot.get("shot_index", 0))) in wanted
+            for shot in record.get("shots") or []
+        ):
+            return
+        existing_primary = record.get("primary_judge")
+        use_primary = key if make_primary else (existing_primary or primary_judge)
+        existing = [str(x) for x in (record.get("judges") or []) if x]
+        ordered: list[str] = []
+        if use_primary:
+            ordered.append(str(use_primary))
+        for item in existing:
+            if item not in ordered:
+                ordered.append(item)
+        if key not in ordered:
+            ordered.append(key)
+        record["judges"] = ordered
+        record["scoring"] = "qwen_freeform_judge"
+        recompute_multi_judge_scores(record, use_primary)
+
+    def _persist() -> None:
+        for gradee in list(dirty):
+            records = files.get(gradee) or []
+            pred_path = pack_dir / "models" / gradee / "predictions.jsonl"
+            if not pred_path.is_file() and not records:
+                continue
+            for record in records:
+                _stamp_record(gradee, record)
+            write_jsonl(pred_path, records, mode="w")
+        dirty.clear()
+
+    persist_lock = asyncio.Lock()
+
+    for gradee, qid, shot_index, entry in reuse_owners:
+        _apply(gradee, qid, shot_index, entry)
+        reused += 1
+    if dirty:
+        _persist()
+
+    by_qid_model: dict[str, dict[str, list[_PendingJob]]] = {}
+    qid_order: list[str] = []
+
+    def _owner_model(job: _PendingJob) -> str:
+        return str(job.owners[0][0]) if job.owners else ""
+
+    def _owner_shot(job: _PendingJob) -> int:
+        return int(job.owners[0][2]) if job.owners else 0
+
+    for job in pending_by_key.values():
+        qid = job.qid
+        model = _owner_model(job)
+        if qid not in by_qid_model:
+            qid_order.append(qid)
+            by_qid_model[qid] = {}
+        by_qid_model[qid].setdefault(model, []).append(job)
+    for by_model in by_qid_model.values():
+        for jobs in by_model.values():
+            jobs.sort(key=_owner_shot)
+
+    if question_ids:
+        seen = set()
+        qids: list[str] = []
+        for raw in question_ids:
+            qid = str(raw)
+            if qid in by_qid_model and qid not in seen:
+                qids.append(qid)
+                seen.add(qid)
+        qids.extend(qid for qid in qid_order if qid not in seen)
+    else:
+        qids = qid_order
+    model_order = [label for label in gradees if label]
+    extra_models = [
+        model
+        for by_model in by_qid_model.values()
+        for model in by_model
+        if model not in model_order
+    ]
+    for model in extra_models:
+        if model not in model_order:
+            model_order.append(model)
+
+    taker = None
+    if by_qid_model:
+        taker = AnthropicJudgeTaker(
+            model_id=model_id,
+            temperature=temp,
+            max_tokens=max_tokens,
+            qps=qps,
+            timeout=timeout,
+            retries=retries,
+            retry_interval=retry_interval,
+            effort=str(effort) if effort else None,
+        )
+
+    shot_sem = asyncio.Semaphore(max(1, int(max_workers)))
+    done_questions = 0
+
+    def _entry_from_results(
+        results: list[CompletionResult],
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        texts = [item.text for item in results if item.text]
+        stats = {
+            "n_api": len(texts),
+            "n_failed": sum(1 for item in results if not item.text),
+            "cached": sum(int(item.cached_tokens or 0) for item in results),
+            "prompt": sum(int(item.prompt_tokens or 0) for item in results),
+            "created": sum(int(item.cache_creation_tokens or 0) for item in results),
+        }
+        if n_samples <= 1:
+            text = texts[0] if texts else ""
+            if not text:
+                raise RuntimeError("empty Anthropic judge response")
+            entry = _verdict_entry(
+                CompletionResult(text=text),
+                model_id=model_id,
+                prompt_name=prompt_name,
+                include_gold=include_gold,
+            )
+        else:
+            if not texts:
+                raise RuntimeError("empty Anthropic judge responses")
+            entry = _majority_verdict_entry(
+                texts,
+                model_id=model_id,
+                prompt_name=prompt_name,
+                include_gold=include_gold,
+            )
+        return entry, stats
+
+    async def _grade_job(job: _PendingJob) -> None:
+        nonlocal reused, n_api, n_failed, total_cached, total_prompt, total_created
+        assert taker is not None
+        content = _anthropic_judge_content(
+            question=job.question,
+            answer=job.answer,
+            prediction=job.prediction,
+            prompt_name=prompt_name,
+            include_gold=include_gold,
+        )
+        try:
+            results = await taker.complete_n(content, n_samples)
+            entry, stats = _entry_from_results(results)
+        except Exception:
+            logger.exception(
+                "anthropic grade failed qid=%s model=%s",
+                job.qid,
+                _owner_model(job),
+            )
+            async with persist_lock:
+                n_failed += n_samples
+            return
+        async with persist_lock:
+            n_api += stats["n_api"]
+            n_failed += stats["n_failed"]
+            total_cached += stats["cached"]
+            total_prompt += stats["prompt"]
+            total_created += stats["created"]
+            reuse_cache[job.reuse_key] = entry
+            for extra_index, owner in enumerate(job.owners):
+                gradee, owner_qid, shot_index = (
+                    owner[0],
+                    str(owner[1]),
+                    int(owner[2]),
+                )
+                _apply(gradee, owner_qid, shot_index, entry)
+                if extra_index:
+                    reused += 1
+
+    async def _grade_job_limited(job: _PendingJob) -> None:
+        async with shot_sem:
+            await _grade_job(job)
+
+    async def _grade_model_question(jobs: list[_PendingJob]) -> None:
+        """All shots of one model on one question, samples grouped per shot."""
+        if not jobs:
+            return
+        first, rest = jobs[0], jobs[1:]
+        await _grade_job_limited(first)
+        if rest:
+            await asyncio.gather(*(_grade_job_limited(job) for job in rest))
+
+    # One question at a time. Inside it, one model at a time. Never a first
+    # pass over every question before coming back for shot 1 / sample 1.
+    for qid in qids:
+        by_model = by_qid_model.get(qid) or {}
+        for model in model_order:
+            await _grade_model_question(by_model.get(model) or [])
+        async with persist_lock:
+            _persist()
+            done_questions += 1
+            finished = done_questions
+            read = total_cached
+            written = total_created
+            billed = total_prompt
+            api_n = n_api
+        if finished % print_every == 0 or finished == len(qids):
+            denom = read + billed + written
+            hit = (read / denom) if denom else 0.0
+            print(
+                f"[anthropic-judge {resolved}] {finished}/{len(qids)} "
+                f"qid={qid} api={api_n} cache_read={read} cache_write={written} "
+                f"uncached={billed} ({hit:.0%} read)"
+            )
+
+    if dirty:
+        _persist()
+
+    by_model: dict[str, dict] = {}
+    for gradee, records in files.items():
+        pred_path = pack_dir / "models" / gradee / "predictions.jsonl"
+        by_model[gradee] = {
+            "status": "ok" if pred_path.is_file() else "missing",
+            "n_records": len(records),
+            "predictions_path": str(pred_path),
+        }
+
+    read = total_cached
+    written = total_created
+    billed = total_prompt
+    hit = (read / (read + billed + written)) if (read or billed or written) else 0.0
+    print(
+        f"[anthropic-judge {resolved}] done key={key} graded={graded} "
+        f"reused={reused} api={n_api} failed={n_failed} n_samples={n_samples} "
+        f"cache_read={read} cache_write={written} uncached={billed} ({hit:.1%} read)"
+    )
+    return {
+        "status": "ok",
+        "judge_label": resolved,
+        "judge_key": key,
+        "model_id": model_id,
+        "backend": "anthropic",
+        "gradees": gradees,
+        "by_model": by_model,
+        "n_labeled_shots": n_labeled,
+        "n_shots_graded": graded,
+        "n_shots_reused": reused,
+        "n_api_calls": n_api,
+        "n_failed": n_failed,
+        "n_samples": n_samples,
+        "cached_tokens": read,
+        "cache_creation_tokens": written,
+        "prompt_tokens": billed,
+        "cache_hit_fraction": hit,
+        "prompt": prompt_name,
+        "include_gold": include_gold,
+        "n_labeled": len(wanted),
+    }
 
 
 def _openai_sync_client():
