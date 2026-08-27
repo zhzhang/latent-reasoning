@@ -58,6 +58,7 @@ def _compact_entry(entry: Any) -> dict[str, Any] | None:
         "verdict",
         "output",
         "generation",
+        "reasoning",
         "model_id",
         "prompt",
         "include_gold",
@@ -73,6 +74,7 @@ def _compact_entry(entry: Any) -> dict[str, Any] | None:
                 "verdict": item.get("verdict") if isinstance(item, dict) else None,
                 "output": item.get("output") if isinstance(item, dict) else None,
                 "generation": item.get("generation") if isinstance(item, dict) else None,
+                "reasoning": item.get("reasoning") if isinstance(item, dict) else None,
             }
             for item in samples
             if isinstance(item, dict)
@@ -522,12 +524,17 @@ function renderEntry(title, payload) {
     ? `<div class="judge-row">samples ${samples.map(s => chip(s.correct)).join(" ")}</div>`
     : "";
   const gen = entry && (entry.generation || entry.output);
+  const reasoning = entry && entry.reasoning;
+  const reasonHtml = reasoning
+    ? `<details class="accordion" open><summary>Judge reasoning</summary><div class="accordion-body"><pre>${escapeHtml(reasoning)}</pre></div></details>`
+    : "";
   const body = gen
     ? `<details class="accordion"><summary>Judge text</summary><div class="accordion-body"><pre>${escapeHtml(gen)}</pre></div></details>`
     : "";
   return `<div>
     <div class="judge-row"><strong>${escapeHtml(title)}</strong> ${chip(correct)}</div>
     ${sampleHtml}
+    ${reasonHtml}
     ${body}
   </div>`;
 }
@@ -557,8 +564,13 @@ async function selectQuestion(id) {
         return `<div class="judge-row">
           ${escapeHtml(short)} ${chip(row.correct)} ${agreeChip(gt.correct, row.correct)}
         </div>
-        ${row.entry && (row.entry.generation || row.entry.output)
-          ? `<details class="accordion"><summary>${escapeHtml(short)} text</summary><div class="accordion-body"><pre>${escapeHtml(row.entry.generation || row.entry.output || "")}</pre></div></details>`
+        ${row.entry && (row.entry.reasoning || row.entry.generation || row.entry.output)
+          ? `${row.entry.reasoning
+              ? `<details class="accordion" open><summary>${escapeHtml(short)} reasoning</summary><div class="accordion-body"><pre>${escapeHtml(row.entry.reasoning || "")}</pre></div></details>`
+              : ""}
+            ${row.entry.generation || row.entry.output
+              ? `<details class="accordion"><summary>${escapeHtml(short)} text</summary><div class="accordion-body"><pre>${escapeHtml(row.entry.generation || row.entry.output || "")}</pre></div></details>`
+              : ""}`
           : ""}`;
       }).join("");
       const pred = model.answer_prediction || "";

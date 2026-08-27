@@ -12,9 +12,15 @@ batch 512 concurrent sequences).
 
 Sources, later runs only add models that are not already present:
 
-    exp-mmar-question-difficulty/20260807T145000Z   # 5 models × 1000 q
+    mmar-freeform-thinking                          # run_experiment.py (volume root)
+    outputs/mmar-freeform-thinking                  # local download of that volume
+    exp-mmar-question-difficulty/20260807T145000Z   # legacy 5 models × 1000 q
     exp-mmar-question-difficulty/20260816T050944Z   # extra models × 784 q
     mmar-freeform-5-shot-thinking                   # API models (volume root)
+
+Question ids come from ``mmar-freeform-thinking/question_ids.json``
+(remote volume, then local download). The 1000-id list from the legacy
+full MMAR run is used only if that file is missing.
 
 Resume is the default: existing per-shot verdicts for this judge are
 kept, the H100 is not started when nothing is left, and only ungraded
@@ -44,23 +50,27 @@ from mmar_common import recompute_multi_judge_scores, write_json, write_jsonl
 from modal_cache import (
     FREEFORM_THINKING_MOUNT,
     JUDGING_MOUNT,
+    LOCAL_MMAR_FREEFORM_THINKING_MOUNT,
+    MMAR_FREEFORM_THINKING_MOUNT,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
     VLLM_WHEEL_INDEX,
     freeform_thinking_volume,
     hf_secret,
     judging_volume,
+    mmar_freeform_thinking_volume,
     results_volume,
     volume,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 PACK_NAME = "llm-judge-gt"
 REMOTE_PACK_DIR = JUDGING_MOUNT / PACK_NAME
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 FULL_MMAR_RUN_ID = "20260807T145000Z"
 OPEN_ENDED_RUN_ID = "20260816T050944Z"
 COLLATED_PACK = FREEFORM_THINKING_MOUNT
+LOCAL_FREEFORM_THINKING_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-thinking"
 
 JUDGE_MODEL_ID = "qwen3.6-35b-a3b-fp8"
 GRADE_PROMPT = "neutral_with_gt_no_audio"
@@ -142,6 +152,11 @@ cpu_image = _mount_sources(
         "numpy", "tqdm>=4.67.0"
     )
 )
+if LOCAL_FREEFORM_THINKING_DIR.is_dir():
+    cpu_image = cpu_image.add_local_dir(
+        str(LOCAL_FREEFORM_THINKING_DIR),
+        remote_path=str(LOCAL_MMAR_FREEFORM_THINKING_MOUNT),
+    )
 
 
 def _shot_index(shot: dict[str, Any]) -> int:
@@ -226,6 +241,11 @@ def _iter_shots(predictions_path: Path, *, model: str) -> dict[str, dict[str, An
 def _source_model_dirs() -> list[tuple[str, Path]]:
     """(source_tag, models_dir) in overlay order: first source wins per model."""
     return [
+        ("mmar-freeform-thinking", MMAR_FREEFORM_THINKING_MOUNT / "models"),
+        (
+            "local-mmar-freeform-thinking",
+            LOCAL_MMAR_FREEFORM_THINKING_MOUNT / "models",
+        ),
         (
             FULL_MMAR_RUN_ID,
             DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "models",
@@ -236,6 +256,33 @@ def _source_model_dirs() -> list[tuple[str, Path]]:
         ),
         ("mmar-freeform-5-shot-thinking", COLLATED_PACK / "models"),
     ]
+
+
+def _question_id_candidates() -> list[tuple[str, Path]]:
+    return [
+        ("mmar-freeform-thinking", MMAR_FREEFORM_THINKING_MOUNT / "question_ids.json"),
+        (
+            "local-mmar-freeform-thinking",
+            LOCAL_MMAR_FREEFORM_THINKING_MOUNT / "question_ids.json",
+        ),
+        (
+            FULL_MMAR_RUN_ID,
+            DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json",
+        ),
+    ]
+
+
+def _resolve_question_ids() -> tuple[list[str], str]:
+    for tag, path in _question_id_candidates():
+        ids = _load_question_ids(path)
+        if ids:
+            print(f"[llm-judge-gt] question ids: {len(ids)} from {tag} ({path})")
+            return ids, tag
+    raise SystemExit(
+        "No question_ids.json found on mmar-freeform-thinking "
+        f"(remote {MMAR_FREEFORM_THINKING_MOUNT} or local download) "
+        f"or legacy run {FULL_MMAR_RUN_ID}"
+    )
 
 
 def _merge_shot_judges(local: dict, prior: dict) -> dict:
@@ -339,6 +386,7 @@ def _stamp_manifest(
         VOLUME_MOUNT: volume,
         RESULTS_MOUNT: results_volume,
         FREEFORM_THINKING_MOUNT: freeform_thinking_volume,
+        MMAR_FREEFORM_THINKING_MOUNT: mmar_freeform_thinking_volume,
         JUDGING_MOUNT: judging_volume,
     },
 )
@@ -346,14 +394,12 @@ def prepare_pack(models: str = "all") -> dict:
     """Copy 5-shot freeform answers onto ``mmar-judging/llm-judge-gt``."""
     results_volume.reload()
     freeform_thinking_volume.reload()
+    mmar_freeform_thinking_volume.reload()
     judging_volume.reload()
 
-    ids_path = DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json"
-    question_ids = _load_question_ids(ids_path)
-    if len(question_ids) != 1000:
-        raise SystemExit(
-            f"Expected 1000 MMAR ids in {ids_path}, got {len(question_ids)}"
-        )
+    question_ids, ids_source = _resolve_question_ids()
+    if not question_ids:
+        raise SystemExit("No MMAR question ids found")
     wanted = set(question_ids)
 
     by_model: dict[str, dict[str, dict[str, Any]]] = {}
@@ -409,7 +455,7 @@ def prepare_pack(models: str = "all") -> dict:
             "n": len(question_ids),
             "ids": question_ids,
             "n_shots": N_SHOTS,
-            "source": FULL_MMAR_RUN_ID,
+            "source": ids_source,
         },
     )
     write_json(

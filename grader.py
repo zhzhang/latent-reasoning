@@ -24,8 +24,9 @@ from mmar_common import (
     ensure_assistant_think_open,
     ensure_judge_schema,
     extract_freeform_answer,
+    join_vllm_reasoning,
     judge_label,
-    prefers_markdown_answer_line,
+    parse_freeform_output,
     recompute_multi_judge_scores,
     select_grade_question_ids,
     write_jsonl,
@@ -991,10 +992,7 @@ def _shot_prediction_text(shot: dict, *, model_label: str | None = None) -> str:
     source = (raw or extracted).strip()
     if not source:
         return ""
-    markdown = prefers_markdown_answer_line(model_label)
-    return (
-        extract_freeform_answer(source, markdown_answer=markdown) or extracted or raw
-    )
+    return extract_freeform_answer(source) or extracted or raw
 
 
 def _shot_judge_entry(shot: dict, judge_key: str) -> dict | None:
@@ -1780,13 +1778,24 @@ def _grade_sampling(
 
 
 def _completion_texts(out: Any, n: int = 1) -> list[str]:
-    """All ``n`` completion strings from one vLLM request (padded if short)."""
+    """All ``n`` completion strings from one vLLM request (padded if short).
+
+    Concatenates vLLM's separated ``reasoning`` / ``reasoning_content`` onto
+    ``.text`` so LALM CoT is not dropped when a reasoning parser is active.
+    """
     n = max(1, int(n))
+    request_output = getattr(out, "request_output", None)
+    if request_output is not None:
+        out = (
+            request_output[0]
+            if isinstance(request_output, (list, tuple)) and request_output
+            else request_output
+        )
     outs = getattr(out, "outputs", None) or []
     if outs:
-        texts = [str(getattr(item, "text", "") or "") for item in outs]
+        texts = [join_vllm_reasoning(item) for item in outs]
     else:
-        texts = [str(getattr(out, "text", "") or "")]
+        texts = [join_vllm_reasoning(out)]
     if len(texts) < n:
         texts = texts + [""] * (n - len(texts))
     return texts[:n]
@@ -1798,12 +1807,14 @@ def _completion_text(out: Any) -> str:
 
 def _verdict_fields(text: str) -> dict[str, Any]:
     verdict = parse_grade_verdict(text)
+    reasoning, _answer = parse_freeform_output(text)
     return {
         "correct": bool(verdict) if verdict is not None else False,
         "verdict": (
             "pass" if verdict is True else "fail" if verdict is False else None
         ),
         "generation": text,
+        "reasoning": reasoning or "",
         "grader_output": format_grade_output(verdict),
         "grader_verdict_raw": verdict,
     }
@@ -1851,12 +1862,15 @@ def _grade_results_from_sample_groups(
         raw = [item["grader_verdict_raw"] for item in sample_fields]
         majority = majority_grade_verdict(raw)
         generation = ""
+        reasoning = ""
         for item, verdict in zip(sample_fields, raw):
             if majority is not None and verdict is majority:
                 generation = item["generation"]
+                reasoning = item.get("reasoning") or ""
                 break
         if not generation and sample_fields:
             generation = sample_fields[0]["generation"]
+            reasoning = sample_fields[0].get("reasoning") or ""
         results.append(
             {
                 "correct": bool(majority) if majority is not None else False,
@@ -1868,6 +1882,7 @@ def _grade_results_from_sample_groups(
                     else None
                 ),
                 "generation": generation,
+                "reasoning": reasoning,
                 "grader_output": format_grade_output(majority),
                 "grader": model_id,
                 "grader_verdict_raw": majority,
@@ -1876,6 +1891,7 @@ def _grade_results_from_sample_groups(
                         "correct": item["correct"],
                         "verdict": item["verdict"],
                         "generation": item["generation"],
+                        "reasoning": item.get("reasoning") or "",
                         "output": item["grader_output"],
                     }
                     for item in sample_fields
@@ -2203,7 +2219,8 @@ def grade_shot_batch(
     Omni / HF backends duplicate the prompt instead.
 
     Returns one result dict per job with ``correct``, ``verdict``,
-    ``generation`` (full text), ``grader_output`` (short 0/1), and
+    ``generation`` (full text, including any vLLM-separated reasoning),
+    ``reasoning`` (CoT span), ``grader_output`` (short 0/1), and
     ``grader``. Majority runs also include ``samples`` / ``n_samples``.
     """
     if not jobs:
@@ -2491,6 +2508,7 @@ def grade_predictions_file(
                 "verdict": result.get("verdict"),
                 "output": result.get("grader_output"),
                 "generation": result.get("generation") or "",
+                "reasoning": result.get("reasoning") or "",
                 "model_id": model_id,
                 "prompt": prompt_name,
                 "include_gold": include_gold,

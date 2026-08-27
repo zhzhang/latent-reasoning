@@ -10,10 +10,14 @@ VOLUME_NAME = "latent-reasoning"
 RESULTS_VOLUME_NAME = "latent-reasoning-results"
 JUDGING_VOLUME_NAME = "mmar-judging"
 FREEFORM_THINKING_VOLUME_NAME = "mmar-freeform-5-shot-thinking"
+MMAR_FREEFORM_THINKING_VOLUME_NAME = "mmar-freeform-thinking"
 VOLUME_MOUNT = Path("/cache")
 RESULTS_MOUNT = Path("/results")
 JUDGING_MOUNT = Path("/judging")
 FREEFORM_THINKING_MOUNT = Path("/mmar-freeform-5-shot-thinking")
+MMAR_FREEFORM_THINKING_MOUNT = Path("/mmar-freeform-thinking")
+# Snapshot of a local ``outputs/mmar-freeform-thinking`` download, when present.
+LOCAL_MMAR_FREEFORM_THINKING_MOUNT = Path("/local-mmar-freeform-thinking")
 DATA_ROOT = VOLUME_MOUNT / "data"
 MODELS_ROOT = VOLUME_MOUNT / "models"
 
@@ -25,6 +29,9 @@ results_volume = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=T
 judging_volume = modal.Volume.from_name(JUDGING_VOLUME_NAME, create_if_missing=True)
 freeform_thinking_volume = modal.Volume.from_name(
     FREEFORM_THINKING_VOLUME_NAME, create_if_missing=True
+)
+mmar_freeform_thinking_volume = modal.Volume.from_name(
+    MMAR_FREEFORM_THINKING_VOLUME_NAME, create_if_missing=True
 )
 
 hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])

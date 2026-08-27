@@ -4,6 +4,11 @@ Pulls the first-shot LLM-GT and LALM-no-GT packs written by
 ``run_llm_judge_gt.py`` and ``run_lalm_judge_no_gt.py`` into
 ``outputs/judge-quality/``.
 
+Test-taker generations for those scripts come from the
+``mmar-freeform-thinking`` volume; download that pack with
+``uv run modal run download_results.py`` into
+``outputs/mmar-freeform-thinking/``.
+
 Usage::
 
     uv run modal run judge-quality/download_judge_quality.py

@@ -34,7 +34,7 @@ from mmar_common import (
     count_wavs,
     load_jsonl,
 )
-from mmar_models import MODEL_SPECS
+from mmar_models import MODEL_SPECS, resolve_sampling
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
@@ -142,8 +142,8 @@ SAMPLING_SOURCES: dict[str, dict[str, str]] = {
         ),
         "label": "Hugging Face Best Practices",
         "note": (
-            "Thinking-mode card: T=0.6, top_p=0.95. "
-            "max_tokens capped at 2048 for MMAR (card recommends 20480)."
+            "Thinking-mode card: T=0.6, top_p=0.95, max_tokens=20480, "
+            "reasoning_budget=16384, grace_period=1024, max_model_len=210000."
         ),
     },
     "gemini-3.7-flash": {
@@ -164,6 +164,7 @@ SAMPLING_KEY_ORDER = (
     "top_k",
     "max_tokens",
     "repetition_penalty",
+    "thinking_token_budget",
 )
 
 # Official reported MMAR / MMAU averages. ``score`` is accuracy (%). Missing
@@ -432,7 +433,10 @@ def sampling_entries(model_labels: list[str]) -> list[dict[str, Any]]:
         source = SAMPLING_SOURCES.get(label) or {}
         benches = BENCHMARK_SCORES.get(label) or {}
         model_id = str(spec.get("model_id") or label)
-        sampling = _ordered_sampling(dict(spec.get("sampling") or {}))
+        if label in MODEL_SPECS:
+            sampling = _ordered_sampling(resolve_sampling(label))
+        else:
+            sampling = _ordered_sampling(dict(spec.get("sampling") or {}))
         url = source.get("url") or ""
         if not url and "/" in model_id and not model_id.startswith("gpt-"):
             url = f"https://huggingface.co/{model_id}"

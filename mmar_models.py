@@ -19,10 +19,10 @@ from mmar_common import (
     ensure_assistant_think_open,
     parse_choice_output,
     parse_freeform_output,
-    parse_gemma_freeform_output,
     parse_music_flamingo_output,
     parse_think_tagged_output,
-    prefers_markdown_answer_line,
+    join_vllm_reasoning,
+    vllm_reasoning_text,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -119,6 +119,10 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "tokenizer_id": "XiaomiMiMo/MiMo-Audio-Tokenizer",
         "gpu": "L40S",
         "backend": "vllm_omni",
+        # Thinker-heavy Omni YAML: starve Token2Wav, max_num_seqs=16.
+        # Stage 1 cannot be omitted on Omni 0.24. CUDA graphs are off —
+        # capture copies CPU→CUDA in mimo_audio_llm.forward. Omni
+        # init_timeout is raised in load_mimo_audio (default 600s is tight).
         "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
         "sampling_rate": 24000,
         # Native CoT when the assistant turn is prefilled with ``<think>``.
@@ -394,7 +398,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     #         "repetition_penalty": 1.0,
     #     },
     # },
-    # Native FP8 MoE. Cap max_tokens for MMAR (card recommends 20480).
+    # Native FP8 MoE. Thinking-mode card Best Practices.
     # https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8#best-practices
     "nemotron-3-nano-omni": {
         "model_id": "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
@@ -402,7 +406,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm_chat",
         "engine": {
             "dtype": "auto",
-            "max_model_len": 4096,
+            "max_model_len": 210000,
             "max_num_seqs": 64,
             "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
@@ -417,11 +421,13 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         },
         "native_thinking": True,
         "enable_thinking": True,
-        # Thinking-mode card / generation_config.json: T=0.6, top_p=0.95.
+        # Card: extra_body thinking_token_budget = reasoning_budget + grace_period.
+        "reasoning_budget": 16384,
+        "grace_period": 1024,
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
-            "max_tokens": 4096,
+            "max_tokens": 20480,
             "repetition_penalty": 1.0,
         },
     },
@@ -446,7 +452,12 @@ def chat_kwargs_for(label: str) -> dict[str, Any]:
     spec = MODEL_SPECS.get(label) or {}
     if "enable_thinking" not in spec:
         return {}
-    return {"chat_template_kwargs": {"enable_thinking": bool(spec["enable_thinking"])}}
+    template_kwargs: dict[str, Any] = {
+        "enable_thinking": bool(spec["enable_thinking"]),
+    }
+    if spec.get("reasoning_budget") is not None:
+        template_kwargs["reasoning_budget"] = int(spec["reasoning_budget"])
+    return {"chat_template_kwargs": template_kwargs}
 
 
 def parse_model_list(value: str) -> list[str]:
@@ -514,6 +525,13 @@ def resolve_sampling(
     if not spec or "sampling" not in spec:
         raise ValueError(f"Model {label!r} has no per-model sampling config")
     out = dict(spec["sampling"])
+    reasoning_budget = spec.get("reasoning_budget")
+    if reasoning_budget is not None:
+        thinking = int(reasoning_budget)
+        grace_period = spec.get("grace_period")
+        if grace_period is not None:
+            thinking += int(grace_period)
+        out.setdefault("thinking_token_budget", thinking)
     if args is None:
         return out
     if getattr(args, "greedy_non_thinking", False) and not spec.get("native_thinking"):
@@ -569,12 +587,16 @@ def _completion_texts(output: Any) -> list[str]:
         texts: list[str] = []
         for item in outputs:
             text = getattr(item, "text", None)
-            texts.append(str(text) if text is not None else "")
+            texts.append(
+                join_vllm_reasoning(
+                    item, str(text) if text is not None else ""
+                )
+            )
         if texts:
             return texts
     text = getattr(output, "text", None)
-    if text is not None:
-        return [str(text)]
+    if text is not None or vllm_reasoning_text(output):
+        return [join_vllm_reasoning(output, str(text) if text is not None else "")]
     return [str(output)]
 
 
@@ -630,8 +652,6 @@ def _parse_fn_for(
 
         return parse
     if _prompt_mode(args) == "freeform":
-        if prefers_markdown_answer_line(label):
-            return parse_gemma_freeform_output
         if default is parse_think_tagged_output:
             # Free-form still strips <think> blocks; choice matching is skipped.
             return parse_freeform_output
@@ -1050,6 +1070,15 @@ def _resolve_deploy_path(path: str) -> str:
     return str(candidate)
 
 
+def _count_deploy_stages(path: str) -> int:
+    """Count Omni stages in a deploy YAML (``- stage_id:`` entries)."""
+    n = 0
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("- stage_id:"):
+            n += 1
+    return max(1, n)
+
+
 def _ensure_stepaudio2_path() -> None:
     """Official ``stepaudio2.py`` lives in the cloned Step-Audio2 repo."""
     import sys
@@ -1094,17 +1123,22 @@ def load_mimo_audio(args: SimpleNamespace):
         deploy_config=deploy_config,
         trust_remote_code=True,
         async_chunk=False,
+        # Two-stage encoder dummy profiling (8192 audio items) plus starved
+        # Token2Wav exceeds Omni's 600s default on a cold A100.
+        init_timeout=1800,
+        stage_init_timeout=900,
     )
+    n_stages = _count_deploy_stages(deploy_config)
     print(
         f"MiMo-Audio Omni ready from {local_id} "
-        f"(tokenizer={tokenizer_dir}) deploy={deploy_config}"
+        f"(tokenizer={tokenizer_dir}) deploy={deploy_config} stages={n_stages}"
     )
     return {
         "backend": "vllm_omni",
         "llm": omni,
         "sampling_rate": int(spec["sampling_rate"]),
         "parse_fn": parse_think_tagged_output,
-        "stages": 2,
+        "stages": n_stages,
     }
 
 

@@ -1,6 +1,6 @@
 # MMAR Question Difficulty Experiment
 
-Run the full MMAR set, generate 10 freeform responses per model
+Run the full MMAR set, generate 5 freeform responses per model
 (per-model sampling; see `MODEL_SPECS`), then grade and browse
 questions hardest-first by mean success rate.
 
@@ -42,36 +42,36 @@ Judge aliases: `qwen2.5-3b`, `qwen3.6-35b-a3b-fp8` (→ `Qwen/Qwen3.6-35B-A3B-FP
 ## Run
 
 ```bash
-# Full freeform generation (detach recommended; models run in parallel)
+# Full freeform generation (--detach required so GPU workers survive the client exit)
 uv run modal run --detach run_experiment.py
 
 # Smoke test one model (plain vLLM: SamplingParams n=2)
-uv run modal run run_experiment.py \
+uv run modal run --detach run_experiment.py \
   --models af-next-think --n-shots 2
 
 # Step-Audio-2-mini-Think: one MMAR clip via a standalone HF script
 uv run modal run smoke_step_audio.py
 
-# Resume after a crash (full MMAR; skip questions that already have n_shots)
-uv run modal run --detach run_experiment.py \
-  --run-id <run_id>
+# Fill missing models / questions / shots (skip GPU workers with no work)
+uv run modal run --detach run_experiment.py --n-shots 5
 
 # After grading via run_judges.py, rebuild difficulty.jsonl / scores.json
-uv run modal run run_experiment.py \
-  --aggregate-only --run-id <run_id>
+uv run modal run run_experiment.py --aggregate-only
 ```
 
-Defaults: `--n-shots 10 --seed 42` on the full MMAR set, freeform prompts.
-Sampling (`temperature` / `top_p` / `max_tokens` / `repetition_penalty`) is
+Defaults: `--n-shots 5 --seed 42` on the full MMAR set, freeform prompts.
+Writes to the root of the `mmar-freeform-thinking` Modal Volume. Sampling
+(`temperature` / `top_p` / `max_tokens` / `repetition_penalty`) is
 per-model in `mmar_models.MODEL_SPECS`; optional `--temperature` / `--top-p` /
 `--max-new-tokens` override every model when set.
 
-Resume is keyed by `--run-id`. Each model writes
-`models/<label>/predictions.jsonl`. A question is skipped when it already
-has the requested number of shots; otherwise only the missing shots are
-generated. Models that already cover every question at that shot count
-are not re-spawned. Grade those predictions with `run_judges.py`, then
-`--aggregate-only` to rank questions.
+Each run reads existing generations and fills gaps. New models generate
+up to `n_shots` per question. Uncovered questions are filled for each
+requested model. A model with 3 shots when `n_shots=5` generates 2 more.
+Workload is computed on CPU before any GPU container starts; models that
+already have `n_shots` for every question are not spawned. Each model
+writes `models/<label>/predictions.jsonl`. Grade those predictions with
+`run_judges.py`, then `--aggregate-only` to rank questions.
 
 ### Throughput knobs
 
@@ -91,15 +91,23 @@ are not re-spawned. Grade those predictions with `run_judges.py`, then
   Keep it close to real prompt+output length — an inflated value deflates
   vLLM's reported max concurrency and tempts a too-low `max_num_seqs`.
 - **`enforce_eager: False`**: enables torch.compile + CUDA graphs where the
-  model supports it (`af-next`, `voxtral`, InteractiveOmni). Qwen3-Omni MoE
-  keeps `enforce_eager: True` — torch.compile hits a Dynamo meta/cuda
-  mismatch during `profile_run`; its throughput win comes from concurrency.
+  model supports it (`af-next`, `qwen3-omni`, `voxtral`, InteractiveOmni).
+  vLLM 0.28 fixed Qwen3-Omni's Dynamo meta/cuda `profile_run` crash; graphs
+  are on for the thinker-only path. Keep `VLLM_ENABLE_V1_MULTIPROCESSING=0`
+  (in-process EngineCore) — multiprocess `profile_run` was the other
+  meta/cuda failure mode.
 - Prefill-oriented: engines set `max_num_batched_tokens` (≥8192 where possible)
   and `enable_prefix_caching`. Qwen3 Thinking is decode-heavy
   (`max_tokens=2048`; measured outputs peak ~870).
 - `--max-num-seqs` / `--gpu-memory-utilization`: optional CLI escape hatches.
-- MiMo Omni YAML: stage-0 prefix caching on; `max_num_seqs: 1` stays for the
-  two-stage memory split on one GPU (not raised for speed).
+- MiMo Omni YAML: Omni 0.24 still boots Token2Wav, so stage 1 stays loaded
+  (`gpu_memory_utilization: 0.25`); stage 0 gets `max_num_seqs: 16`,
+  `gpu_memory_utilization: 0.55`, and prefix caching. `enforce_eager` stays
+  true — graph capture copies a CPU tensor onto CUDA in `mimo_audio_llm.forward`.
+  Official Omni pins `max_num_seqs: 1` to mask a TTS code-batching bug;
+  text-only MMAR does not hit that path. `load_mimo_audio` sets Omni
+  `init_timeout=1800` because two-stage encoder dummy profiling exceeds
+  the 600s default.
 - Judge engines are tuned with `tune_judge.py` (see below). For the
   `qwen3.6-35b-a3b-fp8` MoE judge, `enforce_eager: False` was worth 332 →
   4,824 output tok/s on an H100; only 3B params are active per token, so
@@ -111,13 +119,12 @@ are not re-spawned. Grade those predictions with `run_judges.py`, then
   `NVIDIA_A100_80GB_PCIe` and `NVIDIA_A100-SXM4-80GB` names (copied from the
   H200 bf16 stand-in; vLLM ships no A100 tune for this shape).
 - AF-Next / Qwen3 / Voxtral images keep `VLLM_ENABLE_V1_MULTIPROCESSING=0`
-  (in-process EngineCore). Multiprocess EngineCore breaks Qwen3-Omni
-  `profile_run` with a meta/cuda device mismatch.
+  (in-process EngineCore).
 
 ## Download + view
 
 ```bash
-# Default remote path is exp-mmar-question-difficulty/
+# Default: mmar-freeform-thinking volume root -> outputs/mmar-freeform-thinking/
 uv run modal run download_results.py
 uv run python view_difficulty.py          # single-run UI (:7860)
 uv run python view_mode_compare.py        # MCQ ↔ freeform compare (:7861)
@@ -287,7 +294,7 @@ exports/
   labels.csv       # question_id, generation_id, model_label, shot_index, ratings
   generations.csv  # question_id, generation_id, model_label, shot_index, answer_prediction
 
-outputs/exp-mmar-question-difficulty/<run_id>/
+outputs/mmar-freeform-thinking/
   question_ids.json
   manifest.json
   models/<label>/predictions.jsonl

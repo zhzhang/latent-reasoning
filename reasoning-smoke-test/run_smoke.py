@@ -1,14 +1,16 @@
 """Tiny reasoning smoke test for every MMAR test-taker in ``MODEL_SPECS``.
 
 Loads one model, runs one freeform MMAR clip, and writes the prompt/output
-token ids the model actually consumed. vLLM boots with ``enforce_eager`` so
-compile / CUDA-graph warmup is skipped.
+token ids the model actually consumed. vLLM boots with ``enforce_eager`` by
+default so compile / CUDA-graph warmup is skipped. Pass ``--no-enforce-eager``
+to exercise ``profile_run`` with torch.compile / CUDA graphs.
 
 Usage::
 
     uv run modal run reasoning-smoke-test/run_smoke.py
     uv run modal run reasoning-smoke-test/run_smoke.py --models gemma-4-e4b
     uv run modal run reasoning-smoke-test/run_smoke.py --models music-flamingo
+    uv run modal run reasoning-smoke-test/run_smoke.py --models qwen3-omni --no-enforce-eager
     uv run modal run reasoning-smoke-test/run_smoke.py \\
       --question-id GJ6r_T6ckc4_00-00-00_00-00-06 --max-new-tokens 2048
 
@@ -278,6 +280,7 @@ def _smoke_one(
     question_id: str | None,
     max_new_tokens: int,
     seed: int,
+    enforce_eager: bool = True,
 ) -> dict[str, Any]:
     volume.reload()
     results_volume.reload()
@@ -297,7 +300,7 @@ def _smoke_one(
         max_num_seqs=1,
         gpu_memory_utilization=None,
         prompt_mode="freeform",
-        enforce_eager=True,
+        enforce_eager=bool(enforce_eager),
     )
     sampling = resolve_sampling(model_label, args)
     args.temperature = float(sampling["temperature"])
@@ -306,15 +309,21 @@ def _smoke_one(
     args.repetition_penalty = float(sampling.get("repetition_penalty", 1.0))
     args.sampling = sampling
 
-    # Skip DeepGEMM kernel warmup; torch.compile / CUDA graphs are off via
-    # enforce_eager (see ``_eager_startup_kwargs``).
+    # Skip DeepGEMM kernel warmup; isolate compile / CUDA-graph profile_run.
     os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
 
+    try:
+        import vllm
+
+        vllm_version = getattr(vllm, "__version__", "unknown")
+    except Exception:  # noqa: BLE001 — version is diagnostic only
+        vllm_version = "unknown"
     print(
         f"[smoke {model_label}] id={item.get('id')} "
+        f"vllm={vllm_version} "
         f"native_thinking={spec.get('native_thinking')} "
         f"enable_thinking={spec.get('enable_thinking')} "
-        f"enforce_eager=True sampling={sampling}"
+        f"enforce_eager={bool(enforce_eager)} sampling={sampling}"
     )
     handle = load_model(model_label, args)
     trace = generate_raw_trace(model_label, handle, item, args)
@@ -438,6 +447,7 @@ def main(
     seed: int = DEFAULT_SEED,
     run_id: str | None = None,
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
+    enforce_eager: bool = True,
 ) -> None:
     labels = _parse_models(models)
     resolved_run_id = run_id or make_run_id()
@@ -447,10 +457,12 @@ def main(
         question_id=question_id,
         max_new_tokens=max_new_tokens,
         seed=seed,
+        enforce_eager=enforce_eager,
     )
     print(
         f"[smoke] run_id={resolved_run_id} models={labels} "
-        f"question_id={question_id} max_new_tokens={max_new_tokens}"
+        f"question_id={question_id} max_new_tokens={max_new_tokens} "
+        f"enforce_eager={enforce_eager}"
     )
     handles = [
         _WORKERS[label].spawn(model_label=label, **kwargs) for label in labels

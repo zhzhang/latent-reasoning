@@ -560,8 +560,10 @@ def _verdict_entry(
     include_gold: bool,
 ) -> dict[str, Any]:
     from grader import format_grade_output, parse_grade_verdict
+    from mmar_common import parse_freeform_output
 
     verdict = parse_grade_verdict(result.text)
+    reasoning, _answer = parse_freeform_output(result.text)
     entry: dict[str, Any] = {
         "correct": bool(verdict) if verdict is not None else False,
         "verdict": (
@@ -569,6 +571,7 @@ def _verdict_entry(
         ),
         "output": format_grade_output(verdict),
         "generation": result.text,
+        "reasoning": reasoning or "",
         "model_id": model_id,
         "prompt": prompt_name,
         "include_gold": include_gold,
@@ -594,12 +597,15 @@ def _majority_verdict_entry(
     raw = [item["grader_verdict_raw"] for item in sample_fields]
     majority = majority_grade_verdict(raw)
     generation = ""
+    reasoning = ""
     for item, verdict in zip(sample_fields, raw):
         if majority is not None and verdict is majority:
             generation = item["generation"]
+            reasoning = item.get("reasoning") or ""
             break
     if not generation and sample_fields:
         generation = sample_fields[0]["generation"]
+        reasoning = sample_fields[0].get("reasoning") or ""
     return {
         "correct": bool(majority) if majority is not None else False,
         "verdict": (
@@ -607,6 +613,7 @@ def _majority_verdict_entry(
         ),
         "output": format_grade_output(majority),
         "generation": generation,
+        "reasoning": reasoning,
         "model_id": model_id,
         "prompt": prompt_name,
         "include_gold": include_gold,
@@ -615,6 +622,7 @@ def _majority_verdict_entry(
                 "correct": item["correct"],
                 "verdict": item["verdict"],
                 "generation": item["generation"],
+                "reasoning": item.get("reasoning") or "",
                 "output": item["grader_output"],
             }
             for item in sample_fields

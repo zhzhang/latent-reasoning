@@ -5,6 +5,18 @@ Same setup as ``run_llm_judge_gt.py`` (``neutral_with_gt_no_audio``, every
 ``claude-sonnet-5`` via Anthropic's Message Batches API. Runs locally;
 no Modal container is started.
 
+Before grading, overlays test-taker generations into the local pack
+from the same sources as ``run_llm_judge_gt.py`` (first source wins,
+existing per-shot verdicts are kept when the answer is unchanged):
+
+    outputs/mmar-freeform-thinking                  # run_experiment.py download
+    outputs/exp-mmar-question-difficulty/<run_id>   # legacy downloads
+    outputs/mmar-freeform-5-shot-thinking           # API pack download
+    outputs/judge-quality/llm-judge-gt              # already in the pack
+
+Question ids come from ``outputs/mmar-freeform-thinking/question_ids.json``
+when that file exists.
+
 Writes verdicts into the local ``llm-judge-gt`` pack (default:
 ``outputs/judge-quality/llm-judge-gt``). If that directory is missing,
 the pack is pulled from the ``mmar-judging`` volume with ``modal volume
@@ -45,11 +57,16 @@ if str(_REPO_ROOT) not in sys.path:
 from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
 from grader import compose_judge_key, remaining_grade_work
 from mmar_api import grade_pack_with_batch_api
-from mmar_common import write_json
+from mmar_common import recompute_multi_judge_scores, write_json, write_jsonl
 from modal_cache import JUDGING_VOLUME_NAME
 
 PACK_NAME = "llm-judge-gt"
 DEFAULT_PACK_DIR = _REPO_ROOT / "outputs" / "judge-quality" / PACK_NAME
+LOCAL_FREEFORM_THINKING_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-thinking"
+LOCAL_RESULTS_DIR = _REPO_ROOT / "outputs" / "exp-mmar-question-difficulty"
+LOCAL_API_PACK_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-5-shot-thinking"
+FULL_MMAR_RUN_ID = "20260807T145000Z"
+OPEN_ENDED_RUN_ID = "20260816T050944Z"
 JUDGE_LABEL = "claude-sonnet-5"
 GRADE_PROMPT = "neutral_with_gt_no_audio"
 N_SHOTS = 5
@@ -57,6 +74,26 @@ SHOT_INDICES = tuple(range(N_SHOTS))
 N_SAMPLES = 3
 # Same as run_llm_judge_gt.py: T=0 would collapse the 3 votes.
 JUDGE_TEMPERATURE = 1.0
+
+DROP_RECORD_KEYS = (
+    "judges",
+    "grader",
+    "grader_output",
+    "per_judge",
+    "primary_judge",
+    "pending_grade",
+    "scoring",
+    "correct",
+    "n_shot_correct",
+    "shot_success_rate",
+)
+DROP_SHOT_KEYS = (
+    "judges",
+    "grader",
+    "grader_output",
+    "pending_grade",
+    "correct",
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -69,12 +106,291 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _load_question_ids(pack_dir: Path) -> list[str]:
-    payload = _load_json(pack_dir / "question_ids.json")
-    ids = payload.get("ids") if isinstance(payload, dict) else None
-    if isinstance(ids, list) and ids:
-        return [str(qid) for qid in ids if str(qid).strip()]
-    return []
+def _load_question_ids(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if isinstance(payload, dict):
+        ids = payload.get("ids") or []
+    elif isinstance(payload, list):
+        ids = payload
+    else:
+        return []
+    return [str(qid) for qid in ids if str(qid).strip()]
+
+
+def _shot_index(shot: dict[str, Any]) -> int:
+    raw = shot.get("shot_index")
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
+    out = {key: value for key, value in shot.items() if key not in DROP_SHOT_KEYS}
+    out["shot_index"] = _shot_index(shot)
+    out["correct"] = None
+    out["pending_grade"] = True
+    return out
+
+
+def _shots_record(record: dict[str, Any], *, model: str) -> dict[str, Any] | None:
+    raw_shots = list(record.get("shots") or [])
+    raw_shots.sort(key=_shot_index)
+    kept: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for shot in raw_shots:
+        idx = _shot_index(shot)
+        if idx not in SHOT_INDICES or idx in seen:
+            continue
+        seen.add(idx)
+        kept.append(_compact_shot(shot))
+    if not kept:
+        return None
+    first = next((shot for shot in kept if _shot_index(shot) == 0), kept[0])
+    out = {key: value for key, value in record.items() if key not in DROP_RECORD_KEYS}
+    out["id"] = str(record.get("id") or "")
+    out["model"] = model
+    out["n_shots"] = len(kept)
+    out["shots"] = kept
+    out["answer_prediction"] = first.get("answer_prediction")
+    out["model_output"] = first.get("model_output")
+    out["thinking_prediction"] = first.get("thinking_prediction")
+    out["raw_tokens"] = first.get("raw_tokens")
+    out["correct"] = None
+    out["n_shot_correct"] = None
+    out["shot_success_rate"] = None
+    out["pending_grade"] = True
+    return out
+
+
+def _iter_shots(predictions_path: Path, *, model: str) -> dict[str, dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    if not predictions_path.is_file():
+        return found
+    with predictions_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                record = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            compact = _shots_record(record, model=model)
+            if compact is None or not compact["id"]:
+                continue
+            found[compact["id"]] = compact
+    return found
+
+
+def _source_model_dirs(pack_dir: Path) -> list[tuple[str, Path]]:
+    """(source_tag, models_dir) in overlay order: first source wins per model."""
+    return [
+        ("mmar-freeform-thinking", LOCAL_FREEFORM_THINKING_DIR / "models"),
+        (
+            FULL_MMAR_RUN_ID,
+            LOCAL_RESULTS_DIR / FULL_MMAR_RUN_ID / "models",
+        ),
+        (
+            OPEN_ENDED_RUN_ID,
+            LOCAL_RESULTS_DIR / OPEN_ENDED_RUN_ID / "models",
+        ),
+        ("mmar-freeform-5-shot-thinking", LOCAL_API_PACK_DIR / "models"),
+        ("llm-judge-gt-pack", pack_dir / "models"),
+    ]
+
+
+def _question_id_candidates(pack_dir: Path) -> list[tuple[str, Path]]:
+    return [
+        ("mmar-freeform-thinking", LOCAL_FREEFORM_THINKING_DIR / "question_ids.json"),
+        (
+            FULL_MMAR_RUN_ID,
+            LOCAL_RESULTS_DIR / FULL_MMAR_RUN_ID / "question_ids.json",
+        ),
+        ("llm-judge-gt-pack", pack_dir / "question_ids.json"),
+    ]
+
+
+def _resolve_question_ids(pack_dir: Path) -> tuple[list[str], str]:
+    for tag, path in _question_id_candidates(pack_dir):
+        ids = _load_question_ids(path)
+        if ids:
+            print(f"[llm-judge-gt-claude] question ids: {len(ids)} from {tag} ({path})")
+            return ids, tag
+    raise SystemExit(
+        "No question_ids.json found. Download the experiment pack:\n"
+        "  uv run modal run download_results.py\n"
+        f"Expected {LOCAL_FREEFORM_THINKING_DIR / 'question_ids.json'}"
+    )
+
+
+def _merge_shot_judges(local: dict, prior: dict) -> dict:
+    """Keep prior per-shot verdicts when that shot's answer is unchanged."""
+    prior_shots = {
+        _shot_index(shot): shot for shot in (prior.get("shots") or [])
+    }
+    merged_shots = []
+    for shot in local.get("shots") or []:
+        prev = prior_shots.get(_shot_index(shot))
+        prev_judges = (prev or {}).get("judges") or {}
+        pred = str(shot.get("answer_prediction") or "").strip().lower()
+        prev_pred = str((prev or {}).get("answer_prediction") or "").strip().lower()
+        if prev is not None and prev_judges and pred == prev_pred:
+            shot = dict(shot)
+            judges = dict(shot.get("judges") or {})
+            for key, entry in prev_judges.items():
+                judges.setdefault(key, entry)
+            shot["judges"] = judges
+        merged_shots.append(shot)
+    merged = dict(local)
+    merged["shots"] = merged_shots
+    if prior.get("primary_judge") and not merged.get("primary_judge"):
+        merged["primary_judge"] = prior["primary_judge"]
+    prior_labels = [str(x) for x in (prior.get("judges") or []) if x]
+    if prior_labels:
+        merged["judges"] = list(prior_labels)
+    return merged
+
+
+def _has_shot_judges(record: dict[str, Any]) -> bool:
+    if record.get("judges"):
+        return True
+    return any((shot.get("judges") or {}) for shot in (record.get("shots") or []))
+
+
+def _write_predictions(path: Path, records: list[dict[str, Any]]) -> None:
+    prior_by_id: dict[str, dict] = {}
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                record = json.loads(stripped)
+                rid = str(record.get("id") or "")
+                if rid:
+                    prior_by_id[rid] = record
+    merged = []
+    for record in records:
+        prior = prior_by_id.get(str(record.get("id") or ""))
+        row = _merge_shot_judges(record, prior) if prior else record
+        if _has_shot_judges(row):
+            recompute_multi_judge_scores(row, row.get("primary_judge"))
+        merged.append(row)
+    write_jsonl(path, merged, mode="w")
+
+
+def _overlay_pack(pack_dir: Path, models: str = "all") -> dict[str, Any]:
+    """Copy 5-shot freeform answers into the local llm-judge-gt pack."""
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    question_ids, ids_source = _resolve_question_ids(pack_dir)
+    by_model: dict[str, dict[str, dict[str, Any]]] = {}
+    sources: dict[str, str] = {}
+    for tag, models_dir in _source_model_dirs(pack_dir):
+        if not models_dir.is_dir():
+            print(f"[llm-judge-gt-claude] skip missing source {tag}: {models_dir}")
+            continue
+        for model_dir in sorted(models_dir.iterdir()):
+            if not model_dir.is_dir():
+                continue
+            label = model_dir.name
+            if label in by_model:
+                continue
+            pred = model_dir / "predictions.jsonl"
+            rows = _iter_shots(pred, model=label)
+            kept = {qid: rows[qid] for qid in question_ids if qid in rows}
+            if not kept:
+                print(f"[llm-judge-gt-claude] {tag}/{label}: no shot overlap")
+                continue
+            by_model[label] = kept
+            sources[label] = tag
+            n_shot_rows = sum(len(row.get("shots") or []) for row in kept.values())
+            print(
+                f"[llm-judge-gt-claude] {tag}/{label}: {len(kept)}/{len(question_ids)} "
+                f"questions, {n_shot_rows} shots"
+            )
+
+    requested = [part.strip() for part in str(models or "all").split(",") if part.strip()]
+    write_model = dict(by_model)
+    if requested and requested != ["all"]:
+        missing = [label for label in requested if label not in write_model]
+        if missing:
+            raise SystemExit(
+                f"Requested model(s) not found: {missing}. "
+                f"Available: {order_model_labels(list(write_model))}"
+            )
+        write_model = {label: write_model[label] for label in requested}
+
+    labels = order_model_labels(list(write_model))
+    if not labels:
+        raise SystemExit(
+            "No test-taker generations found. Download the experiment pack:\n"
+            "  uv run modal run download_results.py\n"
+            f"Expected {LOCAL_FREEFORM_THINKING_DIR}"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    for label in labels:
+        ordered = [
+            write_model[label][qid] for qid in question_ids if qid in write_model[label]
+        ]
+        _write_predictions(pack_dir / "models" / label / "predictions.jsonl", ordered)
+
+    write_json(
+        pack_dir / "question_ids.json",
+        {
+            "n": len(question_ids),
+            "ids": question_ids,
+            "n_shots": N_SHOTS,
+            "source": ids_source,
+        },
+    )
+    manifest_path = pack_dir / "manifest.json"
+    existing = _load_json(manifest_path)
+    disk_labels = discover_model_labels(pack_dir, manifest=existing)
+    manifest_models = order_model_labels(
+        list(dict.fromkeys([*disk_labels, *labels]))
+    )
+    manifest = {
+        "name": PACK_NAME,
+        "mode": "freeform",
+        "n_shots": N_SHOTS,
+        "n_questions": len(question_ids),
+        "models": manifest_models,
+        "sources": {**(existing.get("sources") or {}), **sources},
+        "grade_prompt": GRADE_PROMPT,
+        "n_samples": N_SAMPLES,
+        "temperature": JUDGE_TEMPERATURE,
+        "created_at": existing.get("created_at") or now,
+        "updated_at": now,
+    }
+    for key in (
+        "scoring",
+        "grader_model_id",
+        "judges",
+        "primary_judge",
+        "judge_model_id",
+        "graded_at",
+    ):
+        if existing.get(key) is not None:
+            manifest[key] = existing[key]
+    write_json(manifest_path, manifest)
+    print(
+        f"[llm-judge-gt-claude] prepared models={manifest_models} "
+        f"questions={len(question_ids)} overlay={labels} -> {pack_dir}"
+    )
+    return {
+        "pack": PACK_NAME,
+        "model_labels": labels if requested and requested != ["all"] else manifest_models,
+        "question_ids": question_ids,
+        "sources": sources,
+        "n_questions": len(question_ids),
+    }
 
 
 def _download_pack(pack_dir: Path, *, force: bool = False) -> Path:
@@ -102,22 +418,35 @@ def _download_pack(pack_dir: Path, *, force: bool = False) -> Path:
 def _require_pack(pack_dir: Path, *, download: bool = True) -> Path:
     if pack_dir.is_dir() and (pack_dir / "manifest.json").is_file():
         return pack_dir
+    has_local_generations = (LOCAL_FREEFORM_THINKING_DIR / "models").is_dir()
     if not download:
+        if has_local_generations:
+            return pack_dir
         raise SystemExit(
             f"Pack not found at {pack_dir}. Download with:\n"
             "  uv run modal run judge-quality/download_judge_quality.py "
-            f"--pack {PACK_NAME}"
+            f"--pack {PACK_NAME}\n"
+            "or generations with:\n"
+            "  uv run modal run download_results.py"
         )
     try:
         return _download_pack(pack_dir, force=pack_dir.exists())
     except subprocess.CalledProcessError as exc:
+        if has_local_generations:
+            print(
+                "[llm-judge-gt-claude] judging-volume pack missing; "
+                f"will overlay {LOCAL_FREEFORM_THINKING_DIR}"
+            )
+            return pack_dir
         raise SystemExit(
             f"Pack not found at {pack_dir} and download failed "
             f"(exit {exc.returncode}). Prepare it with:\n"
             "  uv run modal run --detach judge-quality/run_llm_judge_gt.py\n"
             "then download:\n"
             "  uv run modal run judge-quality/download_judge_quality.py "
-            f"--pack {PACK_NAME}"
+            f"--pack {PACK_NAME}\n"
+            "or download generations:\n"
+            "  uv run modal run download_results.py"
         ) from exc
 
 
@@ -220,12 +549,8 @@ def run_claude_judge(
 ) -> dict[str, Any]:
     dest = Path(pack_dir or DEFAULT_PACK_DIR).expanduser().resolve()
     dest = _require_pack(dest, download=download)
-    question_ids = _load_question_ids(dest)
-    if len(question_ids) != 1000:
-        raise SystemExit(
-            f"Expected 1000 MMAR ids in {dest / 'question_ids.json'}, "
-            f"got {len(question_ids)}"
-        )
+    prep = _overlay_pack(dest, models)
+    question_ids = list(prep["question_ids"])
     model_labels = _model_labels(dest, models)
     judge_key = compose_judge_key(
         JUDGE_LABEL, prompt=GRADE_PROMPT, include_gold=True
@@ -331,7 +656,11 @@ def parse_args() -> argparse.Namespace:
         "--pack-dir",
         type=Path,
         default=DEFAULT_PACK_DIR,
-        help=f"Local llm-judge-gt pack (default: {DEFAULT_PACK_DIR})",
+        help=(
+            f"Local llm-judge-gt pack (default: {DEFAULT_PACK_DIR}). "
+            "Generations are overlaid from outputs/mmar-freeform-thinking "
+            "before grading."
+        ),
     )
     parser.add_argument(
         "--batch-id",

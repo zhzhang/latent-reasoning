@@ -3,21 +3,31 @@
 Grades ``shot_index == 0`` for every test-taker that has a freeform
 generation on the full MMAR set. Each audio suite judge
 (``grader.ROUND_ROBIN_SUITE``) uses the ``neutral_no_gt`` recipe: hears
-the clip, does not see gold, 3-sample majority vote
-(``SamplingParams(n=3)`` where the backend supports it).
+the clip, does not see gold. Default is one judge completion per
+answer (``--n-samples 1``). Pass ``--n-samples 3`` to restore
+3-sample majority vote (``SamplingParams(n=...)`` where the backend
+supports it).
 
-Writes ``lalm-judge-no-gt/`` on the ``mmar-judging`` volume. Suite
-judges run in parallel on the same GPU families as ``run_judges.py``.
+Writes ``lalm-judge-no-gt/`` on the ``mmar-judging`` volume. Each suite
+judge gets its own GPU container (``single_use_containers``), same
+spawn pattern as ``run_experiment.py``: a short CPU orchestrator
+prepares remaining work, launches pending judges in parallel, and
+returns without waiting. Fold sidecars with ``--merge-only`` after
+workers finish (or on a re-run with nothing left to grade).
 
 Sources, later runs only add models that are not already present:
 
-    exp-mmar-question-difficulty/20260807T145000Z   # 5 models × 1000 q
+    mmar-freeform-thinking                          # run_experiment.py (volume root)
+    outputs/mmar-freeform-thinking                  # local download of that volume
+    exp-mmar-question-difficulty/20260807T145000Z   # legacy 5 models × 1000 q
     exp-mmar-question-difficulty/20260816T050944Z   # extra models × 784 q
     mmar-freeform                                   # collated pack (API, …)
     mmar-freeform-5-shot-thinking                   # API models (volume root)
 
-The 1000-id list comes from the full MMAR run. Models that only exist
-on the 784-id packs are graded on the overlap.
+Question ids come from ``mmar-freeform-thinking/question_ids.json``
+(remote volume, then local download). The 1000-id list from the legacy
+full MMAR run is used only if that file is missing. Models that only
+exist on the 784-id packs are graded on the overlap.
 
 Resume is the default: existing sidecar / predictions verdicts for a
 suite judge are kept, that judge's GPU is not started when nothing is
@@ -27,9 +37,12 @@ left, and only ungraded examples are sent to the model. Pass
 Usage::
 
     uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py
+    uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py --n-samples 3
     uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py --force
     uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py \\
       --judges qwen2.5-omni-7b,phi-4-multimodal
+    uv run modal run judge-quality/run_lalm_judge_no_gt.py --merge-only
+    uv run modal run judge-quality/run_lalm_judge_no_gt.py --aggregate-only
 """
 
 from __future__ import annotations
@@ -47,16 +60,20 @@ if str(_REPO_ROOT) not in sys.path:
 import modal
 
 from aggregate import aggregate_difficulty, order_model_labels
+from grader import ROUND_ROBIN_SUITE
 from mmar_common import write_json, write_jsonl
 from modal_cache import (
     FREEFORM_THINKING_MOUNT,
     JUDGING_MOUNT,
+    LOCAL_MMAR_FREEFORM_THINKING_MOUNT,
+    MMAR_FREEFORM_THINKING_MOUNT,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
     VLLM_WHEEL_INDEX,
     freeform_thinking_volume,
     hf_secret,
     judging_volume,
+    mmar_freeform_thinking_volume,
     results_volume,
     volume,
 )
@@ -70,11 +87,12 @@ COLLATED_PACK = FREEFORM_THINKING_MOUNT
 FREEFORM_PACK = RESULTS_MOUNT / "mmar-freeform"
 LOCAL_FREEFORM_DIR = _REPO_ROOT / "outputs" / "mmar-freeform"
 LOCAL_FREEFORM_MOUNT = Path("/local-mmar-freeform")
+LOCAL_FREEFORM_THINKING_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-thinking"
 
 GRADE_PROMPT = "neutral_no_gt"
 INCLUDE_GOLD = False
-N_SAMPLES = 3
-# Shared with run_llm_judge_gt.py: T=0 would make the 3 votes identical.
+DEFAULT_N_SAMPLES = 1
+# Shared with run_llm_judge_gt.py: T=0 would make n>1 votes identical.
 JUDGE_TEMPERATURE = 1.0
 
 DROP_RECORD_KEYS = (
@@ -174,6 +192,11 @@ if LOCAL_FREEFORM_DIR.is_dir():
     cpu_image = cpu_image.add_local_dir(
         str(LOCAL_FREEFORM_DIR), remote_path=str(LOCAL_FREEFORM_MOUNT)
     )
+if LOCAL_FREEFORM_THINKING_DIR.is_dir():
+    cpu_image = cpu_image.add_local_dir(
+        str(LOCAL_FREEFORM_THINKING_DIR),
+        remote_path=str(LOCAL_MMAR_FREEFORM_THINKING_MOUNT),
+    )
 
 
 def _shot_index(shot: dict[str, Any]) -> int:
@@ -253,6 +276,11 @@ def _iter_first_shots(predictions_path: Path, *, model: str) -> dict[str, dict[s
 def _source_model_dirs() -> list[tuple[str, Path]]:
     """(source_tag, models_dir) in overlay order: first source wins per model."""
     return [
+        ("mmar-freeform-thinking", MMAR_FREEFORM_THINKING_MOUNT / "models"),
+        (
+            "local-mmar-freeform-thinking",
+            LOCAL_MMAR_FREEFORM_THINKING_MOUNT / "models",
+        ),
         (
             FULL_MMAR_RUN_ID,
             DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "models",
@@ -265,6 +293,33 @@ def _source_model_dirs() -> list[tuple[str, Path]]:
         ("mmar-freeform-5-shot-thinking", COLLATED_PACK / "models"),
         ("local-mmar-freeform", LOCAL_FREEFORM_MOUNT / "models"),
     ]
+
+
+def _question_id_candidates() -> list[tuple[str, Path]]:
+    return [
+        ("mmar-freeform-thinking", MMAR_FREEFORM_THINKING_MOUNT / "question_ids.json"),
+        (
+            "local-mmar-freeform-thinking",
+            LOCAL_MMAR_FREEFORM_THINKING_MOUNT / "question_ids.json",
+        ),
+        (
+            FULL_MMAR_RUN_ID,
+            DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json",
+        ),
+    ]
+
+
+def _resolve_question_ids() -> tuple[list[str], str]:
+    for tag, path in _question_id_candidates():
+        ids = _load_question_ids(path)
+        if ids:
+            print(f"[lalm-judge-no-gt] question ids: {len(ids)} from {tag} ({path})")
+            return ids, tag
+    raise SystemExit(
+        "No question_ids.json found on mmar-freeform-thinking "
+        f"(remote {MMAR_FREEFORM_THINKING_MOUNT} or local download) "
+        f"or legacy run {FULL_MMAR_RUN_ID}"
+    )
 
 
 def _merge_shot_judges(local: dict, prior: dict) -> dict:
@@ -315,7 +370,7 @@ def _write_predictions(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def _parse_judge_list(raw: str) -> list[str]:
-    from grader import ROUND_ROBIN_SUITE, _suite_label_for
+    from grader import _suite_label_for
 
     requested = [part.strip() for part in str(raw or "all").split(",") if part.strip()]
     if not requested or requested == ["all"]:
@@ -336,13 +391,19 @@ def _parse_judge_list(raw: str) -> list[str]:
     return out
 
 
+def _clamp_n_samples(raw: int | None) -> int:
+    return max(1, int(raw if raw is not None else DEFAULT_N_SAMPLES))
+
+
 def _stamp_manifest(
     manifest: dict,
     *,
     judge_entries: list[dict],
     primary: str | None,
+    n_samples: int = DEFAULT_N_SAMPLES,
 ) -> dict:
     now = datetime.now(timezone.utc).isoformat()
+    n_samples = _clamp_n_samples(n_samples)
     by_label: dict[str, dict] = {}
     for item in manifest.get("judges") or []:
         if isinstance(item, dict) and item.get("label"):
@@ -359,7 +420,7 @@ def _stamp_manifest(
             "label": key,
             "prompt": GRADE_PROMPT,
             "include_gold": INCLUDE_GOLD,
-            "n_samples": N_SAMPLES,
+            "n_samples": n_samples,
             "temperature": JUDGE_TEMPERATURE,
             "primary": False,
         }
@@ -381,7 +442,7 @@ def _stamp_manifest(
         manifest["grader_model_id"] = (by_label.get(primary) or {}).get("model_id")
     manifest["scoring"] = "qwen_freeform_judge"
     manifest["grade_prompt"] = GRADE_PROMPT
-    manifest["n_samples"] = N_SAMPLES
+    manifest["n_samples"] = n_samples
     manifest["temperature"] = JUDGE_TEMPERATURE
     manifest["graded_at"] = now
     manifest["updated_at"] = now
@@ -395,23 +456,21 @@ def _stamp_manifest(
         VOLUME_MOUNT: volume,
         RESULTS_MOUNT: results_volume,
         FREEFORM_THINKING_MOUNT: freeform_thinking_volume,
+        MMAR_FREEFORM_THINKING_MOUNT: mmar_freeform_thinking_volume,
         JUDGING_MOUNT: judging_volume,
     },
 )
 def prepare_pack(models: str = "all") -> dict:
     """Copy first-shot freeform answers onto ``mmar-judging/lalm-judge-no-gt``."""
-    from grader import ROUND_ROBIN_SUITE
 
     results_volume.reload()
     freeform_thinking_volume.reload()
+    mmar_freeform_thinking_volume.reload()
     judging_volume.reload()
 
-    ids_path = DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json"
-    question_ids = _load_question_ids(ids_path)
-    if len(question_ids) != 1000:
-        raise SystemExit(
-            f"Expected 1000 MMAR ids in {ids_path}, got {len(question_ids)}"
-        )
+    question_ids, ids_source = _resolve_question_ids()
+    if not question_ids:
+        raise SystemExit("No MMAR question ids found")
     wanted = set(question_ids)
 
     by_model: dict[str, dict[str, dict[str, Any]]] = {}
@@ -466,27 +525,35 @@ def prepare_pack(models: str = "all") -> dict:
             "n": len(question_ids),
             "ids": question_ids,
             "n_shots": 1,
-            "source": FULL_MMAR_RUN_ID,
+            "source": ids_source,
         },
     )
-    write_json(
-        pack_dir / "manifest.json",
-        {
-            "name": PACK_NAME,
-            "mode": "freeform",
-            "n_shots": 1,
-            "n_questions": len(question_ids),
-            "models": labels,
-            "sources": sources,
-            "grade_prompt": GRADE_PROMPT,
-            "include_gold": INCLUDE_GOLD,
-            "n_samples": N_SAMPLES,
-            "temperature": JUDGE_TEMPERATURE,
-            "suite_judges": list(ROUND_ROBIN_SUITE),
-            "created_at": now,
-            "updated_at": now,
-        },
-    )
+    manifest_path = pack_dir / "manifest.json"
+    existing: dict = {}
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+    manifest = {
+        "name": PACK_NAME,
+        "mode": "freeform",
+        "n_shots": 1,
+        "n_questions": len(question_ids),
+        "models": labels,
+        "sources": sources,
+        "grade_prompt": GRADE_PROMPT,
+        "include_gold": INCLUDE_GOLD,
+        "n_samples": DEFAULT_N_SAMPLES,
+        "temperature": JUDGE_TEMPERATURE,
+        "suite_judges": list(ROUND_ROBIN_SUITE),
+        "created_at": existing.get("created_at") or now,
+        "updated_at": now,
+    }
+    for key in ("scoring", "grader_model_id", "judges", "primary_judge", "graded_at"):
+        if existing.get(key) is not None:
+            manifest[key] = existing[key]
+    write_json(manifest_path, manifest)
     judging_volume.commit()
     print(
         f"[lalm-judge-no-gt] prepared models={labels} questions={len(question_ids)} "
@@ -501,15 +568,20 @@ def prepare_pack(models: str = "all") -> dict:
     }
 
 
-def _prompt_batch_for(judge_label: str, batch_size: int | None) -> int:
+def _prompt_batch_for(
+    judge_label: str,
+    batch_size: int | None,
+    n_samples: int = DEFAULT_N_SAMPLES,
+) -> int:
     from mmar_models import MODEL_SPECS
 
+    n_samples = _clamp_n_samples(n_samples)
     if batch_size is not None:
         seq_budget = int(batch_size)
     else:
         engine = (MODEL_SPECS.get(judge_label) or {}).get("engine") or {}
         seq_budget = int(engine.get("max_num_seqs") or 32)
-    return max(1, seq_budget // N_SAMPLES)
+    return max(1, seq_budget // n_samples)
 
 
 def _grade_one_lalm(
@@ -519,6 +591,7 @@ def _grade_one_lalm(
     question_ids: list[str],
     force: bool,
     batch_size: int | None,
+    n_samples: int = DEFAULT_N_SAMPLES,
 ) -> dict:
     from grader import (
         compose_judge_key,
@@ -529,6 +602,7 @@ def _grade_one_lalm(
     )
     from mmar_models import MODEL_SPECS
 
+    n_samples = _clamp_n_samples(n_samples)
     volume.reload()
     judging_volume.reload()
     pack_dir = REMOTE_PACK_DIR
@@ -569,7 +643,7 @@ def _grade_one_lalm(
                 "by_model": {},
                 "prompt": GRADE_PROMPT,
                 "include_gold": INCLUDE_GOLD,
-                "n_samples": N_SAMPLES,
+                "n_samples": n_samples,
             }
 
     handle = load_grader(judge_label)
@@ -579,10 +653,10 @@ def _grade_one_lalm(
     key = resolve_grade_judge_key(
         handle, prompt=GRADE_PROMPT, include_gold=INCLUDE_GOLD
     )
-    prompt_batch = _prompt_batch_for(judge_label, batch_size)
+    prompt_batch = _prompt_batch_for(judge_label, batch_size, n_samples=n_samples)
     print(
         f"[lalm-judge-no-gt] judge={judge_label} key={key} "
-        f"n_samples={N_SAMPLES} temperature={JUDGE_TEMPERATURE} "
+        f"n_samples={n_samples} temperature={JUDGE_TEMPERATURE} "
         f"prompt_batch={prompt_batch}"
     )
 
@@ -605,7 +679,7 @@ def _grade_one_lalm(
             shot_indices=(0,),
             sidecar_path=sidecar,
             question_ids=question_ids,
-            n_samples=N_SAMPLES,
+            n_samples=n_samples,
             temperature=JUDGE_TEMPERATURE,
         )
         judging_volume.commit()
@@ -622,61 +696,182 @@ def _grade_one_lalm(
         "by_model": per_model,
         "prompt": GRADE_PROMPT,
         "include_gold": INCLUDE_GOLD,
-        "n_samples": N_SAMPLES,
+        "n_samples": n_samples,
         "prompt_batch": prompt_batch,
     }
 
 
+# ---------------------------------------------------------------------------
+# Modal grade workers (one GPU function per suite judge)
+# ---------------------------------------------------------------------------
+# single_use_containers keeps a GPU from being reused after that judge returns.
+
 _SUITE_GRADE_KW = dict(
-    image=large_mm_image,
     timeout=12 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
     secrets=[hf_secret],
     memory=65536,
+    single_use_containers=True,
 )
 
-
-@app.function(gpu="L40S", **_SUITE_GRADE_KW)
-def grade_suite_l40s(
-    judge_label: str,
-    model_labels: list[str],
-    question_ids: list[str],
-    force: bool = False,
-    batch_size: int | None = None,
-) -> dict:
-    return _grade_one_lalm(
-        judge_label,
-        model_labels=model_labels,
-        question_ids=question_ids,
-        force=force,
-        batch_size=batch_size,
-    )
-
-
-@app.function(gpu="H100", **_SUITE_GRADE_KW)
-def grade_suite_h100(
-    judge_label: str,
-    model_labels: list[str],
-    question_ids: list[str],
-    force: bool = False,
-    batch_size: int | None = None,
-) -> dict:
-    return _grade_one_lalm(
-        judge_label,
-        model_labels=model_labels,
-        question_ids=question_ids,
-        force=force,
-        batch_size=batch_size,
-    )
-
-
-_SUITE_GRADE_FNS = {
-    "qwen2.5-omni-7b": grade_suite_l40s,
-    "phi-4-multimodal": grade_suite_l40s,
-    "gemma-4-e4b": grade_suite_l40s,
-    "qwen3-omni-instruct": grade_suite_h100,
-    "nemotron-3-nano-omni": grade_suite_h100,
+# GPU for suite judges whose MODEL_SPECS entry is currently commented out.
+_JUDGE_GPU_FALLBACK = {
+    "qwen2.5-omni-7b": "L40S",
+    "phi-4-multimodal": "L40S",
+    "gemma-4-e4b": "L40S",
+    "qwen3-omni-instruct": "H100",
+    "nemotron-3-nano-omni": "H100",
 }
+_JUDGE_MODEL_ID_FALLBACK = {
+    "qwen2.5-omni-7b": "Qwen/Qwen2.5-Omni-7B",
+    "phi-4-multimodal": "microsoft/Phi-4-multimodal-instruct",
+    "qwen3-omni-instruct": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
+}
+
+
+def _judge_gpu(label: str) -> str | None:
+    from mmar_models import MODEL_SPECS
+
+    gpu = (MODEL_SPECS.get(label) or {}).get("gpu") or _JUDGE_GPU_FALLBACK.get(label)
+    return str(gpu) if gpu else None
+
+
+def _judge_model_id(label: str) -> str:
+    from mmar_models import MODEL_SPECS
+
+    return (
+        (MODEL_SPECS.get(label) or {}).get("model_id")
+        or _JUDGE_MODEL_ID_FALLBACK.get(label)
+        or label
+    )
+
+
+def _planned_judge_entry(label: str, n_samples: int = DEFAULT_N_SAMPLES) -> dict:
+    from grader import compose_judge_key
+
+    key = compose_judge_key(
+        label, prompt=GRADE_PROMPT, include_gold=INCLUDE_GOLD
+    )
+    return {
+        "label": key,
+        "judge_key": key,
+        "model_id": _judge_model_id(label),
+        "prompt": GRADE_PROMPT,
+        "include_gold": INCLUDE_GOLD,
+        "n_samples": _clamp_n_samples(n_samples),
+    }
+
+
+def _grade_function(label: str, gpu: str):
+    def run(
+        model_labels: list[str],
+        question_ids: list[str],
+        force: bool = False,
+        batch_size: int | None = None,
+        n_samples: int = DEFAULT_N_SAMPLES,
+    ) -> dict:
+        return _grade_one_lalm(
+            label,
+            model_labels=model_labels,
+            question_ids=question_ids,
+            force=force,
+            batch_size=batch_size,
+            n_samples=n_samples,
+        )
+
+    # Modal rejects nested @app.function unless serialized=True (cloudpickle
+    # from this process into the CUDA image). Give the worker a global
+    # __qualname__ and bind it on the module so FILE load works. Dots must
+    # go too: ``qwen2.5-omni-7b`` → ``grade_qwen2.5_omni_7b`` looks like a
+    # class method (``is_method_fn``) and raises InvalidError at import.
+    name = f"grade_{label.replace('-', '_').replace('.', '_')}"
+    run.__name__ = name
+    run.__qualname__ = name
+    fn = app.function(
+        image=large_mm_image,
+        gpu=gpu,
+        name=f"grade-{label}",
+        **_SUITE_GRADE_KW,
+    )(run)
+    globals()[name] = fn
+    return fn
+
+
+_SUITE_GRADE_FNS = {}
+_missing_grade = []
+for _label in ROUND_ROBIN_SUITE:
+    _gpu = _judge_gpu(_label)
+    if not _gpu:
+        _missing_grade.append(_label)
+        continue
+    _SUITE_GRADE_FNS[_label] = _grade_function(_label, _gpu)
+if _missing_grade:
+    raise RuntimeError(f"No GPU grade worker for judges: {_missing_grade}")
+
+
+def _spawn_judge_grade(label: str, **kwargs):
+    """Start one dedicated GPU container for ``label`` (does not wait)."""
+    fn = _SUITE_GRADE_FNS.get(label)
+    if fn is None:
+        raise SystemExit(f"No GPU worker for suite judge {label!r}")
+    call = fn.spawn(**kwargs)
+    print(f"[lalm-judge-no-gt] Spawned {label} call_id={call.object_id}")
+    return call
+
+
+def _print_grade_workload(
+    judge_labels: list[str],
+    remaining_by_judge: dict[str, dict[str, list[str]]],
+    gradees: list[str],
+    n_questions: int,
+    force: bool,
+) -> None:
+    """Log ungraded first-shot counts before any GPU worker is spawned."""
+    n_spawn = 0
+    print("Workload (first shot, sidecar resume):")
+    for label in judge_labels:
+        remaining = remaining_by_judge.get(label) or {}
+        n_left = (
+            n_questions * len(gradees)
+            if force
+            else sum(len(ids) for ids in remaining.values())
+        )
+        n_gradees = len(gradees) if force else len(remaining)
+        skip = n_left == 0
+        if not skip:
+            n_spawn += 1
+        action = "skip spawn" if skip else "spawn"
+        print(
+            f"  {label}: {n_left} ungraded first shots across "
+            f"{n_gradees}/{len(gradees)} gradee(s) → {action}"
+        )
+    print(
+        f"  {n_spawn} GPU container(s) to launch "
+        f"across {len(judge_labels)} judge(s)"
+    )
+
+
+def _stamp_planned_judges(
+    judge_labels: list[str],
+    primary: str | None,
+    n_samples: int = DEFAULT_N_SAMPLES,
+) -> None:
+    judging_volume.reload()
+    manifest_path = REMOTE_PACK_DIR / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = [
+        _planned_judge_entry(label, n_samples=n_samples) for label in judge_labels
+    ]
+    manifest = _stamp_manifest(
+        manifest,
+        judge_entries=entries,
+        primary=primary,
+        n_samples=n_samples,
+    )
+    write_json(manifest_path, manifest)
+    judging_volume.commit()
 
 
 @app.function(
@@ -688,6 +883,7 @@ def merge_pack(
     model_labels: list[str],
     judge_entries: list[dict],
     primary_judge: str | None = None,
+    n_samples: int = DEFAULT_N_SAMPLES,
 ) -> dict:
     """Fold judge sidecars into predictions.jsonl and stamp the manifest."""
     from grader import apply_judge_partials
@@ -713,7 +909,10 @@ def merge_pack(
     manifest_path = pack_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest = _stamp_manifest(
-        manifest, judge_entries=judge_entries, primary=primary_judge
+        manifest,
+        judge_entries=judge_entries,
+        primary=primary_judge,
+        n_samples=n_samples,
     )
     write_json(manifest_path, manifest)
     judging_volume.commit()
@@ -760,29 +959,44 @@ def run_aggregate() -> dict:
 
 @app.function(
     image=cpu_image,
-    timeout=24 * 60 * 60,
-    volumes={
-        VOLUME_MOUNT: volume,
-        RESULTS_MOUNT: results_volume,
-        JUDGING_MOUNT: judging_volume,
-    },
+    timeout=30 * 60,
+    volumes={JUDGING_MOUNT: judging_volume},
 )
 def run_pipeline(
     models: str = "all",
     judges: str = "all",
     force: bool = False,
     batch_size: int | None = None,
+    n_samples: int = DEFAULT_N_SAMPLES,
     skip_aggregate: bool = False,
+    merge_only: bool = False,
+    aggregate_only: bool = False,
 ) -> dict:
+    """Remote orchestrator: prepare workload, spawn GPU judges, return.
+
+    Does not wait on grading. GPU FunctionCalls keep a ``--detach`` app
+    alive; waiting here would pin a preemptible CPU container for hours
+    and re-spawn workers if that container is redelivered.
+
+    Workload is computed on CPU before any GPU container starts. Each
+    pending suite judge is spawned on its own GPU container; a multi-judge
+    run launches those containers in parallel. Fold sidecars with
+    ``--merge-only`` after workers finish.
+    """
+    from grader import compose_judge_key, remaining_grade_work
+
+    n_samples = _clamp_n_samples(n_samples)
     judge_labels = _parse_judge_list(judges)
     primary = None
-    from grader import compose_judge_key, remaining_grade_work
-    from mmar_models import MODEL_SPECS
-
     if judge_labels:
         primary = compose_judge_key(
             judge_labels[0], prompt=GRADE_PROMPT, include_gold=INCLUDE_GOLD
         )
+
+    if aggregate_only:
+        result = run_aggregate.remote()
+        print("[lalm-judge-no-gt] Done (aggregate-only):", result)
+        return {"aggregate_only": True, "aggregate": result}
 
     prep = prepare_pack.remote(models=models)
     print(
@@ -790,18 +1004,44 @@ def run_pipeline(
         f"models={prep.get('model_labels')} "
         f"n_questions={prep.get('n_questions')} "
         f"sources={prep.get('sources')} "
-        f"judges={judge_labels}"
+        f"judges={judge_labels} "
+        f"n_samples={n_samples} "
+        f"gpu_containers=per-judge parallel_launch=True"
     )
-
-    judging_volume.reload()
     gradees = list(prep["model_labels"])
     question_ids = list(prep["question_ids"])
-    handles: list[tuple[str, Any]] = []
-    skipped_results: list[dict] = []
+    judge_entries = [
+        _planned_judge_entry(label, n_samples=n_samples) for label in judge_labels
+    ]
+
+    def _merge() -> dict:
+        merge = merge_pack.remote(
+            model_labels=gradees,
+            judge_entries=judge_entries,
+            primary_judge=primary,
+            n_samples=n_samples,
+        )
+        print("[lalm-judge-no-gt] merged:", merge)
+        return merge
+
+    if merge_only:
+        merge = _merge()
+        agg = None if skip_aggregate else run_aggregate.remote()
+        if agg is not None:
+            print("[lalm-judge-no-gt] aggregated:", agg)
+        return {
+            "prepare": prep,
+            "merge_only": True,
+            "merge": merge,
+            "aggregate": agg,
+        }
+
+    judging_volume.reload()
+    remaining_by_judge: dict[str, dict[str, list[str]]] = {}
+    pending_labels: list[str] = []
+    skipped_labels: list[str] = []
+    remaining_gradees: dict[str, list[str]] = {}
     for label in judge_labels:
-        fn = _SUITE_GRADE_FNS.get(label)
-        if fn is None:
-            raise SystemExit(f"No GPU worker for suite judge {label!r}")
         key = compose_judge_key(
             label, prompt=GRADE_PROMPT, include_gold=INCLUDE_GOLD
         )
@@ -813,78 +1053,78 @@ def run_pipeline(
             shot_indices=(0,),
             sidecar=True,
         )
-        for gradee in gradees:
-            n_left = len(question_ids) if force else len(remaining.get(gradee) or [])
-            print(
-                f"[lalm-judge-no-gt] {label} -> {gradee}: "
-                f"{n_left}/{len(question_ids)} ungraded before GPU"
+        remaining_by_judge[label] = remaining
+        if force or remaining:
+            pending_labels.append(label)
+            remaining_gradees[label] = (
+                list(gradees) if force else [g for g in gradees if g in remaining]
             )
-        if not force and not remaining:
-            print(f"[lalm-judge-no-gt] skip GPU {label}: already graded")
-            model_id = (MODEL_SPECS.get(label) or {}).get("model_id") or label
-            skipped_results.append(
+        else:
+            skipped_labels.append(label)
+    _print_grade_workload(
+        judge_labels,
+        remaining_by_judge,
+        gradees,
+        n_questions=len(question_ids),
+        force=force,
+    )
+
+    results: list[dict] = [
+        {
+            "status": "already_complete",
+            "judge_label": label,
+            "model_id": _judge_model_id(label),
+            "judge_key": compose_judge_key(
+                label, prompt=GRADE_PROMPT, include_gold=INCLUDE_GOLD
+            ),
+            "gradees": gradees,
+        }
+        for label in skipped_labels
+    ]
+
+    _stamp_planned_judges(judge_labels, primary, n_samples=n_samples)
+
+    if pending_labels:
+        print(
+            f"[lalm-judge-no-gt] Launching {len(pending_labels)} dedicated "
+            f"GPU container(s)"
+            f"{' in parallel' if len(pending_labels) > 1 else ''}: "
+            f"{pending_labels}"
+        )
+        for label in pending_labels:
+            call = _spawn_judge_grade(
+                label,
+                model_labels=remaining_gradees[label],
+                question_ids=question_ids,
+                force=force,
+                batch_size=batch_size,
+                n_samples=n_samples,
+            )
+            results.append(
                 {
-                    "status": "skipped",
+                    "status": "spawned",
                     "judge_label": label,
-                    "model_id": model_id,
-                    "judge_key": key,
-                    "gradees": gradees,
-                    "by_model": {
-                        g: {"status": "skipped", "n_shots_graded": 0} for g in gradees
-                    },
+                    "call_id": call.object_id,
+                    "gradees": remaining_gradees[label],
                 }
             )
-            continue
-        remaining_labels = (
-            list(gradees) if force else [g for g in gradees if g in remaining]
-        )
-        print(f"[lalm-judge-no-gt] spawning {label} models={remaining_labels}")
-        handles.append(
-            (
-                label,
-                fn.spawn(
-                    label,
-                    model_labels=remaining_labels,
-                    question_ids=question_ids,
-                    force=force,
-                    batch_size=batch_size,
-                ),
-            )
-        )
+        return {
+            "prepare": prep,
+            "grade": results,
+            "pending_labels": pending_labels,
+            "skipped_labels": skipped_labels,
+        }
 
-    grade_results: list[dict] = []
-    judge_entries: list[dict] = []
-
-    def _record_grade(label: str, result: dict) -> None:
-        grade_results.append(result)
-        print(f"[lalm-judge-no-gt] {label}:", result)
-        judge_entries.append(
-            {
-                "label": result.get("judge_key"),
-                "judge_key": result.get("judge_key"),
-                "model_id": result.get("model_id") or label,
-                "prompt": GRADE_PROMPT,
-                "include_gold": INCLUDE_GOLD,
-            }
-        )
-
-    for result in skipped_results:
-        _record_grade(str(result.get("judge_label") or ""), result)
-    for label, handle in handles:
-        _record_grade(label, handle.get())
-
-    merge = merge_pack.remote(
-        model_labels=gradees,
-        judge_entries=judge_entries,
-        primary_judge=primary,
-    )
-    print("[lalm-judge-no-gt] merged:", merge)
+    print("[lalm-judge-no-gt] All requested judges already complete; merging.")
+    merge = _merge()
     agg = None if skip_aggregate else run_aggregate.remote()
     if agg is not None:
         print("[lalm-judge-no-gt] aggregated:", agg)
     return {
         "prepare": prep,
-        "grade": grade_results,
+        "grade": results,
+        "pending_labels": pending_labels,
+        "skipped_labels": skipped_labels,
         "merge": merge,
         "aggregate": agg,
     }
@@ -896,9 +1136,12 @@ def main(
     judges: str = "all",
     force: bool = False,
     batch_size: int | None = None,
+    n_samples: int = DEFAULT_N_SAMPLES,
     skip_aggregate: bool = False,
+    merge_only: bool = False,
+    aggregate_only: bool = False,
 ) -> None:
-    """Materialize first shots, grade with 3-sample LALM majority, aggregate.
+    """Materialize first shots, spawn one GPU per LALM judge, return.
 
     Args:
         models: Comma-separated test-taker labels, or ``all``.
@@ -908,22 +1151,41 @@ def main(
         force: Replace existing verdicts for these judge keys. Without
             this flag, already-graded first shots are skipped.
         batch_size: Concurrent sequence budget (default: the judge's
-            ``max_num_seqs``). Prompt batch is ``batch_size // 3``.
-        skip_aggregate: Skip difficulty.jsonl / scores.json.
+            ``max_num_seqs``). Prompt batch is ``batch_size // n_samples``.
+        n_samples: Judge completions per answer (default 1). ``1`` is a
+            single verdict; ``3`` restores majority vote.
+        skip_aggregate: Skip difficulty.jsonl / scores.json when merging.
+        merge_only: Fold existing sidecars into predictions.jsonl; do not
+            spawn GPU workers.
+        aggregate_only: Skip prepare and grading; only build
+            difficulty.jsonl / scores.json from existing predictions.
     """
-    handle = run_pipeline.spawn(
+    # Remote prepare+spawn so ``--detach`` keeps GPU FunctionCalls after
+    # this process exits. Do not wait on workers here.
+    out = run_pipeline.spawn(
         models=models,
         judges=judges,
         force=force,
         batch_size=batch_size,
+        n_samples=n_samples,
         skip_aggregate=skip_aggregate,
-    )
-    dashboard = app.get_dashboard_url()
-    if dashboard:
-        print(f"[lalm-judge-no-gt] pipeline started (detached): {dashboard}")
-    else:
-        print("[lalm-judge-no-gt] pipeline started (detached)")
-    print(f"[lalm-judge-no-gt] call id: {handle.object_id}")
+        merge_only=merge_only,
+        aggregate_only=aggregate_only,
+    ).get()
+
+    pending = out.get("pending_labels") or []
+    if pending:
+        print(f"Spawned {len(pending)} GPU worker(s): {pending}")
+        print(
+            "Use ``modal run --detach``; without it this process exiting "
+            "stops the ephemeral app and kills those workers. "
+            "Watch progress in the Modal dashboard."
+        )
+        print(
+            "After GPU workers finish, fold sidecars with:\n"
+            "  uv run modal run judge-quality/run_lalm_judge_no_gt.py --merge-only"
+        )
+    print("Orchestrator:", out)
 
 
 if __name__ == "__main__":
