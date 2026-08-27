@@ -10,7 +10,7 @@ Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
   - music-flamingo: vLLM 0.24 AudioFlamingo3 (HF fallback)
   - mimo-audio-7b: vLLM-Omni 0.24
-  - step-audio-2-mini-think: HF StepAudio2 (official examples-think.py text path)
+  - step-audio-2-mini-think: vLLM-Omni 0.26 thinker-only (step_audio_2_asr)
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
   - qwen3-omni: vLLM 0.28 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
   - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
@@ -83,204 +83,15 @@ from modal_cache import (
     DEFAULT_MMAR_META,
     MMAR_FREEFORM_THINKING_MOUNT,
     VOLUME_MOUNT,
-    VLLM_WHEEL_INDEX,
     hf_secret,
     mmar_freeform_thinking_volume,
     volume,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent
-_DEPLOY_MOUNT = "/root/deploy"
+from modal_images import EVAL_IMAGES, cpu_image
 
 DEFAULT_OUTPUT_DIR = MMAR_FREEFORM_THINKING_MOUNT
 DEFAULT_N_SHOTS = 5
 DEFAULT_SEED = 42
-
-# ---------------------------------------------------------------------------
-# Images
-# ---------------------------------------------------------------------------
-# Modal rule: after any ``add_local_*``, no further build steps (apt/pip/run/env).
-# Put installs + env first; mount local sources last.
-
-_SHARED_SOURCES = (
-    "modal_cache",
-    "mmar_common",
-    "audio_flamingo_runtime",
-    "aggregate",
-    "mmar_models",
-)
-
-
-def _mount_local_sources(image: modal.Image) -> modal.Image:
-    """Attach Python modules + Omni deploy YAML (must be last image steps)."""
-    return image.add_local_python_source(*_SHARED_SOURCES).add_local_dir(
-        str(REPO_ROOT / "deploy"), remote_path=_DEPLOY_MOUNT
-    )
-
-
-_VLLM_CACHE_ENV = {
-    "HF_XET_HIGH_PERFORMANCE": "1",
-    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-}
-
-# AF-Next / large multimodal: keep EngineCore in-process. Qwen3-Omni's
-# profile_run hits a meta/cuda device mismatch under multiprocess EngineCore
-# (Tensor on device meta is not on the expected device cuda:0). AF-Next also
-# needs in-process for its symlink model-view load path.
-_INPROC_VLLM_ENV = {
-    **_VLLM_CACHE_ENV,
-    "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-}
-
-
-def _cuda_base_image(python_version: str = "3.12") -> modal.Image:
-    return (
-        modal.Image.from_registry(
-            "nvidia/cuda:12.8.0-devel-ubuntu22.04",
-            add_python=python_version,
-        )
-        .entrypoint([])
-        .apt_install("ffmpeg", "git")
-    )
-
-
-# AF-Next: vLLM 0.24 MusicFlamingo (+ HF fallback deps if weight load fails).
-af_next_image = _mount_local_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "vllm==0.24.0",
-        "transformers>=5.5.3",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate>=1.14.0",
-        "soxr",
-        "torch",
-        "torchaudio",
-        "peft>=0.15.2",
-        "safetensors>=0.8.0",
-    )
-    .env(_INPROC_VLLM_ENV)
-)
-
-# MiMo: vLLM-Omni on the 0.24 line.
-omni_image = _mount_local_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "vllm==0.24.0",
-        "vllm-omni==0.24.0",
-        "transformers>=5.5.3",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate==1.12.0",
-        "einops",
-        "torchaudio",
-        "onnxruntime",
-    )
-    .env(_VLLM_CACHE_ENV)
-)
-
-# Step-Audio-2-mini-Think: official HF StepAudio2 (no vLLM-Omni).
-step_audio_image = _mount_local_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "torch==2.7.1",
-        "torchaudio==2.7.1",
-        "transformers==4.49.0",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate==1.12.0",
-        "einops",
-        "onnxruntime",
-        extra_index_url="https://download.pytorch.org/whl/cu128",
-        extra_options="--index-strategy unsafe-best-match",
-    )
-    .run_commands(
-        "git clone --depth 1 https://github.com/stepfun-ai/Step-Audio2.git /opt/Step-Audio2"
-    )
-    .env({**_VLLM_CACHE_ENV, "PYTHONPATH": "/opt/Step-Audio2"})
-)
-
-# InteractiveOmni: newer vLLM transformers-audio backend + HF chat fallback.
-interactive_omni_image = _mount_local_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "vllm==0.28.0",
-        "transformers>=5.5.3",
-        "torch",
-        "torchaudio",
-        "torchvision",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "safetensors>=0.8.0",
-        "einops",
-        "decord",
-        "onnxruntime",
-        "diffusers",
-        "Pillow",
-        "omegaconf",
-        "scipy",
-        "timm",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate>=1.14.0",
-        extra_index_url=VLLM_WHEEL_INDEX,
-    )
-    .env(_VLLM_CACHE_ENV)
-)
-
-# Qwen3-Omni thinker + Voxtral Small (A100-80GB); needs mistral-common[audio] + PyAV.
-# Install E=128,N=768 fused-MoE Triton config under both A100 device names
-# Modal may assign (PCIe or SXM4). vLLM 0.28 ships no A100 variant for this
-# shape — use H200 bf16 as the best available stand-in vs untuned defaults.
-_FUSED_MOE_CONFIG_CMD = (
-    "D=/usr/local/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs && "
-    "SRC=\"$D/E=128,N=768,device_name=NVIDIA_H200.json\" && "
-    "if [ ! -f \"$SRC\" ]; then echo \"fused_moe: no H200 config, skipping\"; "
-    "else "
-    "for name in NVIDIA_A100_80GB_PCIe NVIDIA_A100-SXM4-80GB; do "
-    "DST=\"$D/E=128,N=768,device_name=$name.json\"; "
-    "cp -n \"$SRC\" \"$DST\" 2>/dev/null || cp \"$SRC\" \"$DST\"; "
-    "echo \"fused_moe: installed $name from H200\"; "
-    "done; fi"
-)
-large_mm_image = _mount_local_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "vllm[audio]==0.28.0",
-        "transformers>=5.5.3",
-        "mistral-common[audio]",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "soxr",
-        "av",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate>=1.14.0",
-        "torch",
-        "torchaudio",
-        extra_index_url=VLLM_WHEEL_INDEX,
-    )
-    .run_commands(_FUSED_MOE_CONFIG_CMD)
-    .env(_INPROC_VLLM_ENV)
-)
-
-# Lightweight CPU image for manifest / question-id helpers.
-cpu_image = _mount_local_sources(
-    modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-        "numpy", "tqdm>=4.67.0"
-    )
-)
 
 app = modal.App("exp-mmar-question-difficulty")
 
@@ -620,14 +431,6 @@ def _run_model_eval(
             "mode": "freeform",
         }
 
-    # Persist torch.compile / Triton JIT caches across cold starts. Per-model
-    # subdirs avoid concurrent writers when models run in parallel.
-    compile_cache = VOLUME_MOUNT / "vllm" / model_label
-    compile_cache.mkdir(parents=True, exist_ok=True)
-    os.environ["VLLM_CACHE_ROOT"] = str(compile_cache)
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(compile_cache / "torchinductor")
-    print(f"[{model_label}] compile cache -> {compile_cache}")
-
     handle = load_model(model_label, args)
     try:
         volume.commit()
@@ -770,32 +573,15 @@ _EVAL_KW = dict(
     single_use_containers=True,
 )
 
-# Image for each known label (including specs currently commented out).
-# GPU comes from MODEL_SPECS[label]["gpu"].
-_EVAL_IMAGES: dict[str, modal.Image] = {
-    "af-next-think": af_next_image,
-    "music-flamingo": af_next_image,
-    "mimo-audio-7b": omni_image,
-    "step-audio-2-mini-think": step_audio_image,
-    "interactive-omni-8b": interactive_omni_image,
-    "qwen3-omni": large_mm_image,
-    "voxtral-small-24b": large_mm_image,
-    "qwen2.5-omni-7b": large_mm_image,
-    "phi-4-multimodal": large_mm_image,
-    "gemma-4-e4b": large_mm_image,
-    "qwen3-omni-instruct": large_mm_image,
-    "nemotron-3-nano-omni": large_mm_image,
-}
-
-
 def _eval_function(label: str, image: modal.Image, gpu: str):
     def run(**kwargs) -> dict:
         return _run_model_eval(model_label=label, **kwargs)
 
     # Modal rejects nested @app.function unless serialized=True (cloudpickle
     # from this process into the CUDA image). Give the worker a global
-    # __qualname__ and bind it on the module so FILE load works.
-    name = f"eval_{label.replace('-', '_')}"
+    # __qualname__ and bind it on the module so FILE load works. Dots must
+    # go too: a dotted __qualname__ looks like a class method.
+    name = f"eval_{label.replace('-', '_').replace('.', '_')}"
     run.__name__ = name
     run.__qualname__ = name
     fn = app.function(image=image, gpu=gpu, name=f"eval-{label}", **_EVAL_KW)(run)
@@ -806,7 +592,7 @@ def _eval_function(label: str, image: modal.Image, gpu: str):
 _EVAL_FNS = {}
 _missing_eval = []
 for _label in ALL_MODEL_LABELS:
-    _image = _EVAL_IMAGES.get(_label)
+    _image = EVAL_IMAGES.get(_label)
     _gpu = MODEL_SPECS[_label].get("gpu")
     if _image is None or not _gpu:
         _missing_eval.append(_label)

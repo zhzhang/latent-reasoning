@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import modal
@@ -41,4 +42,79 @@ hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKE
 VLLM_VERSION = "0.28.0"
 VLLM_GIT_SHA = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
 VLLM_WHEEL_INDEX = f"https://wheels.vllm.ai/{VLLM_GIT_SHA}"
+
+# Per-model torch.compile / Triton / nvcc / vLLM JIT artifacts. Subdirs avoid
+# concurrent writers when models run in parallel. Must be configured before
+# importing torch / vLLM / triton.
+COMPILE_CACHE_ROOT = VOLUME_MOUNT / "vllm"
+
+
+def compile_cache_dir(model_label: str) -> Path:
+    return COMPILE_CACHE_ROOT / model_label
+
+
+def configure_compile_cache(model_label: str) -> Path | None:
+    """Point inductor / Triton / nvcc / vLLM caches at a volume subdir.
+
+    Returns the cache root, or ``None`` when ``/cache`` is not writable
+    (local runs without the Modal volume). Later GPU containers call this
+    before ``load_model`` so they reuse artifacts from ``compile_cache.py``.
+    """
+    root = compile_cache_dir(model_label)
+    subdirs = {
+        "torchinductor": root / "torchinductor",
+        "triton": root / "triton",
+        "cuda": root / "cuda",
+        "torch_extensions": root / "torch_extensions",
+        "flashinfer": root / "flashinfer",
+    }
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for path in subdirs.values():
+            path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[{model_label}] compile cache {root} unavailable ({exc})")
+        return None
+
+    os.environ["VLLM_CACHE_ROOT"] = str(root)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(subdirs["torchinductor"])
+    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+    os.environ["TRITON_CACHE_DIR"] = str(subdirs["triton"])
+    os.environ["TRITON_HOME"] = str(subdirs["triton"])
+    os.environ["CUDA_CACHE_PATH"] = str(subdirs["cuda"])
+    os.environ["TORCH_EXTENSIONS_DIR"] = str(subdirs["torch_extensions"])
+    os.environ["FLASHINFER_CACHE_DIR"] = str(subdirs["flashinfer"])
+    os.environ["FLASHINFER_WORKSPACE_DIR"] = str(subdirs["flashinfer"])
+    print(f"[{model_label}] compile cache -> {root}")
+    return root
+
+
+def compile_cache_stats(model_label: str) -> dict[str, object]:
+    """File count + byte size of a model's compile-cache tree."""
+    root = compile_cache_dir(model_label)
+    n_files = 0
+    n_bytes = 0
+    if root.is_dir():
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                n_files += 1
+                try:
+                    n_bytes += (Path(dirpath) / name).stat().st_size
+                except OSError:
+                    pass
+    return {
+        "path": str(root),
+        "n_files": n_files,
+        "n_bytes": n_bytes,
+        "n_mib": round(n_bytes / (1024 * 1024), 1),
+    }
+
+
+def commit_compile_cache(model_label: str | None = None) -> None:
+    """Persist compile-cache writes on the ``latent-reasoning`` volume."""
+    tag = f"[{model_label}] " if model_label else ""
+    try:
+        volume.commit()
+    except Exception as exc:  # noqa: BLE001 — cache commit is best-effort
+        print(f"{tag}volume.commit compile cache failed: {exc}")
 

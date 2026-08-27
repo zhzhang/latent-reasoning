@@ -5,6 +5,9 @@ Judge prompt assembly is table-driven (``JUDGE_FORMATS``). Inspect gold
 ``{question}`` / ``{answer}`` / ``{prediction}``::
 
     python grader.py
+
+Per-judge wraps (the text ``grade_shot_batch`` would send) live in
+``render_judge_prompt``; dump them with ``python render_judge_prompts.py``.
 """
 
 from __future__ import annotations
@@ -1281,8 +1284,6 @@ def load_grader(
     model_id: str = DEFAULT_GRADER_MODEL_ID,
     args: SimpleNamespace | None = None,
 ) -> dict[str, Any]:
-    from vllm import LLM, SamplingParams
-
     suite_label = _suite_label_for(model_id)
     if suite_label is not None:
         from mmar_models import MODEL_SPECS, load_model
@@ -1301,24 +1302,35 @@ def load_grader(
             seed=0,
         )
         loaded = load_model(suite_label, ns)
-        llm = loaded["llm"]
-        tokenizer = llm.get_tokenizer()
+        llm = loaded.get("llm")
+        tokenizer = loaded.get("tokenizer")
+        getter = getattr(llm, "get_tokenizer", None) if llm is not None else None
+        if tokenizer is None and callable(getter):
+            tokenizer = getter()
         local_id = resolve_model_dir(
             spec["model_id"], getattr(ns, "local_model_dir", None)
         )
-        _ensure_tokenizer_chat_template(
-            tokenizer,
-            model_dir=local_id,
-            fallback=_CHATML_JINJA if "qwen" in suite_label else None,
+        if tokenizer is not None:
+            _ensure_tokenizer_chat_template(
+                tokenizer,
+                model_dir=local_id,
+                fallback=_CHATML_JINJA if "qwen" in suite_label else None,
+            )
+        sampling = _grade_sampling_for_engine(
+            spec.get("engine") or {}, spec.get("sampling") or {}
         )
-        sampling = _grade_sampling_for_engine(spec.get("engine") or {}, spec.get("sampling") or {})
         print(
             f"Freeform grader ready (suite): {suite_label} ({spec['model_id']}) "
             f"sampling={sampling}"
         )
         chat_kwargs = loaded.get("chat_kwargs") or {}
+        try:
+            from vllm import SamplingParams
+        except ImportError:
+            SamplingParams = None  # type: ignore[misc, assignment]
         return {
             "llm": llm,
+            "model": loaded.get("model"),
             "tokenizer": tokenizer,
             "model_id": spec["model_id"],
             "judge_label": suite_label,
@@ -1336,8 +1348,14 @@ def load_grader(
             "batch_size": int((spec.get("engine") or {}).get("max_num_seqs") or 32),
         }
 
+    from modal_cache import configure_compile_cache
+
     model_id = resolve_judge_model_id(model_id)
     label = judge_label(model_id)
+    configure_compile_cache(label)
+
+    from vllm import LLM, SamplingParams
+
     local_id = resolve_model_dir(model_id, None)
     engine = resolve_judge_engine(model_id, args)
     sampling = resolve_judge_sampling(model_id, args)
@@ -1744,6 +1762,194 @@ def _nongold_audio_chat_messages(
     return [{"role": "user", "content": content}]
 
 
+# ---------------------------------------------------------------------------
+# Prompt rendering (no tokenizer / GPU)
+# ---------------------------------------------------------------------------
+
+_CHAT_JUDGE_BACKENDS = frozenset({"vllm_chat", "hf_chat", "vllm_transformers"})
+_HF_AUDIO_TYPE_BACKENDS = frozenset({"hf_chat", "vllm_transformers"})
+_DEFAULT_RENDER_AUDIO = "/cache/data/mmar/audio/example.wav"
+
+
+def judge_render_labels() -> tuple[str, ...]:
+    """Labels ``render_judge_prompt`` can dump (suite, dedicated, API)."""
+    from mmar_api import API_SPECS
+    from mmar_models import ALL_MODEL_LABELS
+
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    def _add(items) -> None:
+        for item in items:
+            key = str(item or "").strip()
+            if key and key not in seen:
+                labels.append(key)
+                seen.add(key)
+
+    _add(ROUND_ROBIN_SUITE)
+    _add(JUDGE_SPECS)
+    _add(NONGOLD_AUDIO_PROMPT_TEMPLATES)
+    _add(ALL_MODEL_LABELS)
+    _add(API_SPECS)
+    return tuple(labels)
+
+
+def parse_judge_list(value: str) -> list[str]:
+    """Comma-separated judge labels, or ``all``."""
+    raw = [item.strip() for item in value.split(",") if item.strip()]
+    known = judge_render_labels()
+    if not raw or any(item.lower() == "all" for item in raw):
+        return list(known)
+    labels: list[str] = []
+    unknown: list[str] = []
+    for item in raw:
+        resolved = _resolve_render_judge_label(item)
+        if resolved is None:
+            unknown.append(item)
+        elif resolved not in labels:
+            labels.append(resolved)
+    if unknown:
+        raise ValueError(
+            f"Unknown judge label(s): {unknown}. "
+            f"Choose from {list(known)} or 'all'."
+        )
+    return labels
+
+
+def _resolve_render_judge_label(raw: str) -> str | None:
+    from mmar_api import resolve_api_judge_label
+    from mmar_models import MODEL_SPECS
+
+    key = str(raw or "").strip()
+    if not key:
+        return None
+    if key in judge_render_labels():
+        return key
+    api = resolve_api_judge_label(key)
+    if api:
+        return api
+    if key in MODEL_SPECS:
+        return key
+    alias = JUDGE_MODEL_ALIASES.get(key.lower())
+    if alias:
+        slug = judge_label(alias)
+        if slug in JUDGE_SPECS:
+            return slug
+    if key in JUDGE_SPECS:
+        return key
+    return _suite_label_for(key)
+
+
+def _judge_backend(label: str) -> str:
+    from mmar_api import API_SPECS, resolve_api_judge_label
+    from mmar_models import MODEL_SPECS
+
+    if label in MODEL_SPECS:
+        return str(MODEL_SPECS[label].get("backend") or "vllm")
+    api = resolve_api_judge_label(label)
+    if api:
+        return str((API_SPECS.get(api) or {}).get("backend") or "")
+    if label in JUDGE_SPECS:
+        return "vllm"
+    return "vllm"
+
+
+def judge_can_hear_audio(label: str) -> bool:
+    """True when this label can take an ``audio_included`` format."""
+    from mmar_api import is_api_judge, is_batch_api_judge
+    from mmar_models import MODEL_SPECS
+
+    if is_batch_api_judge(label):
+        return False
+    if is_api_judge(label):
+        return True
+    if label in ROUND_ROBIN_SUITE or label in NONGOLD_AUDIO_PROMPT_TEMPLATES:
+        return True
+    return label in MODEL_SPECS
+
+
+def render_judge_prompt(
+    label: str,
+    job: dict,
+    *,
+    prompt: str | None = None,
+    include_gold: bool | None = None,
+) -> str:
+    """Return the text ``grade_shot_batch`` would send for ``label``.
+
+    Audio is represented by the same placeholders used at grade time
+    (``<sound>``, ``<|audio_pad|>``, ``file://`` URLs, etc.). Chat backends
+    dump the messages ``LLM.chat`` receives; the model's Jinja chat template
+    is applied later by vLLM / HF. API judges send ``build_grade_prompt``
+    text and attach audio out of band when the format includes it.
+    """
+    from mmar_api import is_api_judge, is_batch_api_judge
+    from mmar_models import _format_chat_messages
+
+    resolved = _resolve_render_judge_label(label) or label
+    gold_flag = DEFAULT_INCLUDE_GOLD if include_gold is None else include_gold
+    fmt = get_judge_format(prompt, include_gold=gold_flag)
+    question = str(job.get("question") or "")
+    answer = str(job.get("answer") or "")
+    prediction = str(job.get("prediction") or "")
+    audio_raw = str(job.get("audio_path") or "") or _DEFAULT_RENDER_AUDIO
+    audio_path = Path(audio_raw)
+
+    if not fmt.audio_included:
+        text = fmt.as_text(
+            question=question, answer=answer, prediction=prediction
+        )
+        return text if text.endswith("\n") else f"{text}\n"
+
+    if is_batch_api_judge(resolved):
+        raise ValueError(
+            f"{resolved!r} is a Batch API judge and only supports text formats"
+        )
+    if not judge_can_hear_audio(resolved):
+        raise ValueError(
+            f"{resolved!r} cannot hear audio; use a suite or live API judge"
+        )
+
+    if is_api_judge(resolved):
+        text = fmt.as_text(
+            question=question, answer=answer, prediction=prediction
+        )
+        body = text if text.endswith("\n") else f"{text}\n"
+        return f"[audio attached]\n{body}"
+
+    backend = _judge_backend(resolved)
+    instructions = _adapt_judge_instructions(resolved, fmt.prompt)
+    if backend in _CHAT_JUDGE_BACKENDS:
+        audio_type = "audio" if backend in _HF_AUDIO_TYPE_BACKENDS else "audio_url"
+        messages = _nongold_audio_chat_messages(
+            instructions,
+            question,
+            prediction,
+            audio_path,
+            audio_type=audio_type,
+            closer=fmt.closer,
+            answer=answer,
+            field_templates=fmt.field_templates,
+        )
+        return _format_chat_messages(messages)
+    if backend == "vllm_voxtral":
+        fields = fmt.fields_with_closer(
+            question=question, answer=answer, prediction=prediction
+        )
+        return (
+            "role=user\n"
+            f"{instructions}\n"
+            f"<audio>{audio_path}</audio>\n"
+            f"{fields}\n"
+        )
+    fields = fmt.fields(
+        question=question, answer=answer, prediction=prediction
+    )
+    return _nongold_audio_prompt_string(
+        resolved, instructions, fields, fmt.closer
+    )
+
+
 def _grade_sampling(
     handle: dict[str, Any],
     *,
@@ -1968,6 +2174,10 @@ def _grade_shot_batch_audio(
 
     label = str(handle.get("suite_label") or handle.get("judge_label") or "")
     backend = str(handle.get("backend") or "vllm")
+    if label == "step-audio-2-mini-think" or backend == "hf_step":
+        raise ValueError(
+            "step-audio-2-mini-think is a test-taker, not a supported audio judge"
+        )
     sampling_rate = int(handle.get("sampling_rate") or 16000)
     fmt = get_judge_format(prompt, include_gold=include_gold)
     include_gold = fmt.include_gold
@@ -2005,10 +2215,6 @@ def _grade_shot_batch_audio(
         include_gold=include_gold,
     )
 
-    if backend == "hf_step":
-        raise ValueError(
-            "step-audio-2-mini-think (hf_step) is a test-taker, not a supported audio judge"
-        )
     if backend == "vllm_chat":
         chat_kwargs = dict(handle.get("chat_kwargs") or {})
         messages = [

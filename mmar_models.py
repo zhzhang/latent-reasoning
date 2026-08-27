@@ -114,38 +114,38 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     },
     # CONFIRMED
     # https://github.com/XiaomiMiMo/MiMo-Audio/blob/main/src/mimo_audio/mimo_audio.py#L134
-    "mimo-audio-7b": {
-        "model_id": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
-        "tokenizer_id": "XiaomiMiMo/MiMo-Audio-Tokenizer",
-        "gpu": "L40S",
-        "backend": "vllm_omni",
-        # Thinker-heavy Omni YAML: starve Token2Wav, max_num_seqs=16.
-        # Stage 1 cannot be omitted on Omni 0.24. CUDA graphs are off —
-        # capture copies CPU→CUDA in mimo_audio_llm.forward. Omni
-        # init_timeout is raised in load_mimo_audio (default 600s is tight).
-        "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
-        "sampling_rate": 24000,
-        # Native CoT when the assistant turn is prefilled with ``<think>``.
-        "native_thinking": True,
-        "enable_thinking": True,
-        # Official audio_understanding global sampler: T=0.3, top_p=0.95.
-        # repetition_penalty 1.1 is vLLM-Omni's mimo_audio deploy default
-        # (https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/mimo_audio.yaml).
-        "sampling": {
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.1,
-        },
-    },
+    # "mimo-audio-7b": {
+    #     "model_id": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
+    #     "tokenizer_id": "XiaomiMiMo/MiMo-Audio-Tokenizer",
+    #     "gpu": "L40S",
+    #     "backend": "vllm_omni",
+    #     # Thinker-heavy Omni YAML: starve Token2Wav, max_num_seqs=16.
+    #     # Stage 1 cannot be omitted on Omni 0.24. CUDA graphs are off —
+    #     # capture copies CPU→CUDA in mimo_audio_llm.forward. Omni
+    #     # init_timeout is raised in load_mimo_audio (default 600s is tight).
+    #     "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
+    #     "sampling_rate": 24000,
+    #     # Native CoT when the assistant turn is prefilled with ``<think>``.
+    #     "native_thinking": True,
+    #     "enable_thinking": True,
+    #     # Official audio_understanding global sampler: T=0.3, top_p=0.95.
+    #     # repetition_penalty 1.1 is vLLM-Omni's mimo_audio deploy default
+    #     # (https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/mimo_audio.yaml).
+    #     "sampling": {
+    #         "temperature": 0.3,
+    #         "top_p": 0.95,
+    #         "max_tokens": 2048,
+    #         "repetition_penalty": 1.1,
+    #     },
+    # },
     # CONFIRMED
-    # Official StepAudio2 HF path. vLLM-Omni 0.24 does not register
-    # ``step_audio_2`` and infers TP world size 4.
+    # Thinker-only Omni 0.26 (0.24 did not register step_audio_2).
     # https://github.com/stepfun-ai/Step-Audio2/blob/main/examples-think.py
     "step-audio-2-mini-think": {
         "model_id": "stepfun-ai/Step-Audio-2-mini-Think",
         "gpu": "L40S",
-        "backend": "hf_step",
+        "backend": "vllm_omni",
+        "deploy_config": str(DEPLOY_DIR / "step_audio_2_thinker.yaml"),
         "sampling_rate": 16000,
         "native_thinking": True,
         "enable_thinking": True,
@@ -406,7 +406,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm_chat",
         "engine": {
             "dtype": "auto",
-            "max_model_len": 210000,
+            "max_model_len": 8192,
             "max_num_seqs": 64,
             "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
@@ -422,12 +422,13 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "native_thinking": True,
         "enable_thinking": True,
         # Card: extra_body thinking_token_budget = reasoning_budget + grace_period.
-        "reasoning_budget": 16384,
-        "grace_period": 1024,
+        "reasoning_budget": 1024,
+        "reasoning_parser": "nemotron_v3",
+        "grace_period": 512,
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
-            "max_tokens": 20480,
+            "max_tokens": 4096,
             "repetition_penalty": 1.0,
         },
     },
@@ -458,6 +459,16 @@ def chat_kwargs_for(label: str) -> dict[str, Any]:
     if spec.get("reasoning_budget") is not None:
         template_kwargs["reasoning_budget"] = int(spec["reasoning_budget"])
     return {"chat_template_kwargs": template_kwargs}
+
+
+def engine_kwargs_for(label: str, args: SimpleNamespace) -> dict[str, Any]:
+    """vLLM ``LLM(...)`` kwargs: spec ``engine`` plus optional ``reasoning_parser``."""
+    spec = MODEL_SPECS.get(label) or {}
+    engine = _apply_engine_overrides(dict(spec.get("engine") or {}), args)
+    parser = spec.get("reasoning_parser")
+    if parser:
+        engine["reasoning_parser"] = str(parser)
+    return engine
 
 
 def parse_model_list(value: str) -> list[str]:
@@ -732,9 +743,7 @@ def render_prompt(
     if backend == "hf_step":
         return _step_audio_prompt(sample, ns)
     if backend == "vllm_omni":
-        if label != "mimo-audio-7b":
-            raise ValueError(f"No Omni prompt builder for {label}")
-        return ensure_assistant_think_open(label, _mimo_audio_prompt(sample, ns))
+        return ensure_assistant_think_open(label, _omni_prompt_fn(label)(sample, ns))
     if backend == "vllm_chat":
         if label == "interactive-omni-8b":
             messages = _interactive_omni_messages(sample, ns)
@@ -821,6 +830,46 @@ STEP_AUDIO_SYSTEM = (
     "reason step by step about what you hear, then answer accurately."
 )
 _STEP_AUDIO2_ROOT = Path("/opt/Step-Audio2")
+# Official stepaudio2.py splits at 25s so each encoder window stays under
+# n_ctx=1500 (~30s). MMAR's longest clip is 56s → 3 chunks.
+STEP_AUDIO_CHUNK_SECONDS = 25
+STEP_AUDIO_MAX_CHUNKS = 3
+
+
+def _step_audio_chunk_count(n_samples: int, sampling_rate: int) -> int:
+    chunk = int(sampling_rate) * STEP_AUDIO_CHUNK_SECONDS
+    if n_samples <= 0 or chunk <= 0:
+        return 1
+    return max(1, (int(n_samples) + chunk - 1) // chunk)
+
+
+def _step_audio_chunk_waveforms(
+    audio: Any, sampling_rate: int
+) -> list[tuple[Any, int]]:
+    """Split a 16 kHz waveform into official 25s encoder windows."""
+    import numpy as np
+
+    waveform = np.asarray(audio)
+    sr = int(sampling_rate)
+    chunk_samples = sr * STEP_AUDIO_CHUNK_SECONDS
+    n = int(waveform.shape[0]) if waveform.ndim >= 1 else 0
+    if n <= 0 or chunk_samples <= 0:
+        return [(waveform.astype(np.float32, copy=False), sr)]
+    chunks: list[tuple[Any, int]] = []
+    for start in range(0, n, chunk_samples):
+        piece = waveform[start : start + chunk_samples]
+        if piece.shape[0] == 0:
+            continue
+        chunks.append((piece.astype(np.float32, copy=False), sr))
+        if len(chunks) >= STEP_AUDIO_MAX_CHUNKS:
+            break
+    return chunks or [(waveform.astype(np.float32, copy=False), sr)]
+
+
+def _step_audio_placeholders(n_chunks: int) -> str:
+    """One Omni ``<audio_patch>`` per encoder chunk (processor expands each)."""
+    n = max(1, int(n_chunks))
+    return "<audio_start><audio_patch><audio_end>" * n
 
 
 def _step_audio_messages(sample: dict, args: SimpleNamespace | None = None) -> list[dict]:
@@ -840,15 +889,64 @@ def _step_audio_messages(sample: dict, args: SimpleNamespace | None = None) -> l
     ]
 
 
-def _step_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
-    """String wrap for viewers; generation uses ``_step_audio_messages``."""
+def _omni_prompt_fn(label: str) -> Callable[[dict, SimpleNamespace | None], str]:
+    """Offline Omni prompt builder for ``label``."""
+    if label == "mimo-audio-7b":
+        return _mimo_audio_prompt
+    if label == "step-audio-2-mini-think":
+        return _step_audio_prompt
+    raise ValueError(f"No Omni prompt builder for {label}")
+
+
+def _step_audio_prompt(
+    sample: dict,
+    args: SimpleNamespace | None = None,
+    *,
+    n_chunks: int | None = None,
+) -> str:
+    """Official StepAudio2 ``<|BOT|>`` wrap; Omni expands each ``<audio_patch>``.
+
+    Long clips are split into 25s encoder windows. Each window needs its own
+    ``<audio_start><audio_patch><audio_end>`` span (StepFun's intended
+    long-audio path). ``n_chunks`` should match the waveform split; when
+    omitted, duration is inferred from ``audio_path`` if the wav exists.
+    """
     ns = args or SimpleNamespace(prompt_mode="mc")
     question = _build_prompt(sample, ns)
+    chunks = (
+        _step_audio_n_chunks_for_sample(sample)
+        if n_chunks is None
+        else min(STEP_AUDIO_MAX_CHUNKS, max(1, int(n_chunks)))
+    )
+    patches = _step_audio_placeholders(chunks)
     return (
         f"<|BOT|>system\n{STEP_AUDIO_SYSTEM}<|EOT|>"
-        f"<|BOT|>human\n<audio_patch>{question}<|EOT|>"
+        f"<|BOT|>human\n{patches}{question}<|EOT|>"
         f"<|BOT|>assistant\n\n{ASSISTANT_THINK_OPEN}"
     )
+
+
+def _step_audio_n_chunks_for_sample(sample: dict) -> int:
+    path = sample.get("audio_path")
+    if not path:
+        return 1
+    wav = Path(str(path))
+    if not wav.is_file():
+        return 1
+    try:
+        import wave
+
+        with wave.open(str(wav), "rb") as handle:
+            n_frames = handle.getnframes()
+            rate = handle.getframerate()
+        if rate <= 0:
+            return 1
+        n_at_16k = int(round(n_frames * (16000 / rate)))
+        return min(
+            STEP_AUDIO_MAX_CHUNKS, _step_audio_chunk_count(n_at_16k, 16000)
+        )
+    except Exception:  # noqa: BLE001 — display/prompt fallback
+        return 1
 
 
 def _mimo_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
@@ -1089,18 +1187,32 @@ def _ensure_stepaudio2_path() -> None:
 
 
 def load_step_audio(args: SimpleNamespace):
-    _ensure_stepaudio2_path()
-    from stepaudio2 import StepAudio2
+    from vllm_omni.entrypoints.omni import Omni
 
     spec = MODEL_SPECS["step-audio-2-mini-think"]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    model = StepAudio2(local_id)
-    print(f"Step-Audio-2-mini-Think HF ready from {local_id}")
+    deploy_config = _resolve_deploy_path(
+        getattr(args, "deploy_config", None) or spec["deploy_config"]
+    )
+    omni = Omni(
+        model=local_id,
+        deploy_config=deploy_config,
+        trust_remote_code=True,
+        async_chunk=False,
+        init_timeout=1800,
+        stage_init_timeout=900,
+    )
+    n_stages = _count_deploy_stages(deploy_config)
+    print(
+        f"Step-Audio-2-mini-Think Omni ready from {local_id} "
+        f"deploy={deploy_config} stages={n_stages}"
+    )
     return {
-        "backend": "hf_step",
-        "model": model,
+        "backend": "vllm_omni",
+        "llm": omni,
         "sampling_rate": int(spec["sampling_rate"]),
         "parse_fn": parse_think_tagged_output,
+        "stages": n_stages,
     }
 
 
@@ -1388,9 +1500,8 @@ def load_gemma_4_e4b(args: SimpleNamespace):
 def load_nemotron_omni(args: SimpleNamespace):
     from vllm import LLM
 
-    spec = MODEL_SPECS["nemotron-3-nano-omni"]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    engine = _apply_engine_overrides(spec["engine"], args)
+    engine = engine_kwargs_for("nemotron-3-nano-omni", args)
     llm = LLM(model=local_id, **engine)
     print(f"Nemotron-3-Nano-Omni vLLM chat ready from {local_id} engine={engine}")
     return {
@@ -1457,16 +1568,37 @@ def _build_vllm_audio_inputs(
 ) -> tuple[list[dict], list[Any]]:
     prompts: list[dict] = []
     sampling: list[Any] = []
+    n_step_split = 0
     for sample, seed in zip(samples, seeds):
         audio = _load_audio_tuple(
             sample["audio_path"],
             sampling_rate,
             max_samples=max_audio_samples,
         )
+        mm_audio: Any = audio
+        if label == "step-audio-2-mini-think":
+            n_samples = int(audio[0].shape[0])
+            needed = _step_audio_chunk_count(n_samples, audio[1])
+            chunks = _step_audio_chunk_waveforms(audio[0], audio[1])
+            n_chunks = len(chunks)
+            if needed > STEP_AUDIO_MAX_CHUNKS:
+                print(
+                    f"[{label}] {Path(str(sample['audio_path'])).name} needs "
+                    f"{needed} {STEP_AUDIO_CHUNK_SECONDS}s chunks; "
+                    f"keeping first {n_chunks}"
+                )
+            if n_chunks > 1:
+                n_step_split += 1
+            mm_audio = chunks
+            prompt_text = ensure_assistant_think_open(
+                label, _step_audio_prompt(sample, args, n_chunks=n_chunks)
+            )
+        else:
+            prompt_text = ensure_assistant_think_open(label, prompt_fn(sample))
         prompts.append(
             {
-                "prompt": ensure_assistant_think_open(label, prompt_fn(sample)),
-                "multi_modal_data": {"audio": audio},
+                "prompt": prompt_text,
+                "multi_modal_data": {"audio": mm_audio},
             }
         )
         sampling.append(
@@ -1478,6 +1610,12 @@ def _build_vllm_audio_inputs(
                 stop_token_ids=stop_token_ids,
                 repetition_penalty=repetition_penalty,
             )
+        )
+    if n_step_split:
+        print(
+            f"[{label}] split {n_step_split}/{len(samples)} clips into "
+            f"{STEP_AUDIO_CHUNK_SECONDS}s encoder windows "
+            f"(max {STEP_AUDIO_MAX_CHUNKS} per prompt)"
         )
     return prompts, sampling
 
@@ -1610,10 +1748,8 @@ def generate_batch(
     if backend == "vllm_omni":
         if n_completions != 1:
             raise ValueError("vllm_omni requires expanded shot rows (n_completions=1)")
-        if label == "mimo-audio-7b":
-            prompt_fn = lambda s: _mimo_audio_prompt(s, args)  # noqa: E731
-        else:
-            raise ValueError(f"No Omni prompt builder for {label}")
+        omni_prompt = _omni_prompt_fn(label)
+        prompt_fn = lambda s: omni_prompt(s, args)  # noqa: E731
         prompts, sampling = _build_vllm_audio_inputs(
             label,
             samples,
@@ -1968,6 +2104,14 @@ _LOADERS = {
 def load_model(label: str, args: SimpleNamespace):
     if label not in _LOADERS:
         raise ValueError(f"No loader for model label {label!r}")
+    # Point inductor / Triton / vLLM JIT at the per-model volume cache before
+    # those libraries are imported inside the loader.
+    try:
+        from modal_cache import configure_compile_cache
+
+        configure_compile_cache(label)
+    except Exception as exc:  # noqa: BLE001 — local runs have no /cache volume
+        print(f"[{label}] compile cache setup skipped: {exc}")
     return _LOADERS[label](args)
 
 
@@ -2218,11 +2362,9 @@ def generate_raw_trace(
             label, handle, [sample], args, seeds=[seed], n_completions=1
         )[0]
         output_text = str(parsed.get("model_output") or "")
-        if label == "mimo-audio-7b":
-            prompt_fallback = _mimo_audio_prompt(sample, args)
-        else:
-            prompt_fallback = _build_prompt(sample, args)
-        prompt_fallback = ensure_assistant_think_open(label, prompt_fallback)
+        prompt_fallback = ensure_assistant_think_open(
+            label, _omni_prompt_fn(label)(sample, args)
+        )
         finish_reason = "vllm_omni"
 
     elif backend == "hf_af_next":

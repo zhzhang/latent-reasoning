@@ -36,6 +36,7 @@ from modal_cache import (
     RESULTS_MOUNT,
     VOLUME_MOUNT,
     VLLM_WHEEL_INDEX,
+    configure_compile_cache,
     hf_secret,
     results_volume,
     volume,
@@ -158,13 +159,13 @@ omni_image = _mount_local_sources(
     .env(_VLLM_CACHE_ENV)
 )
 
-# Step-Audio-2-mini-Think: official HF StepAudio2 (no vLLM-Omni).
+# Step-Audio-2-mini-Think: vLLM-Omni 0.26 (registers step_audio_2).
 step_audio_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
-        "torch==2.7.1",
-        "torchaudio==2.7.1",
-        "transformers==4.49.0",
+        "vllm==0.26.0",
+        "vllm-omni==0.26.0",
+        "transformers>=5.5.3",
         "huggingface-hub>=0.30.0",
         "librosa>=0.11.0",
         "soundfile",
@@ -172,14 +173,10 @@ step_audio_image = _mount_local_sources(
         "tqdm>=4.67.0",
         "accelerate==1.12.0",
         "einops",
+        "torchaudio",
         "onnxruntime",
-        extra_index_url="https://download.pytorch.org/whl/cu128",
-        extra_options="--index-strategy unsafe-best-match",
     )
-    .run_commands(
-        "git clone --depth 1 https://github.com/stepfun-ai/Step-Audio2.git /opt/Step-Audio2"
-    )
-    .env({**_VLLM_CACHE_ENV, "PYTHONPATH": "/opt/Step-Audio2"})
+    .env(_VLLM_CACHE_ENV)
 )
 
 interactive_omni_image = _mount_local_sources(
@@ -286,6 +283,7 @@ def _smoke_one(
     results_volume.reload()
 
     spec = MODEL_SPECS[model_label]
+    configure_compile_cache(model_label)
     item = _pick_item(question_id)
     args = SimpleNamespace(
         model_id=spec["model_id"],
@@ -326,7 +324,15 @@ def _smoke_one(
         f"enforce_eager={bool(enforce_eager)} sampling={sampling}"
     )
     handle = load_model(model_label, args)
+    try:
+        volume.commit()
+    except Exception as exc:  # noqa: BLE001 — cache commit is best-effort
+        print(f"[smoke {model_label}] volume.commit after load failed: {exc}")
     trace = generate_raw_trace(model_label, handle, item, args)
+    try:
+        volume.commit()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[smoke {model_label}] volume.commit after generate failed: {exc}")
 
     record = {
         "model_label": model_label,
@@ -369,8 +375,8 @@ def smoke_omni_a100(model_label: str, **kwargs) -> dict:
     return _smoke_one(model_label=model_label, **kwargs)
 
 
-@app.function(image=step_audio_image, gpu="A100-80GB", **_FN_KW)
-def smoke_step_a100(model_label: str, **kwargs) -> dict:
+@app.function(image=step_audio_image, gpu="L40S", **_FN_KW)
+def smoke_step(model_label: str, **kwargs) -> dict:
     return _smoke_one(model_label=model_label, **kwargs)
 
 
@@ -400,10 +406,10 @@ def _smoke_worker_for(label: str):
     gpu = str(spec.get("gpu") or "")
     if label in {"af-next-think", "music-flamingo"}:
         return smoke_af_l40s
+    if label == "step-audio-2-mini-think":
+        return smoke_step
     if backend == "vllm_omni":
         return smoke_omni_a100
-    if backend == "hf_step":
-        return smoke_step_a100
     if label == "interactive-omni-8b":
         return smoke_interactive_a100
     if gpu == "H100":

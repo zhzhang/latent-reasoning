@@ -1,38 +1,28 @@
 """One-off: LALM-as-judge, no gold, first shot, all 1000 MMAR questions.
 
 Grades ``shot_index == 0`` for every test-taker that has a freeform
-generation on the full MMAR set. Each audio suite judge
-(``grader.ROUND_ROBIN_SUITE``) uses the ``neutral_no_gt`` recipe: hears
-the clip, does not see gold. Default is one judge completion per
-answer (``--n-samples 1``). Pass ``--n-samples 3`` to restore
-3-sample majority vote (``SamplingParams(n=...)`` where the backend
-supports it).
+generation on the full MMAR set. Each active ``MODEL_SPECS`` audio model
+uses the ``neutral_no_gt`` recipe: hears the clip, does not see gold.
+Default is one judge completion per answer (``--n-samples 1``). Pass
+``--n-samples 3`` to restore 3-sample majority vote
+(``SamplingParams(n=...)`` where the backend supports it).
 
-Writes ``lalm-judge-no-gt/`` on the ``mmar-judging`` volume. Each suite
-judge gets its own GPU container (``single_use_containers``), same
-spawn pattern as ``run_experiment.py``: a short CPU orchestrator
-prepares remaining work, launches pending judges in parallel, and
-returns without waiting. Fold sidecars with ``--merge-only`` after
-workers finish (or on a re-run with nothing left to grade).
+Writes ``lalm-judge-no-gt/`` on the ``mmar-judging`` volume. Each judge
+gets its own GPU container (``single_use_containers``), same image and
+GPU as ``run_experiment.py`` (``modal_images.EVAL_IMAGES`` +
+``MODEL_SPECS[label]["gpu"]``). A short CPU orchestrator prepares
+remaining work, launches pending judges in parallel, and returns without
+waiting. Fold sidecars with ``--merge-only`` after workers finish (or on
+a re-run with nothing left to grade).
 
-Sources, later runs only add models that are not already present:
-
-    mmar-freeform-thinking                          # run_experiment.py (volume root)
-    outputs/mmar-freeform-thinking                  # local download of that volume
-    exp-mmar-question-difficulty/20260807T145000Z   # legacy 5 models × 1000 q
-    exp-mmar-question-difficulty/20260816T050944Z   # extra models × 784 q
-    mmar-freeform                                   # collated pack (API, …)
-    mmar-freeform-5-shot-thinking                   # API models (volume root)
-
-Question ids come from ``mmar-freeform-thinking/question_ids.json``
-(remote volume, then local download). The 1000-id list from the legacy
-full MMAR run is used only if that file is missing. Models that only
-exist on the 784-id packs are graded on the overlap.
+Generations come only from ``mmar-freeform-thinking`` (volume root, then
+the local ``outputs/mmar-freeform-thinking`` download). Question ids come
+from that pack's ``question_ids.json``. Other experiment dirs are ignored.
 
 Resume is the default: existing sidecar / predictions verdicts for a
-suite judge are kept, that judge's GPU is not started when nothing is
-left, and only ungraded examples are sent to the model. Pass
-``--force`` to replace them.
+judge are kept, that judge's GPU is not started when nothing is left,
+and only ungraded examples are sent to the model. Pass ``--force`` to
+replace them.
 
 Usage::
 
@@ -40,7 +30,7 @@ Usage::
     uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py --n-samples 3
     uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py --force
     uv run modal run --detach judge-quality/run_lalm_judge_no_gt.py \\
-      --judges qwen2.5-omni-7b,phi-4-multimodal
+      --judges gemma-4-e4b,nemotron-3-nano-omni
     uv run modal run judge-quality/run_lalm_judge_no_gt.py --merge-only
     uv run modal run judge-quality/run_lalm_judge_no_gt.py --aggregate-only
 """
@@ -60,33 +50,22 @@ if str(_REPO_ROOT) not in sys.path:
 import modal
 
 from aggregate import aggregate_difficulty, order_model_labels
-from grader import ROUND_ROBIN_SUITE
 from mmar_common import write_json, write_jsonl
+from mmar_models import ALL_MODEL_LABELS, MODEL_SPECS, parse_model_list
 from modal_cache import (
-    FREEFORM_THINKING_MOUNT,
     JUDGING_MOUNT,
     LOCAL_MMAR_FREEFORM_THINKING_MOUNT,
     MMAR_FREEFORM_THINKING_MOUNT,
-    RESULTS_MOUNT,
     VOLUME_MOUNT,
-    VLLM_WHEEL_INDEX,
-    freeform_thinking_volume,
     hf_secret,
     judging_volume,
     mmar_freeform_thinking_volume,
-    results_volume,
     volume,
 )
+from modal_images import EVAL_IMAGES, cpu_image as _CPU_IMAGE
 
 PACK_NAME = "lalm-judge-no-gt"
 REMOTE_PACK_DIR = JUDGING_MOUNT / PACK_NAME
-DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
-FULL_MMAR_RUN_ID = "20260807T145000Z"
-OPEN_ENDED_RUN_ID = "20260816T050944Z"
-COLLATED_PACK = FREEFORM_THINKING_MOUNT
-FREEFORM_PACK = RESULTS_MOUNT / "mmar-freeform"
-LOCAL_FREEFORM_DIR = _REPO_ROOT / "outputs" / "mmar-freeform"
-LOCAL_FREEFORM_MOUNT = Path("/local-mmar-freeform")
 LOCAL_FREEFORM_THINKING_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-thinking"
 
 GRADE_PROMPT = "neutral_no_gt"
@@ -117,81 +96,7 @@ DROP_SHOT_KEYS = (
 
 app = modal.App("run-lalm-judge-no-gt")
 
-
-def _cuda_base_image(python_version: str = "3.12") -> modal.Image:
-    return (
-        modal.Image.from_registry(
-            "nvidia/cuda:12.8.0-devel-ubuntu22.04",
-            add_python=python_version,
-        )
-        .entrypoint([])
-        .apt_install("ffmpeg", "git")
-    )
-
-
-def _mount_sources(image: modal.Image) -> modal.Image:
-    return image.add_local_python_source(
-        "modal_cache",
-        "mmar_common",
-        "mmar_api",
-        "audio_flamingo_runtime",
-        "aggregate",
-        "grader",
-        "mmar_models",
-    )
-
-
-_INPROC_VLLM_ENV = {
-    "HF_XET_HIGH_PERFORMANCE": "1",
-    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-    "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-}
-
-# Same fused-MoE stand-in as run_experiment.py / run_judges.py.
-_FUSED_MOE_CONFIG_CMD = (
-    "D=/usr/local/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs && "
-    "SRC=\"$D/E=128,N=768,device_name=NVIDIA_H200.json\" && "
-    "if [ ! -f \"$SRC\" ]; then echo \"fused_moe: no H200 config, skipping\"; "
-    "else "
-    "for name in NVIDIA_A100_80GB_PCIe NVIDIA_A100-SXM4-80GB; do "
-    "DST=\"$D/E=128,N=768,device_name=$name.json\"; "
-    "cp -n \"$SRC\" \"$DST\" 2>/dev/null || cp \"$SRC\" \"$DST\"; "
-    "echo \"fused_moe: installed $name from H200\"; "
-    "done; fi"
-)
-
-# Suite LALM judges load via mmar_models (same image/GPU as run_judges.py).
-large_mm_image = _mount_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "vllm[audio]==0.28.0",
-        "transformers>=5.5.3",
-        "mistral-common[audio]",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "soxr",
-        "av",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate>=1.14.0",
-        "torch",
-        "torchaudio",
-        extra_index_url=VLLM_WHEEL_INDEX,
-    )
-    .run_commands(_FUSED_MOE_CONFIG_CMD)
-    .env(_INPROC_VLLM_ENV)
-)
-
-cpu_image = _mount_sources(
-    modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-        "numpy", "tqdm>=4.67.0"
-    )
-)
-if LOCAL_FREEFORM_DIR.is_dir():
-    cpu_image = cpu_image.add_local_dir(
-        str(LOCAL_FREEFORM_DIR), remote_path=str(LOCAL_FREEFORM_MOUNT)
-    )
+cpu_image = _CPU_IMAGE
 if LOCAL_FREEFORM_THINKING_DIR.is_dir():
     cpu_image = cpu_image.add_local_dir(
         str(LOCAL_FREEFORM_THINKING_DIR),
@@ -274,24 +179,13 @@ def _iter_first_shots(predictions_path: Path, *, model: str) -> dict[str, dict[s
 
 
 def _source_model_dirs() -> list[tuple[str, Path]]:
-    """(source_tag, models_dir) in overlay order: first source wins per model."""
+    """Only ``mmar-freeform-thinking`` (remote volume, then local download)."""
     return [
         ("mmar-freeform-thinking", MMAR_FREEFORM_THINKING_MOUNT / "models"),
         (
             "local-mmar-freeform-thinking",
             LOCAL_MMAR_FREEFORM_THINKING_MOUNT / "models",
         ),
-        (
-            FULL_MMAR_RUN_ID,
-            DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "models",
-        ),
-        (
-            OPEN_ENDED_RUN_ID,
-            DEFAULT_OUTPUT_DIR / OPEN_ENDED_RUN_ID / "models",
-        ),
-        ("mmar-freeform", FREEFORM_PACK / "models"),
-        ("mmar-freeform-5-shot-thinking", COLLATED_PACK / "models"),
-        ("local-mmar-freeform", LOCAL_FREEFORM_MOUNT / "models"),
     ]
 
 
@@ -301,10 +195,6 @@ def _question_id_candidates() -> list[tuple[str, Path]]:
         (
             "local-mmar-freeform-thinking",
             LOCAL_MMAR_FREEFORM_THINKING_MOUNT / "question_ids.json",
-        ),
-        (
-            FULL_MMAR_RUN_ID,
-            DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json",
         ),
     ]
 
@@ -317,8 +207,7 @@ def _resolve_question_ids() -> tuple[list[str], str]:
             return ids, tag
     raise SystemExit(
         "No question_ids.json found on mmar-freeform-thinking "
-        f"(remote {MMAR_FREEFORM_THINKING_MOUNT} or local download) "
-        f"or legacy run {FULL_MMAR_RUN_ID}"
+        f"(remote {MMAR_FREEFORM_THINKING_MOUNT} or local download)"
     )
 
 
@@ -370,25 +259,10 @@ def _write_predictions(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def _parse_judge_list(raw: str) -> list[str]:
-    from grader import _suite_label_for
-
-    requested = [part.strip() for part in str(raw or "all").split(",") if part.strip()]
-    if not requested or requested == ["all"]:
-        return list(ROUND_ROBIN_SUITE)
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in requested:
-        label = _suite_label_for(item) or item
-        if label not in ROUND_ROBIN_SUITE:
-            raise SystemExit(
-                f"Unknown LALM judge {item!r}. Expected one of {list(ROUND_ROBIN_SUITE)}"
-            )
-        if label not in seen:
-            out.append(label)
-            seen.add(label)
-    if not out:
-        raise SystemExit("No LALM judges resolved")
-    return out
+    try:
+        return parse_model_list(raw)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _clamp_n_samples(raw: int | None) -> int:
@@ -453,9 +327,6 @@ def _stamp_manifest(
     image=cpu_image,
     timeout=30 * 60,
     volumes={
-        VOLUME_MOUNT: volume,
-        RESULTS_MOUNT: results_volume,
-        FREEFORM_THINKING_MOUNT: freeform_thinking_volume,
         MMAR_FREEFORM_THINKING_MOUNT: mmar_freeform_thinking_volume,
         JUDGING_MOUNT: judging_volume,
     },
@@ -463,8 +334,6 @@ def _stamp_manifest(
 def prepare_pack(models: str = "all") -> dict:
     """Copy first-shot freeform answers onto ``mmar-judging/lalm-judge-no-gt``."""
 
-    results_volume.reload()
-    freeform_thinking_volume.reload()
     mmar_freeform_thinking_volume.reload()
     judging_volume.reload()
 
@@ -546,7 +415,7 @@ def prepare_pack(models: str = "all") -> dict:
         "include_gold": INCLUDE_GOLD,
         "n_samples": DEFAULT_N_SAMPLES,
         "temperature": JUDGE_TEMPERATURE,
-        "suite_judges": list(ROUND_ROBIN_SUITE),
+        "suite_judges": list(ALL_MODEL_LABELS),
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
     }
@@ -702,7 +571,7 @@ def _grade_one_lalm(
 
 
 # ---------------------------------------------------------------------------
-# Modal grade workers (one GPU function per suite judge)
+# Modal grade workers (one GPU function per MODEL_SPECS label)
 # ---------------------------------------------------------------------------
 # single_use_containers keeps a GPU from being reused after that judge returns.
 
@@ -714,36 +583,9 @@ _SUITE_GRADE_KW = dict(
     single_use_containers=True,
 )
 
-# GPU for suite judges whose MODEL_SPECS entry is currently commented out.
-_JUDGE_GPU_FALLBACK = {
-    "qwen2.5-omni-7b": "L40S",
-    "phi-4-multimodal": "L40S",
-    "gemma-4-e4b": "L40S",
-    "qwen3-omni-instruct": "H100",
-    "nemotron-3-nano-omni": "H100",
-}
-_JUDGE_MODEL_ID_FALLBACK = {
-    "qwen2.5-omni-7b": "Qwen/Qwen2.5-Omni-7B",
-    "phi-4-multimodal": "microsoft/Phi-4-multimodal-instruct",
-    "qwen3-omni-instruct": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
-}
-
-
-def _judge_gpu(label: str) -> str | None:
-    from mmar_models import MODEL_SPECS
-
-    gpu = (MODEL_SPECS.get(label) or {}).get("gpu") or _JUDGE_GPU_FALLBACK.get(label)
-    return str(gpu) if gpu else None
-
 
 def _judge_model_id(label: str) -> str:
-    from mmar_models import MODEL_SPECS
-
-    return (
-        (MODEL_SPECS.get(label) or {}).get("model_id")
-        or _JUDGE_MODEL_ID_FALLBACK.get(label)
-        or label
-    )
+    return str((MODEL_SPECS.get(label) or {}).get("model_id") or label)
 
 
 def _planned_judge_entry(label: str, n_samples: int = DEFAULT_N_SAMPLES) -> dict:
@@ -762,7 +604,7 @@ def _planned_judge_entry(label: str, n_samples: int = DEFAULT_N_SAMPLES) -> dict
     }
 
 
-def _grade_function(label: str, gpu: str):
+def _grade_function(label: str, image: modal.Image, gpu: str):
     def run(
         model_labels: list[str],
         question_ids: list[str],
@@ -782,13 +624,12 @@ def _grade_function(label: str, gpu: str):
     # Modal rejects nested @app.function unless serialized=True (cloudpickle
     # from this process into the CUDA image). Give the worker a global
     # __qualname__ and bind it on the module so FILE load works. Dots must
-    # go too: ``qwen2.5-omni-7b`` → ``grade_qwen2.5_omni_7b`` looks like a
-    # class method (``is_method_fn``) and raises InvalidError at import.
+    # go too: a dotted __qualname__ looks like a class method.
     name = f"grade_{label.replace('-', '_').replace('.', '_')}"
     run.__name__ = name
     run.__qualname__ = name
     fn = app.function(
-        image=large_mm_image,
+        image=image,
         gpu=gpu,
         name=f"grade-{label}",
         **_SUITE_GRADE_KW,
@@ -799,12 +640,13 @@ def _grade_function(label: str, gpu: str):
 
 _SUITE_GRADE_FNS = {}
 _missing_grade = []
-for _label in ROUND_ROBIN_SUITE:
-    _gpu = _judge_gpu(_label)
-    if not _gpu:
+for _label in ALL_MODEL_LABELS:
+    _image = EVAL_IMAGES.get(_label)
+    _gpu = MODEL_SPECS[_label].get("gpu")
+    if _image is None or not _gpu:
         _missing_grade.append(_label)
         continue
-    _SUITE_GRADE_FNS[_label] = _grade_function(_label, _gpu)
+    _SUITE_GRADE_FNS[_label] = _grade_function(_label, _image, str(_gpu))
 if _missing_grade:
     raise RuntimeError(f"No GPU grade worker for judges: {_missing_grade}")
 
@@ -813,7 +655,7 @@ def _spawn_judge_grade(label: str, **kwargs):
     """Start one dedicated GPU container for ``label`` (does not wait)."""
     fn = _SUITE_GRADE_FNS.get(label)
     if fn is None:
-        raise SystemExit(f"No GPU worker for suite judge {label!r}")
+        raise SystemExit(f"No GPU worker for judge {label!r}")
     call = fn.spawn(**kwargs)
     print(f"[lalm-judge-no-gt] Spawned {label} call_id={call.object_id}")
     return call
@@ -935,8 +777,9 @@ def run_aggregate() -> dict:
     pack_dir = REMOTE_PACK_DIR
     if not pack_dir.is_dir():
         raise SystemExit(f"Pack not found: {pack_dir}")
-    result = aggregate_difficulty(pack_dir)
     manifest = json.loads((pack_dir / "manifest.json").read_text(encoding="utf-8"))
+    labels = [str(x) for x in (manifest.get("models") or []) if x]
+    result = aggregate_difficulty(pack_dir, model_labels=labels or None)
     scores = result.get("scores") or {}
     for key in (
         "scoring",
@@ -979,7 +822,7 @@ def run_pipeline(
     and re-spawn workers if that container is redelivered.
 
     Workload is computed on CPU before any GPU container starts. Each
-    pending suite judge is spawned on its own GPU container; a multi-judge
+    pending judge is spawned on its own GPU container; a multi-judge
     run launches those containers in parallel. Fold sidecars with
     ``--merge-only`` after workers finish.
     """
@@ -1145,9 +988,7 @@ def main(
 
     Args:
         models: Comma-separated test-taker labels, or ``all``.
-        judges: Comma-separated suite LALM labels, or ``all``
-            (``qwen2.5-omni-7b``, ``phi-4-multimodal``, ``gemma-4-e4b``,
-            ``qwen3-omni-instruct``, ``nemotron-3-nano-omni``).
+        judges: Comma-separated ``MODEL_SPECS`` labels, or ``all``.
         force: Replace existing verdicts for these judge keys. Without
             this flag, already-graded first shots are skipped.
         batch_size: Concurrent sequence budget (default: the judge's

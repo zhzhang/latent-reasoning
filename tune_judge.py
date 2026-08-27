@@ -266,11 +266,11 @@ def benchmark_variant(
     """Time one engine config over several concurrency levels."""
     import gc
 
-    from vllm import LLM, SamplingParams
-
+    from modal_cache import configure_compile_cache, commit_compile_cache
     from audio_flamingo_runtime import resolve_model_dir
     from grader import (
         build_grade_prompt,
+        judge_label,
         parse_grade_verdict,
         resolve_judge_model_id,
         resolve_judge_spec,
@@ -285,6 +285,9 @@ def benchmark_variant(
         )
 
     model_id = resolve_judge_model_id(model_id)
+    configure_compile_cache(judge_label(model_id))
+
+    from vllm import LLM, SamplingParams
     spec = resolve_judge_spec(model_id)
     engine = {
         **dict(spec["engine"]),
@@ -326,6 +329,7 @@ def benchmark_variant(
     init_secs = time.perf_counter() - init_start
     tokenizer = llm.get_tokenizer()
     print(f"[{variant}] engine init took {init_secs:.1f}s")
+    commit_compile_cache(judge_label(model_id))
 
     def _render(case: dict) -> str:
         user_text = build_grade_prompt(
@@ -348,6 +352,7 @@ def benchmark_variant(
     # Warm up kernels / JIT so the first timed batch is not penalized.
     warmup = SamplingParams(temperature=0.0, max_tokens=16, seed=0)
     llm.generate(prompts[:8], sampling_params=warmup, use_tqdm=False)
+    commit_compile_cache(judge_label(model_id))
 
     sizes = [int(x) for x in str(batch_sizes).split(",") if str(x).strip()]
     rows: list[dict] = []
