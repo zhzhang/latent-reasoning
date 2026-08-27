@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import re
 import shutil
 import tarfile
 import tempfile
@@ -481,9 +482,47 @@ def _compact_judge_entry(entry: Any) -> dict[str, Any] | None:
     return out
 
 
+_TOKEN_PIECE_RE = re.compile(
+    r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]"
+    r"|[A-Za-z0-9]+(?:'[A-Za-z]+)?|[^\s]",
+    re.UNICODE,
+)
+_GENERATED_TOKEN_ROLES = frozenset({"generated", "output", "assistant"})
+
+
+def _approx_n_tokens(text: str) -> int:
+    return len(_TOKEN_PIECE_RE.findall(text or ""))
+
+
+def _count_raw_token_list(raw: Any) -> int | None:
+    if not isinstance(raw, list) or not raw:
+        return None
+    if all(isinstance(token, int) for token in raw):
+        return len(raw)
+    if all(isinstance(token, dict) for token in raw):
+        generated = [
+            token
+            for token in raw
+            if str(token.get("role") or "").lower() in _GENERATED_TOKEN_ROLES
+        ]
+        return len(generated) if generated else len(raw)
+    return len(raw)
+
+
+def _count_generated_tokens(shot: dict[str, Any]) -> int:
+    counted = _count_raw_token_list(shot.get("raw_tokens"))
+    if counted is not None:
+        return counted
+    stored = shot.get("n_tokens")
+    if isinstance(stored, int) and stored >= 0:
+        return stored
+    return _approx_n_tokens(str(shot.get("model_output") or ""))
+
+
 def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
     out = {key: shot.get(key) for key in SHOT_KEYS if key in shot}
     out["shot_index"] = _shot_index(shot)
+    out["n_tokens"] = _count_generated_tokens(shot)
     judges = shot.get("judges")
     if isinstance(judges, dict) and judges:
         compacted: dict[str, dict[str, Any]] = {}
@@ -1874,16 +1913,23 @@ function shotJudgeAccordions(shot) {
   }).join("");
 }
 
+function fmtTokens(n) {
+  if (n === null || n === undefined || n === "") return "";
+  const num = Number(n);
+  if (!Number.isFinite(num)) return "";
+  return `${num.toLocaleString()} tok`;
+}
+
 function shotBlock(shot) {
   const parsed = shot.answer_prediction || "";
-  const thinkingSource = (
-    shot.thinking_prediction && shot.thinking_prediction !== parsed
-      ? shot.thinking_prediction
-      : (shot.model_output && shot.model_output !== parsed ? shot.model_output : "")
-  );
-  const think = thinkingSource
-    ? `<details class="accordion"><summary><span>Thinking</span></summary>
-        <div class="accordion-body"><pre>${escapeHtml(thinkingSource)}</pre></div>
+  const generated = shot.model_output || "";
+  const tokLabel = fmtTokens(shot.n_tokens);
+  const tokChip = tokLabel
+    ? `<span class="chip" title="Generated tokens">${escapeHtml(tokLabel)}</span>`
+    : "";
+  const gen = generated
+    ? `<details class="accordion"><summary><span>Generated${tokLabel ? ` · ${escapeHtml(tokLabel)}` : ""}</span></summary>
+        <div class="accordion-body"><pre>${escapeHtml(generated)}</pre></div>
        </details>`
     : "";
   const disagree = shotDisagreement(shot);
@@ -1893,11 +1939,12 @@ function shotBlock(shot) {
   return `<div class="shot">
     <div class="shot-head">
       <span>shot ${shot.shot_index ?? "—"}</span>
+      ${tokChip}
       ${disagreeChip}
     </div>
     ${shotJudgeChips(shot)}
     ${parsed ? `<pre>${escapeHtml(parsed)}</pre>` : `<p class="muted">No parsed answer.</p>`}
-    ${think}
+    ${gen}
     ${shotJudgeAccordions(shot)}
   </div>`;
 }

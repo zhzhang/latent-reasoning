@@ -201,6 +201,20 @@ def filter_accuracy_json(path: Path, drop_models: set[str]) -> None:
     from grader import ACCURACY_META_KEYS, JUDGE_FORMATS
 
     known = set(JUDGE_FORMATS)
+
+    def _filter_mode_tables(tables: dict) -> dict:
+        out: dict = {}
+        for mode, bucket in tables.items():
+            if isinstance(bucket, dict) and (mode in known or bucket):
+                out[mode] = {
+                    key: value
+                    for key, value in bucket.items()
+                    if not is_dropped_judge(str(key), drop_models)
+                }
+            else:
+                out[mode] = bucket
+        return out
+
     for mode, bucket in list(payload.items()):
         if mode in ACCURACY_META_KEYS:
             continue
@@ -210,6 +224,14 @@ def filter_accuracy_json(path: Path, drop_models: set[str]) -> None:
                 for key, value in bucket.items()
                 if not is_dropped_judge(str(key), drop_models)
             }
+    for slice_key in ("by_category", "by_modality"):
+        slices = payload.get(slice_key)
+        if not isinstance(slices, dict):
+            continue
+        payload[slice_key] = {
+            name: _filter_mode_tables(tables) if isinstance(tables, dict) else tables
+            for name, tables in slices.items()
+        }
     write_json(path, payload)
 
 

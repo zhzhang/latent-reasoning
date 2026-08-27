@@ -25,6 +25,7 @@ from mmar_common import (
     ensure_judge_schema,
     extract_freeform_answer,
     judge_label,
+    prefers_markdown_answer_line,
     recompute_multi_judge_scores,
     select_grade_question_ids,
     write_jsonl,
@@ -144,6 +145,8 @@ ACCURACY_META_KEYS = frozenset(
         "n_questions",
         "epsilon",
         "modes",
+        "by_category",
+        "by_modality",
     }
 )
 
@@ -981,14 +984,17 @@ def _normalize_grade_answer(text: str) -> str:
     return str(text or "").strip().lower()
 
 
-def _shot_prediction_text(shot: dict) -> str:
+def _shot_prediction_text(shot: dict, *, model_label: str | None = None) -> str:
     """Extracted answer shown to the judge; never includes text before last ``</think>``."""
     raw = str(shot.get("model_output") or "")
     extracted = str(shot.get("answer_prediction") or "")
     source = (raw or extracted).strip()
     if not source:
         return ""
-    return extract_freeform_answer(source) or extracted or raw
+    markdown = prefers_markdown_answer_line(model_label)
+    return (
+        extract_freeform_answer(source, markdown_answer=markdown) or extracted or raw
+    )
 
 
 def _shot_judge_entry(shot: dict, judge_key: str) -> dict | None:
@@ -2316,6 +2322,7 @@ def grade_predictions_file(
         }
 
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
+    gradee_label = predictions_path.parent.name
     fmt = get_judge_format(prompt, include_gold=include_gold)
     include_gold = fmt.include_gold
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
@@ -2385,7 +2392,7 @@ def grade_predictions_file(
                     _grade_reuse_key(
                         question,
                         answer,
-                        _shot_prediction_text(shot),
+                        _shot_prediction_text(shot, model_label=gradee_label),
                         include_gold=include_gold,
                     ),
                     dict(entry),
@@ -2411,7 +2418,7 @@ def grade_predictions_file(
                 continue
             if not force and not _shot_needs_grade(shot, key):
                 continue
-            prediction = _shot_prediction_text(shot)
+            prediction = _shot_prediction_text(shot, model_label=gradee_label)
             cache_key = _grade_reuse_key(
                 question, answer, prediction, include_gold=include_gold
             )

@@ -451,7 +451,7 @@ def _ensure_question_ids(
     seed: int,
 ) -> list[str]:
     ids_path = run_dir / "question_ids.json"
-    full_ids = _mmar_ids_with_audio(meta_path, data_root)
+    full_ids = _mmar_ids_with_audio(meta_path, data_root)[:5]  # TEMP: revert to resume the rest
     if not full_ids:
         raise SystemExit(f"No MMAR items with audio under {data_root}")
 
@@ -740,11 +740,9 @@ def _run_model_eval(
 
 
 # ---------------------------------------------------------------------------
-# Modal eval workers (one GPU container pool per model_label)
+# Modal eval workers (one GPU function per model_label)
 # ---------------------------------------------------------------------------
-# Parametrized Cls: each model_label is its own autoscaler pool even when
-# models share an image / GPU type. single_use_containers keeps a GPU from
-# being reused after that model returns.
+# single_use_containers keeps a GPU from being reused after that model returns.
 
 _EVAL_KW = dict(
     timeout=12 * 60 * 60,
@@ -754,68 +752,50 @@ _EVAL_KW = dict(
     single_use_containers=True,
 )
 
-
-@app.cls(image=af_next_image, gpu="L40S", **_EVAL_KW)
-class EvalAfNext:
-    model_label: str = modal.parameter()
-
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
-
-
-@app.cls(image=omni_image, gpu="A100-80GB", **_EVAL_KW)
-class EvalMimo:
-    model_label: str = modal.parameter()
-
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
-
-
-@app.cls(image=step_audio_image, gpu="A100-80GB", **_EVAL_KW)
-class EvalStepAudio:
-    model_label: str = modal.parameter()
-
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
+# Image for each known label (including specs currently commented out).
+# GPU comes from MODEL_SPECS[label]["gpu"].
+_EVAL_IMAGES: dict[str, modal.Image] = {
+    "af-next-think": af_next_image,
+    "music-flamingo": af_next_image,
+    "mimo-audio-7b": omni_image,
+    "step-audio-2-mini-think": step_audio_image,
+    "interactive-omni-8b": interactive_omni_image,
+    "qwen3-omni": large_mm_image,
+    "voxtral-small-24b": large_mm_image,
+    "qwen2.5-omni-7b": large_mm_image,
+    "phi-4-multimodal": large_mm_image,
+    "gemma-4-e4b": large_mm_image,
+    "qwen3-omni-instruct": large_mm_image,
+    "nemotron-3-nano-omni": large_mm_image,
+}
 
 
-@app.cls(image=interactive_omni_image, gpu="A100-80GB", **_EVAL_KW)
-class EvalInteractiveOmni:
-    model_label: str = modal.parameter()
+def _eval_function(label: str, image: modal.Image, gpu: str):
+    def run(**kwargs) -> dict:
+        return _run_model_eval(model_label=label, **kwargs)
 
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
-
-
-@app.cls(image=large_mm_image, gpu="A100-80GB", **_EVAL_KW)
-class EvalLargeMmA100:
-    model_label: str = modal.parameter()
-
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
+    # Modal rejects nested @app.function unless serialized=True (cloudpickle
+    # from this process into the CUDA image). Give the worker a global
+    # __qualname__ and bind it on the module so FILE load works.
+    name = f"eval_{label.replace('-', '_')}"
+    run.__name__ = name
+    run.__qualname__ = name
+    fn = app.function(image=image, gpu=gpu, name=f"eval-{label}", **_EVAL_KW)(run)
+    globals()[name] = fn
+    return fn
 
 
-@app.cls(image=large_mm_image, gpu="L40S", **_EVAL_KW)
-class EvalLargeMmL40S:
-    model_label: str = modal.parameter()
-
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
-
-
-@app.cls(image=large_mm_image, gpu="H100", **_EVAL_KW)
-class EvalLargeMmH100:
-    model_label: str = modal.parameter()
-
-    @modal.method()
-    def run(self, **kwargs) -> dict:
-        return _run_model_eval(model_label=self.model_label, **kwargs)
+_EVAL_FNS = {}
+_missing_eval = []
+for _label in ALL_MODEL_LABELS:
+    _image = _EVAL_IMAGES.get(_label)
+    _gpu = MODEL_SPECS[_label].get("gpu")
+    if _image is None or not _gpu:
+        _missing_eval.append(_label)
+        continue
+    _EVAL_FNS[_label] = _eval_function(_label, _image, str(_gpu))
+if _missing_eval:
+    raise RuntimeError(f"No GPU eval worker for models: {_missing_eval}")
 
 
 @app.function(
@@ -972,32 +952,12 @@ def run_aggregate(run_id: str, output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dic
     return result
 
 
-_EVAL_CLS = {
-    "af-next-think": EvalAfNext,
-    "music-flamingo": EvalAfNext,
-    "mimo-audio-7b": EvalMimo,
-    "step-audio-2-mini-think": EvalStepAudio,
-    "interactive-omni-8b": EvalInteractiveOmni,
-    "qwen3-omni": EvalLargeMmA100,
-    "voxtral-small-24b": EvalLargeMmA100,
-    "qwen2.5-omni-7b": EvalLargeMmL40S,
-    "phi-4-multimodal": EvalLargeMmL40S,
-    "gemma-4-e4b": EvalLargeMmL40S,
-    "qwen3-omni-instruct": EvalLargeMmH100,
-    "nemotron-3-nano-omni": EvalLargeMmH100,
-}
-
-_missing_eval = [label for label in ALL_MODEL_LABELS if label not in _EVAL_CLS]
-if _missing_eval:
-    raise RuntimeError(f"No GPU eval worker for models: {_missing_eval}")
-
-
 def _spawn_model_eval(label: str, **common):
     """Start one dedicated GPU container for ``label`` (does not wait)."""
-    cls = _EVAL_CLS.get(label)
-    if cls is None:
+    fn = _EVAL_FNS.get(label)
+    if fn is None:
         raise SystemExit(f"No GPU worker for model {label!r}")
-    call = cls(model_label=label).run.spawn(**common)
+    call = fn.spawn(**common)
     print(f"Spawned {label} call_id={call.object_id}")
     return call
 

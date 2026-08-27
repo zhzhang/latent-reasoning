@@ -709,7 +709,7 @@ async def grade_pack_with_api_judge(
 
     reuse_cache: dict[tuple[str, str, str], dict] = {}
     if not force:
-        for records in files.values():
+        for gradee, records in files.items():
             for record in records:
                 if not _in_sample(record):
                     continue
@@ -723,7 +723,7 @@ async def grade_pack_with_api_judge(
                         _grade_reuse_key(
                             question,
                             answer,
-                            _shot_prediction_text(shot),
+                            _shot_prediction_text(shot, model_label=gradee),
                             include_gold=include_gold,
                         ),
                         dict(entry),
@@ -747,7 +747,7 @@ async def grade_pack_with_api_judge(
                 shot_index = int(shot.get("shot_index", 0))
                 if not force and not _shot_needs_grade(shot, key):
                     continue
-                prediction = _shot_prediction_text(shot)
+                prediction = _shot_prediction_text(shot, model_label=gradee)
                 cache_key = _grade_reuse_key(
                     question, answer, prediction, include_gold=include_gold
                 )
@@ -1503,7 +1503,7 @@ def grade_pack_with_batch_api(
                         _grade_reuse_key(
                             question,
                             answer,
-                            _shot_prediction_text(shot),
+                            _shot_prediction_text(shot, model_label=gradee),
                             include_gold=include_gold,
                         ),
                         dict(entry),
@@ -1524,7 +1524,7 @@ def grade_pack_with_batch_api(
                 n_labeled += 1
                 if not force and not _shot_needs_grade(shot, key):
                     continue
-                prediction = _shot_prediction_text(shot)
+                prediction = _shot_prediction_text(shot, model_label=gradee)
                 cache_key = _grade_reuse_key(
                     question, answer, prediction, include_gold=include_gold
                 )

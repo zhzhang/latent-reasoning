@@ -19,8 +19,10 @@ from mmar_common import (
     ensure_assistant_think_open,
     parse_choice_output,
     parse_freeform_output,
+    parse_gemma_freeform_output,
     parse_music_flamingo_output,
     parse_think_tagged_output,
+    prefers_markdown_answer_line,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -206,9 +208,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "max_num_seqs": 64,
             "max_num_batched_tokens": 8192,
             "limit_mm_per_prompt": {"audio": 1},
-            # torch.compile fails on Qwen3-Omni MoE (Dynamo meta/cuda mismatch
-            # during profile_run). Keep eager; throughput comes from max_num_seqs.
-            "enforce_eager": True,
+            # vLLM 0.28: torch.compile + CUDA graphs succeed on profile_run.
+            "enforce_eager": False,
             "trust_remote_code": True,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
@@ -609,7 +610,12 @@ def _build_prompt(
     return build_mmar_prompt(sample, think_suffix=think_suffix)
 
 
-def _parse_fn_for(args: SimpleNamespace, default: Callable = parse_choice_output) -> Callable:
+def _parse_fn_for(
+    args: SimpleNamespace,
+    default: Callable = parse_choice_output,
+    *,
+    label: str = "",
+) -> Callable:
     if default is parse_music_flamingo_output:
         fallback = (
             parse_freeform_output
@@ -624,6 +630,8 @@ def _parse_fn_for(args: SimpleNamespace, default: Callable = parse_choice_output
 
         return parse
     if _prompt_mode(args) == "freeform":
+        if prefers_markdown_answer_line(label):
+            return parse_gemma_freeform_output
         if default is parse_think_tagged_output:
             # Free-form still strips <think> blocks; choice matching is skipped.
             return parse_freeform_output
@@ -1486,7 +1494,7 @@ def generate_batch(
     n_completions = max(1, int(n_completions))
 
     backend = handle["backend"]
-    parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output))
+    parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output), label=label)
 
     if backend == "vllm":
         prompt_fn = _vllm_prompt_fn(label, args)
@@ -1847,7 +1855,9 @@ def _generate_step_audio_hf(
     return _output_dict(
         str(text or ""),
         sample.get("choices") or [],
-        parse_fn=_parse_fn_for(args, handle.get("parse_fn", parse_think_tagged_output)),
+        parse_fn=_parse_fn_for(
+            args, handle.get("parse_fn", parse_think_tagged_output), label=label
+        ),
     )
 
 
@@ -1897,7 +1907,7 @@ def _generate_interactive_omni_hf(
     return _output_dict(
         str(response or ""),
         sample.get("choices") or [],
-        parse_fn=_parse_fn_for(args, handle.get("parse_fn", parse_choice_output)),
+        parse_fn=_parse_fn_for(args, handle.get("parse_fn", parse_choice_output), label=label),
     )
 
 
@@ -2218,7 +2228,7 @@ def generate_raw_trace(
     output_trace = _trace_from_ids(
         tokenizer, output_ids, text_fallback=output_text
     )
-    parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output))
+    parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output), label=label)
     parsed = _output_dict(output_trace["text"] or output_text, sample.get("choices") or [], parse_fn=parse_fn)
     return {
         "backend": backend,

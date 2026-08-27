@@ -7,7 +7,6 @@ import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import N
 from typing import Callable
 
 CHOICE_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -25,6 +24,11 @@ ANSWER_MARKERS = (
     r"final answer[:\s]*",
 )
 ANSWER_LINE_RE = re.compile(r"^\s*Answer:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+# Gemma often bolds the required line: ``**Answer:** …`` or ``**Answer: …**``.
+GEMMA_ANSWER_LINE_RE = re.compile(
+    r"^\s*\*\*\s*Answer:\s*(?:\*\*)?\s*(.+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 THINK_CLOSE = "</think>"
 THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
@@ -399,22 +403,63 @@ def parse_music_flamingo_output(raw_text, choices=None, *, fallback=None):
     return parser(raw_text, choices)
 
 
-def split_answer_line(text: str) -> tuple[str, str] | None:
-    """Split on the last non-empty ``Answer:`` line. ``None`` when absent."""
-    last = None
-    for match in ANSWER_LINE_RE.finditer(text):
-        if match.group(1).strip():
-            last = match
-    if last is None:
-        return None
-    return text[: last.start()].strip(), last.group(1).strip()
+def prefers_markdown_answer_line(label: str | None) -> bool:
+    """Gemma bolds the required ``Answer:`` line; parse that form first."""
+    return "gemma" in str(label or "").lower()
 
 
-def parse_freeform_output(raw_text, choices=None):
+def _unwrap_markdown_line(text: str) -> str:
+    """Strip a wrapping ``**…**`` from a single extracted answer line."""
+    text = (text or "").strip()
+    if len(text) >= 4 and text.startswith("**") and text.endswith("**"):
+        inner = text[2:-2].strip()
+        if inner:
+            return inner
+    return text
+
+
+def _answer_line_value(match: re.Match[str], *, strip_stars: bool) -> str:
+    value = match.group(1).strip()
+    if strip_stars:
+        value = value.strip("*").strip()
+    return value
+
+
+def split_answer_line(
+    text: str,
+    *,
+    markdown: bool = False,
+) -> tuple[str, str] | None:
+    """Split on the last non-empty ``Answer:`` line. ``None`` when absent.
+
+    When ``markdown`` is True (Gemma), try ``**Answer:**`` first, then a
+    plain ``Answer:`` line.
+    """
+    patterns: tuple[tuple[re.Pattern[str], bool], ...] = (
+        ((GEMMA_ANSWER_LINE_RE, True), (ANSWER_LINE_RE, False))
+        if markdown
+        else ((ANSWER_LINE_RE, False),)
+    )
+    for pattern, strip_stars in patterns:
+        last = None
+        last_value = ""
+        for match in pattern.finditer(text):
+            value = _answer_line_value(match, strip_stars=strip_stars)
+            if value:
+                last = match
+                last_value = value
+        if last is not None:
+            return text[: last.start()].strip(), last_value
+    return None
+
+
+def parse_freeform_output(raw_text, choices=None, *, markdown_answer: bool = False):
     """Split free-form model text into (thinking, answer) without choice matching.
 
     ``choices`` is accepted for API compatibility with choice parsers but ignored.
     Prefers the last ``Answer:`` line, then markers / last-line fallbacks.
+    When ``markdown_answer`` is True, a bold ``**Answer:**`` line is tried
+    before a plain ``Answer:`` line (Gemma).
     Answer extraction never includes text before the last closing ``</think>``.
     """
     del choices  # unused — free-form answers are not constrained to options
@@ -422,25 +467,30 @@ def parse_freeform_output(raw_text, choices=None):
     if not text:
         return "", ""
 
+    def finish(thinking: str, answer: str) -> tuple[str, str]:
+        if markdown_answer:
+            answer = _unwrap_markdown_line(answer)
+        return thinking, answer
+
     split = split_last_think_close(text)
     if split is not None:
         prefix, remainder = split
         thinking_prefix = _strip_think_tags(prefix)
         if not remainder:
             return thinking_prefix, ""
-        extracted = split_answer_line(remainder)
+        extracted = split_answer_line(remainder, markdown=markdown_answer)
         if extracted is not None:
             extra_thinking, answer_prediction = extracted
             thinking_prediction = "\n".join(
                 part for part in (thinking_prefix, extra_thinking) if part
             )
-            return thinking_prediction, answer_prediction
-        return thinking_prefix, remainder
+            return finish(thinking_prediction, answer_prediction)
+        return finish(thinking_prefix, remainder)
 
-    extracted = split_answer_line(text)
+    extracted = split_answer_line(text, markdown=markdown_answer)
     if extracted is not None:
         extra_thinking, answer_prediction = extracted
-        return extra_thinking, answer_prediction
+        return finish(extra_thinking, answer_prediction)
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for marker in ANSWER_MARKERS:
@@ -450,31 +500,38 @@ def parse_freeform_output(raw_text, choices=None):
         answer_prediction = match.group(1).strip().splitlines()[0].strip()
         answer_index = text.lower().rfind(answer_prediction.lower())
         thinking = text[:answer_index].strip() if answer_index > 0 else ""
-        return thinking, answer_prediction
+        return finish(thinking, answer_prediction)
 
     if len(lines) > 1:
-        return "\n".join(lines[:-1]).strip(), lines[-1]
-    return "", text
+        return finish("\n".join(lines[:-1]).strip(), lines[-1])
+    return finish("", text)
 
 
-def extract_freeform_answer(raw_text: str) -> str:
+def parse_gemma_freeform_output(raw_text, choices=None):
+    """Freeform parser for Gemma: ``**Answer:**`` before plain ``Answer:``."""
+    return parse_freeform_output(raw_text, choices, markdown_answer=True)
+
+
+def extract_freeform_answer(raw_text: str, *, markdown_answer: bool = False) -> str:
     """Final-answer span for freeform generations and judge replies.
 
     Order: last ``Answer:`` line (after last ``</think>`` when that remainder
     is non-empty, else the full text), then last ``<answer>`` block, then
-    ``parse_freeform_output`` fallbacks.
+    ``parse_freeform_output`` fallbacks. ``markdown_answer`` prefers a bold
+    ``**Answer:**`` line first (Gemma).
     """
     text = (raw_text or "").strip()
     if not text:
         return ""
     search = after_last_think_close(text) or text
-    line = split_answer_line(search)
+    line = split_answer_line(search, markdown=markdown_answer)
     if line is not None:
-        return line[1]
+        answer = line[1]
+        return _unwrap_markdown_line(answer) if markdown_answer else answer
     tagged = parse_answer_tagged_output(text)
     if tagged is not None:
         return tagged[1]
-    _, answer = parse_freeform_output(text)
+    _, answer = parse_freeform_output(text, markdown_answer=markdown_answer)
     return answer
 
 
