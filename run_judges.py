@@ -11,7 +11,8 @@ verdict for the same judge key are skipped. Regenerates
 
 vLLM suite / dedicated judges start Modal from this script. API judges
 (gemini-3.7-flash) run locally and never open an App. Batch API judges
-(gpt-5.6-luna, claude-sonnet-5) also run locally: they grade ``with_gt``
+(gpt-5.6-luna, claude-sonnet-5) also run locally: they grade text-only
+recipes (default ``with_gt``; ``--grade-prompt`` selects any text format)
 on shots in ``exports/labels.csv`` that have all three reviewer ratings.
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
@@ -52,13 +53,15 @@ Local API judges::
     uv run run_judges.py --judge-model-id gemini-3.7-flash
     uv run run_judges.py --judge-model-id api --no-include-gold
 
-OpenAI / Anthropic Batch API (with_gt, triple-labeled shots)::
+OpenAI / Anthropic Batch API (text-only, triple-labeled shots)::
 
     export OPENAI_API_KEY=...
     uv run run_judges.py --judge-model-id gpt-5.6-luna
 
     export ANTHROPIC_API_KEY=...
     uv run run_judges.py --judge-model-id claude-sonnet-5
+    uv run run_judges.py --judge-model-id claude-sonnet-5 \\
+      --grade-prompt neutral_with_gt_no_audio
     uv run run_judges.py --judge-model-id sonnet --batch-id msgbatch_abc123
 
 Mixed (API locally while Modal vLLM runs detached)::
@@ -1886,7 +1889,6 @@ def _run_judges(
         resolve_grade_allowed_ids,
     )
     from mmar_api import (
-        BATCH_API_GRADE_PROMPT,
         grade_pack_with_api_judges,
         grade_pack_with_batch_api,
         split_api_judges,
@@ -2027,34 +2029,55 @@ def _run_judges(
             raise SystemExit(
                 "No triple-labeled shots remain after --n-questions filtering"
             )
-        if prompt and str(prompt).strip() not in {"", BATCH_API_GRADE_PROMPT}:
+        text_modes = [
+            (name, gold)
+            for name, gold in modes
+            if not JUDGE_FORMATS[name].audio_included
+        ]
+        skipped = [name for name, _ in modes if JUDGE_FORMATS[name].audio_included]
+        if skipped:
             print(
-                f"[run-judges] Batch API judges use {BATCH_API_GRADE_PROMPT} "
-                "only; ignoring other --grade-prompt values"
+                "[run-judges] Batch API judges skip audio formats: "
+                + ", ".join(skipped)
             )
+        if not text_modes:
+            raise SystemExit(
+                "Batch API judges need a text-only --grade-prompt "
+                f"(selected: {', '.join(name for name, _ in modes) or '(none)'})"
+            )
+        first_prompt, first_gold = text_modes[0]
         first_batch_key = compose_judge_key(
-            batch_api[0], prompt=BATCH_API_GRADE_PROMPT, include_gold=True
+            batch_api[0], prompt=first_prompt, include_gold=first_gold
         )
         set_primary = api_make_primary or (
             not existing_primary and not suite and not dedicated and not live_api
         )
-        collected: list[dict] = []
-        for index, label in enumerate(batch_api):
-            this_primary = set_primary and index == 0
-            result = grade_pack_with_batch_api(
-                pack_dir,
-                label=label,
-                model_labels=gradees,
-                labeled_rows=rows,
-                prompt=BATCH_API_GRADE_PROMPT,
-                force=force,
-                make_primary=this_primary,
-                primary_judge=first_batch_key if set_primary else primary,
-                poll_interval=batch_poll_interval,
-                batch_id=(batch_id or "").strip() or None,
+        resume_id = (batch_id or "").strip() or None
+        if resume_id and (len(text_modes) > 1 or len(batch_api) > 1):
+            print(
+                "[run-judges] --batch-id applies only to the first "
+                f"recipe/judge pair ({first_prompt} / {batch_api[0]})"
             )
-            collected.append(result)
-            print("Batch graded:", result)
+        collected: list[dict] = []
+        pair_index = 0
+        for prompt_name, _gold_flag in text_modes:
+            for label in batch_api:
+                this_primary = set_primary and pair_index == 0
+                result = grade_pack_with_batch_api(
+                    pack_dir,
+                    label=label,
+                    model_labels=gradees,
+                    labeled_rows=rows,
+                    prompt=prompt_name,
+                    force=force,
+                    make_primary=this_primary,
+                    primary_judge=first_batch_key if set_primary else primary,
+                    poll_interval=batch_poll_interval,
+                    batch_id=resume_id if pair_index == 0 else None,
+                )
+                collected.append(result)
+                print("Batch graded:", result)
+                pair_index += 1
         api_results.extend(collected)
         first_key = str(collected[0].get("judge_key") or first_batch_key)
         _merge_api_manifest(

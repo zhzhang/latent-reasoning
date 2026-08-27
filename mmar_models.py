@@ -148,41 +148,41 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     },
     # CONFIRMED
     # https://huggingface.co/sensenova/InteractiveOmni-8B
-    "interactive-omni-8b": {
-        "model_id": "sensenova/InteractiveOmni-8B",
-        "gpu": "A100-80GB",
-        # No dedicated vLLM / Omni registry entry; transformers modeling backend
-        # with trust_remote_code is the closest path.
-        "backend": "vllm_transformers",
-        "engine": {
-            "dtype": "bfloat16",
-            "max_model_len": 8192,
-            "max_num_batched_tokens": 8192,
-            "limit_mm_per_prompt": {"audio": 1},
-            # Transformers modeling backend may not support CUDA graphs; if load
-            # fails, load_interactive_omni falls back to HF .chat().
-            "enforce_eager": False,
-            "trust_remote_code": True,
-            "model_impl": "transformers",
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",  # best for throughput
-            "async_scheduling": True,  # usually faster, but not all features supported
-        },
-        # README: generation_config = dict(max_new_tokens=1024, do_sample=True)
-        # (no temp/top_p/rep → transformers defaults T=1.0, top_p=1.0).
-        # tokenizer_config.json chat_template: skip CoT only when
-        # enable_thinking is explicitly false.
-        "native_thinking": True,
-        "enable_thinking": True,
-        "sampling": {
-            "temperature": 1.0,
-            "top_p": 1.0,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.0,
-        },
-    },
+    # "interactive-omni-8b": {
+    #     "model_id": "sensenova/InteractiveOmni-8B",
+    #     "gpu": "A100-80GB",
+    #     # No dedicated vLLM / Omni registry entry; transformers modeling backend
+    #     # with trust_remote_code is the closest path.
+    #     "backend": "vllm_transformers",
+    #     "engine": {
+    #         "dtype": "bfloat16",
+    #         "max_model_len": 8192,
+    #         "max_num_batched_tokens": 8192,
+    #         "limit_mm_per_prompt": {"audio": 1},
+    #         # Transformers modeling backend may not support CUDA graphs; if load
+    #         # fails, load_interactive_omni falls back to HF .chat().
+    #         "enforce_eager": False,
+    #         "trust_remote_code": True,
+    #         "model_impl": "transformers",
+    #         "enable_prefix_caching": True,
+    #         "gpu_memory_utilization": 0.95,
+    #         "disable_log_stats": False,
+    #         "attention_backend": "flashinfer",  # best for throughput
+    #         "async_scheduling": True,  # usually faster, but not all features supported
+    #     },
+    #     # README: generation_config = dict(max_new_tokens=1024, do_sample=True)
+    #     # (no temp/top_p/rep → transformers defaults T=1.0, top_p=1.0).
+    #     # tokenizer_config.json chat_template: skip CoT only when
+    #     # enable_thinking is explicitly false.
+    #     "native_thinking": True,
+    #     "enable_thinking": True,
+    #     "sampling": {
+    #         "temperature": 1.0,
+    #         "top_p": 1.0,
+    #         "max_tokens": 2048,
+    #         "repetition_penalty": 1.0,
+    #     },
+    # },
     # CONFIRMED
     # MoE thinker-only (~3B active); fits one A100-80GB via plain vLLM.
     # https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Thinking/blob/main/generation_config.json

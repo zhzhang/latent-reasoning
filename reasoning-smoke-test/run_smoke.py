@@ -10,7 +10,7 @@ Usage::
     uv run modal run reasoning-smoke-test/run_smoke.py --models gemma-4-e4b
     uv run modal run reasoning-smoke-test/run_smoke.py --models music-flamingo
     uv run modal run reasoning-smoke-test/run_smoke.py \\
-      --question-id GJ6r_T6ckc4_00-00-00_00-00-06 --max-new-tokens 384
+      --question-id GJ6r_T6ckc4_00-00-00_00-00-06 --max-new-tokens 2048
 
 View locally (after the run returns, or after downloading the volume)::
 
@@ -52,7 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEPLOY_MOUNT = "/root/deploy"
 DEFAULT_QUESTION_ID = "GJ6r_T6ckc4_00-00-00_00-00-06"
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "reasoning-smoke-test"
-DEFAULT_MAX_NEW_TOKENS = 384
+DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_SEED = 0
 
 
