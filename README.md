@@ -1,17 +1,12 @@
 # MMAR Question Difficulty Experiment
 
-Sample a fixed 200 MMAR questions, generate 10 responses per model
-(per-model sampling; see `MODEL_SPECS`), then browse questions hardest-first
-by mean success rate.
+Run the full MMAR set, generate 10 freeform responses per model
+(per-model sampling; see `MODEL_SPECS`), then grade and browse
+questions hardest-first by mean success rate.
 
-Two prompt / scoring modes:
-
-| Mode | Prompt | Scoring |
-|------|--------|---------|
-| `mc` (default) | question + 4 choices | string-match against gold choice (stored as a synthetic `string-match` judge) |
-| `freeform` | question only (no choices) | one or more local vLLM judges grade each shot vs gold; first judge is **primary** and drives difficulty ranking |
-
-Default freeform judge: `Qwen/Qwen3.6-35B-A3B-FP8`. Pass multiple with `--judge-model-ids` (comma-separated; first = primary).
+Prompts are question-only (no multiple-choice options). Generation is
+`run_experiment.py`; grading is a separate pipeline (`run_judges.py`).
+The first judge is **primary** and drives difficulty ranking.
 
 Inference uses **offline** vLLM (`LLM.generate` / Omni) with continuous
 batching — not an OpenAI-compatible server. `n_shots` means independent
@@ -25,11 +20,10 @@ one prefill; Omni/HF duplicate the prompt per shot and rely on prefix caching.
 |-------|------------|---------|
 | `af-next-think` | `nvidia/audio-flamingo-next-think-hf` | vLLM 0.24 MusicFlamingo (HF fallback); `T=0.2, max_tokens=2048, rep=1.2` |
 | `mimo-audio-7b` | `XiaomiMiMo/MiMo-Audio-7B-Instruct` (+ tokenizer) | vLLM-Omni; `T=0.3, top_p=0.95, max_tokens=512, rep=1.1` |
+| `step-audio-2-mini-think` | [`stepfun-ai/Step-Audio-2-mini-Think`](https://huggingface.co/stepfun-ai/Step-Audio-2-mini-Think) | HF StepAudio2 (official text path); `T=0.7, top_p=0.9, max_tokens=2048, rep=1.05` |
 | `interactive-omni-8b` | `sensenova/InteractiveOmni-8B` | HF `.chat` (vLLM transformers backend incompatible); `T=1.0, max_tokens=1024` |
 | `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.28 thinker-only (A100-80GB); `T=0.6, top_p=0.95, top_k=20, max_tokens=2048` |
 | `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.28 Mistral audio (A100-80GB); `T=0.2, top_p=0.95, max_tokens=512` |
-
-`step-audio-2-mini` is temporarily excluded from difficulty aggregation.
 
 ## Seed
 
@@ -48,53 +42,36 @@ Judge aliases: `qwen2.5-3b`, `qwen3.6-35b-a3b-fp8` (→ `Qwen/Qwen3.6-35B-A3B-FP
 ## Run
 
 ```bash
-# Full MC experiment (detach recommended; models run in parallel by default)
+# Full freeform generation (detach recommended; models run in parallel)
 uv run modal run --detach run_experiment.py
 
-# Free-form answers + Qwen 3B grading on the same 200 questions as
-# 20260727T154400Z (10 shots / model)
-uv run modal run --detach run_experiment.py \
-  --mode freeform --source-run-id 20260727T154400Z
-
-# Multiple judges (first is primary — drives difficulty ranking)
-uv run modal run --detach run_experiment.py \
-  --mode freeform --source-run-id 20260727T154400Z \
-  --judge-model-ids qwen2.5-3b,qwen3.6-35b-a3b-fp8
-
-# Smoke test one model on 8 questions (plain vLLM: SamplingParams n=2)
+# Smoke test one model (plain vLLM: SamplingParams n=2)
 uv run modal run run_experiment.py \
-  --models af-next-think --num-samples 8 --n-shots 2
+  --models af-next-think --n-shots 2
 
-# Resume after a crash (same question set; skip finished models / questions)
+# Step-Audio-2-mini-Think: one MMAR clip via a standalone HF script
+uv run modal run smoke_step_audio.py
+
+# Resume after a crash (full MMAR; skip questions that already have n_shots)
 uv run modal run --detach run_experiment.py \
   --run-id <run_id>
 
-# Re-grade / re-aggregate an existing freeform run
-uv run modal run run_experiment.py \
-  --grade-only --run-id <run_id> --mode freeform
-# Add another judge to an existing run (only missing judge entries are graded)
-uv run modal run run_experiment.py \
-  --grade-only --run-id <run_id> --mode freeform \
-  --judge-model-ids Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen3-8B
+# After grading via run_judges.py, rebuild difficulty.jsonl / scores.json
 uv run modal run run_experiment.py \
   --aggregate-only --run-id <run_id>
 ```
 
-Defaults: `--num-samples 200 --n-shots 10 --seed 42 --parallel-models --mode mc`.
+Defaults: `--n-shots 10 --seed 42` on the full MMAR set, freeform prompts.
 Sampling (`temperature` / `top_p` / `max_tokens` / `repetition_penalty`) is
 per-model in `mmar_models.MODEL_SPECS`; optional `--temperature` / `--top-p` /
 `--max-new-tokens` override every model when set.
 
-Freeform defaults `--source-run-id` to `20260727T154400Z` so the question
-set matches that MC difficulty run. `--grader-model-id` remains a single-judge
-alias when `--judge-model-ids` is unset.
-
-Resume is keyed by `--run-id`. Each model appends to
-`models/<label>/predictions.jsonl` and skips ids already present, so a
-partial model continues mid-file. Models that already cover all sampled
-questions are not re-spawned. Freeform then runs a separate grader pass
-per judge (sequentially, one Modal container each) over pending shots
-before aggregation.
+Resume is keyed by `--run-id`. Each model writes
+`models/<label>/predictions.jsonl`. A question is skipped when it already
+has the requested number of shots; otherwise only the missing shots are
+generated. Models that already cover every question at that shot count
+are not re-spawned. Grade those predictions with `run_judges.py`, then
+`--aggregate-only` to rank questions.
 
 ### Throughput knobs
 
@@ -123,7 +100,6 @@ before aggregation.
 - `--max-num-seqs` / `--gpu-memory-utilization`: optional CLI escape hatches.
 - MiMo Omni YAML: stage-0 prefix caching on; `max_num_seqs: 1` stays for the
   two-stage memory split on one GPU (not raised for speed).
-- `--grader-batch-size`: freeform judge only (separate from model inference).
 - Judge engines are tuned with `tune_judge.py` (see below). For the
   `qwen3.6-35b-a3b-fp8` MoE judge, `enforce_eager: False` was worth 332 →
   4,824 output tok/s on an H100; only 3B params are active per token, so

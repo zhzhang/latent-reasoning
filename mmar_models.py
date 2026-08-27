@@ -77,9 +77,10 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.2,
         },
     },
-    # https://huggingface.co/nvidia/music-flamingo-hf
+    # CONFIRMED
+    # https://huggingface.co/nvidia/music-flamingo-think-2601-hf
     "music-flamingo": {
-        "model_id": "nvidia/music-flamingo-hf",
+        "model_id": "nvidia/music-flamingo-think-2601-hf",
         "gpu": "L40S",
         "backend": "vllm",
         "engine": {
@@ -99,12 +100,13 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         # n-shot variance; the card's optional example uses T=0.7, top_p=0.9.
         "native_thinking": True,
         "sampling": {
-            "temperature": 0.2,
-            "top_p": 1.0,
+            "temperature": 0.7,
+            "top_p": 0.9,
             "max_tokens": 2048,
             "repetition_penalty": 1.0,
         },
     },
+    # CONFIRMED
     # https://github.com/XiaomiMiMo/MiMo-Audio/blob/main/src/mimo_audio/mimo_audio.py#L134
     "mimo-audio-7b": {
         "model_id": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
@@ -121,10 +123,11 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "sampling": {
             "temperature": 0.3,
             "top_p": 0.95,
-            "max_tokens": 512,
+            "max_tokens": 2048,
             "repetition_penalty": 1.1,
         },
     },
+    # CONFIRMED
     # Official StepAudio2 HF path. vLLM-Omni 0.24 does not register
     # ``step_audio_2`` and infers TP world size 4.
     # https://github.com/stepfun-ai/Step-Audio2/blob/main/examples-think.py
@@ -138,11 +141,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         # repetition_penalty=1.05 match stepaudio2.py conversation defaults.
         "sampling": {
             "temperature": 0.7,
-            "top_p": 0.9,
+            "top_p": 1.0,
             "max_tokens": 2048,
             "repetition_penalty": 1.05,
         },
     },
+    # CONFIRMED
     # https://huggingface.co/sensenova/InteractiveOmni-8B
     "interactive-omni-8b": {
         "model_id": "sensenova/InteractiveOmni-8B",
@@ -175,10 +179,11 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "sampling": {
             "temperature": 1.0,
             "top_p": 1.0,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "repetition_penalty": 1.0,
         },
     },
+    # CONFIRMED
     # MoE thinker-only (~3B active); fits one A100-80GB via plain vLLM.
     # https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Thinking/blob/main/generation_config.json
     "qwen3-omni": {
@@ -221,97 +226,101 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
+    # CONFIRMED non-thinking
     # Dense 24B; ~55GB bf16 — needs A100-80GB. Mistral tokenizer/format.
     # https://huggingface.co/mistralai/Voxtral-Small-24B-2507
-    "voxtral-small-24b": {
-        "model_id": "mistralai/Voxtral-Small-24B-2507",
-        "gpu": "A100-80GB",
-        "backend": "vllm_voxtral",
-        "engine": {
-            "dtype": "bfloat16",
-            "max_model_len": 8192,
-            # Dense 24B leaves ~26 GiB KV; max_tokens=512 ⇒ plenty of room.
-            "max_num_seqs": 64,
-            "max_num_batched_tokens": 8192,
-            "limit_mm_per_prompt": {"audio": 1},
-            "config_format": "mistral",
-            "load_format": "mistral",
-            "tokenizer_mode": "mistral",
-            "enforce_eager": False,
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",  # best for throughput
-            "async_scheduling": True,  # usually faster, but not all features supported
-        },
-        # Card: temperature=0.2 and top_p=0.95 for audio-understanding chat.
-        "sampling": {
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "max_tokens": 512,
-            "repetition_penalty": 1.0,
-        },
-    },
+    # "voxtral-small-24b": {
+    #     "model_id": "mistralai/Voxtral-Small-24B-2507",
+    #     "gpu": "A100-80GB",
+    #     "backend": "vllm_voxtral",
+    #     "engine": {
+    #         "dtype": "bfloat16",
+    #         "max_model_len": 8192,
+    #         # Dense 24B leaves ~26 GiB KV; max_tokens=512 ⇒ plenty of room.
+    #         "max_num_seqs": 64,
+    #         "max_num_batched_tokens": 8192,
+    #         "limit_mm_per_prompt": {"audio": 1},
+    #         "config_format": "mistral",
+    #         "load_format": "mistral",
+    #         "tokenizer_mode": "mistral",
+    #         "enforce_eager": False,
+    #         "enable_prefix_caching": True,
+    #         "gpu_memory_utilization": 0.95,
+    #         "disable_log_stats": False,
+    #         "attention_backend": "flashinfer",  # best for throughput
+    #         "async_scheduling": True,  # usually faster, but not all features supported
+    #     },
+    #     # Card: temperature=0.2 and top_p=0.95 for audio-understanding chat.
+    #     "sampling": {
+    #         "temperature": 0.2,
+    #         "top_p": 0.95,
+    #         "max_tokens": 2048,
+    #         "repetition_penalty": 1.0,
+    #     },
+    # },
+    # CONFIRMED non-thinking model.
     # Dense 7B thinker-only. Card generate() passes no sampler (greedy);
     # generation_config.json has none either. T=0.2 keeps n-shot variance.
     # https://huggingface.co/Qwen/Qwen2.5-Omni-7B
-    "qwen2.5-omni-7b": {
-        "model_id": "Qwen/Qwen2.5-Omni-7B",
-        "gpu": "L40S",
-        "backend": "vllm",
-        "engine": {
-            "dtype": "bfloat16",
-            "max_model_len": 8192,
-            "max_num_seqs": 64,
-            "max_num_batched_tokens": 8192,
-            "limit_mm_per_prompt": {"audio": 1},
-            "enforce_eager": False,
-            "trust_remote_code": True,
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",
-            "async_scheduling": True,
-        },
-        "sampling": {
-            "temperature": 0.2,
-            "top_p": 1.0,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.0,
-        },
-    },
+    # "qwen2.5-omni-7b": {
+    #     "model_id": "Qwen/Qwen2.5-Omni-7B",
+    #     "gpu": "L40S",
+    #     "backend": "vllm",
+    #     "engine": {
+    #         "dtype": "bfloat16",
+    #         "max_model_len": 8192,
+    #         "max_num_seqs": 64,
+    #         "max_num_batched_tokens": 8192,
+    #         "limit_mm_per_prompt": {"audio": 1},
+    #         "enforce_eager": False,
+    #         "trust_remote_code": True,
+    #         "enable_prefix_caching": True,
+    #         "gpu_memory_utilization": 0.95,
+    #         "disable_log_stats": False,
+    #         "attention_backend": "flashinfer",
+    #         "async_scheduling": True,
+    #     },
+    #     "sampling": {
+    #         "temperature": 0.7,
+    #         "top_p": 0.8,
+    #         "max_tokens": 2048,
+    #         "repetition_penalty": 1.05,
+    #     },
+    # },
+    # CONFIRMED non-thinking
     # 5.6B; speech LoRA lives next to the checkpoint. Card uses
     # GenerationConfig.from_pretrained + max_new_tokens=1000 (greedy).
     # T=0.2 keeps n-shot variance.
     # https://huggingface.co/microsoft/Phi-4-multimodal-instruct
-    "phi-4-multimodal": {
-        "model_id": "microsoft/Phi-4-multimodal-instruct",
-        "gpu": "L40S",
-        "backend": "vllm",
-        "engine": {
-            "dtype": "bfloat16",
-            "max_model_len": 8192,
-            "max_num_seqs": 64,
-            "max_num_batched_tokens": 8192,
-            "limit_mm_per_prompt": {"audio": 1},
-            "enforce_eager": False,
-            "trust_remote_code": True,
-            "enable_lora": True,
-            "max_lora_rank": 320,
-            "max_loras": 1,
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",
-            "async_scheduling": True,
-        },
-        "sampling": {
-            "temperature": 0.2,
-            "top_p": 1.0,
-            "max_tokens": 1000,
-            "repetition_penalty": 1.0,
-        },
-    },
+    # "phi-4-multimodal": {
+    #     "model_id": "microsoft/Phi-4-multimodal-instruct",
+    #     "gpu": "L40S",
+    #     "backend": "vllm",
+    #     "engine": {
+    #         "dtype": "bfloat16",
+    #         "max_model_len": 8192,
+    #         "max_num_seqs": 64,
+    #         "max_num_batched_tokens": 8192,
+    #         "limit_mm_per_prompt": {"audio": 1},
+    #         "enforce_eager": False,
+    #         "trust_remote_code": True,
+    #         "enable_lora": True,
+    #         "max_lora_rank": 320,
+    #         "max_loras": 1,
+    #         "enable_prefix_caching": True,
+    #         "gpu_memory_utilization": 0.95,
+    #         "disable_log_stats": False,
+    #         "attention_backend": "flashinfer",
+    #         "async_scheduling": True,
+    #     },
+    #     "sampling": {
+    #         "temperature": 0.2,
+    #         "top_p": 1.0,
+    #         "max_tokens": 1000,
+    #         "repetition_penalty": 1.0,
+    #     },
+    # },
+    # CONFIRMED
     # Effective 4B; native audio.
     # https://huggingface.co/google/gemma-4-E4B-it#best-practices
     "gemma-4-e4b": {
@@ -405,7 +414,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
-            "max_tokens": 2048,
+            "max_tokens": 4096,
             "repetition_penalty": 1.0,
         },
     },
