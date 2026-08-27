@@ -72,6 +72,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         # max_new_tokens=2048 and no do_sample (greedy). T=0.2 is for n-shot
         # variance (official generate() is greedy; README example uses 4096).
         "native_thinking": True,
+        "enable_thinking": True,
         "sampling": {
             "temperature": 0.2,
             "top_p": 1.0,
@@ -101,6 +102,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         # generation_config.json is greedy (max_new_tokens=2048). T=0.2 is for
         # n-shot variance; the card's optional example uses T=0.7, top_p=0.9.
         "native_thinking": True,
+        "enable_thinking": True,
         "sampling": {
             "temperature": 0.7,
             "top_p": 0.9,
@@ -119,6 +121,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "sampling_rate": 24000,
         # Native CoT when the assistant turn is prefilled with ``<think>``.
         "native_thinking": True,
+        "enable_thinking": True,
         # Official audio_understanding global sampler: T=0.3, top_p=0.95.
         # repetition_penalty 1.1 is vLLM-Omni's mimo_audio deploy default
         # (https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/mimo_audio.yaml).
@@ -139,6 +142,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "hf_step",
         "sampling_rate": 16000,
         "native_thinking": True,
+        "enable_thinking": True,
         # examples-think.py: T=0.7, max_new_tokens=2048. top_p=0.9 and
         # repetition_penalty=1.05 match stepaudio2.py conversation defaults.
         "sampling": {
@@ -584,9 +588,24 @@ def _prompt_mode(args: SimpleNamespace) -> str:
     return "freeform" if mode in {"freeform", "free_form", "open"} else "mc"
 
 
-def _build_prompt(sample: dict, args: SimpleNamespace, *, think_suffix: str | None = None) -> str:
+def _build_prompt(
+    sample: dict,
+    args: SimpleNamespace,
+    *,
+    think_suffix: str | None = None,
+    with_timestamps: bool = False,
+) -> str:
     if _prompt_mode(args) == "freeform":
-        return build_mmar_freeform_prompt(sample, think_suffix=think_suffix)
+        # AF-Next: bake timestamps into the reason sentence instead of appending
+        # AF_NEXT_THINK_SUFFIX (which would duplicate "reason step by step").
+        if think_suffix == AF_NEXT_THINK_SUFFIX:
+            with_timestamps = True
+            think_suffix = None
+        return build_mmar_freeform_prompt(
+            sample,
+            think_suffix=think_suffix,
+            with_timestamps=with_timestamps,
+        )
     return build_mmar_prompt(sample, think_suffix=think_suffix)
 
 
@@ -736,10 +755,13 @@ MUSIC_FLAMINGO_SYSTEM = "You are a helpful assistant."
 
 
 def _af_next_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    ns = args or SimpleNamespace(prompt_mode="mc")
+    freeform = _prompt_mode(ns) == "freeform"
     question = _build_prompt(
         sample,
-        args or SimpleNamespace(prompt_mode="mc"),
-        think_suffix=AF_NEXT_THINK_SUFFIX,
+        ns,
+        think_suffix=None if freeform else AF_NEXT_THINK_SUFFIX,
+        with_timestamps=freeform,
     )
     # MusicFlamingo / AF-Next chat format (same placeholder family as AF3).
     return (

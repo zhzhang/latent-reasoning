@@ -24,6 +24,7 @@ ANSWER_MARKERS = (
     r"the answer is[:\s]*",
     r"final answer[:\s]*",
 )
+ANSWER_LINE_RE = re.compile(r"^\s*Answer:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 THINK_CLOSE = "</think>"
 THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
@@ -201,12 +202,31 @@ def build_mmar_prompt(item, think_suffix: str | None = None):
     return prompt
 
 
-def build_mmar_freeform_prompt(item, think_suffix: str | None = None):
+def build_mmar_freeform_prompt(
+    item,
+    think_suffix: str | None = None,
+    *,
+    with_timestamps: bool = False,
+):
     """Prompt the model with the question only (no multiple-choice options)."""
     question = str(item["question"]).strip()
+    reason = (
+        "Reason step by step with timestamps before answering"
+        if with_timestamps
+        else "Reason step by step before answering"
+    )
+    # Music Flamingo uses <think>/<answer> tags instead of the Answer: line.
+    if think_suffix == MUSIC_FLAMINGO_THINK_SUFFIX:
+        prompt = (
+            "Listen to the audio and answer the question. "
+            f"{reason}.\n"
+            f"This question is: {question}\n"
+            f"\n{think_suffix}"
+        )
+        return prompt
     prompt = (
         "Listen to the audio and answer the question. "
-        "Reason step by step before answering, then give a concise, final answer in a single line in exactly this format:\n"
+        f"{reason}, then give a concise, answer in a single final line in exactly this format:\n"
         "Answer: <your answer>\n"
         f"This question is: {question}\n"
     )
@@ -379,10 +399,22 @@ def parse_music_flamingo_output(raw_text, choices=None, *, fallback=None):
     return parser(raw_text, choices)
 
 
+def split_answer_line(text: str) -> tuple[str, str] | None:
+    """Split on the last non-empty ``Answer:`` line. ``None`` when absent."""
+    last = None
+    for match in ANSWER_LINE_RE.finditer(text):
+        if match.group(1).strip():
+            last = match
+    if last is None:
+        return None
+    return text[: last.start()].strip(), last.group(1).strip()
+
+
 def parse_freeform_output(raw_text, choices=None):
     """Split free-form model text into (thinking, answer) without choice matching.
 
     ``choices`` is accepted for API compatibility with choice parsers but ignored.
+    Prefers the last ``Answer:`` line, then markers / last-line fallbacks.
     Answer extraction never includes text before the last closing ``</think>``.
     """
     del choices  # unused — free-form answers are not constrained to options
@@ -393,10 +425,22 @@ def parse_freeform_output(raw_text, choices=None):
     split = split_last_think_close(text)
     if split is not None:
         prefix, remainder = split
-        thinking_prediction = _strip_think_tags(prefix)
-        if remainder:
-            return thinking_prediction, remainder
-        return thinking_prediction, ""
+        thinking_prefix = _strip_think_tags(prefix)
+        if not remainder:
+            return thinking_prefix, ""
+        extracted = split_answer_line(remainder)
+        if extracted is not None:
+            extra_thinking, answer_prediction = extracted
+            thinking_prediction = "\n".join(
+                part for part in (thinking_prefix, extra_thinking) if part
+            )
+            return thinking_prediction, answer_prediction
+        return thinking_prefix, remainder
+
+    extracted = split_answer_line(text)
+    if extracted is not None:
+        extra_thinking, answer_prediction = extracted
+        return extra_thinking, answer_prediction
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for marker in ANSWER_MARKERS:

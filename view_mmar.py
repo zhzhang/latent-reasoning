@@ -27,7 +27,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 from aggregate import MODEL_LABEL_ORDER
 from collate_mmar_freeform import ALL_API_LABELS, DEFAULT_OUT_DIR
 from mmar_common import (
-    AF_NEXT_THINK_SUFFIX,
     ASSISTANT_THINK_OPEN,
     MUSIC_FLAMINGO_THINK_SUFFIX,
     build_mmar_freeform_prompt,
@@ -746,7 +745,7 @@ def _question_fields(record: dict[str, Any]) -> dict[str, Any]:
 def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
     """Reconstruct the freeform text prompts sent to each model."""
     base = build_mmar_freeform_prompt(item)
-    af_base = build_mmar_freeform_prompt(item, think_suffix=AF_NEXT_THINK_SUFFIX)
+    af_base = build_mmar_freeform_prompt(item, with_timestamps=True)
     mf_base = build_mmar_freeform_prompt(item, think_suffix=MUSIC_FLAMINGO_THINK_SUFFIX)
     step_system = (
         "You are an expert in audio analysis. Activate deep thinking: "

@@ -19,6 +19,8 @@ from typing import Any
 from audio_flamingo_runtime import resolve_model_dir
 from mmar_common import (
     ASSISTANT_THINK_OPEN,
+    MUSIC_FLAMINGO_THINK_SUFFIX,
+    after_last_think_close,
     ensure_assistant_think_open,
     ensure_judge_schema,
     judge_label,
@@ -26,6 +28,7 @@ from mmar_common import (
     parse_freeform_output,
     recompute_multi_judge_scores,
     select_grade_question_ids,
+    split_answer_line,
     split_last_think_close,
     write_jsonl,
 )
@@ -729,8 +732,9 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
             "clip, and the response you are judging.\n"
-            "Reason briefly, then give your judgement of the response in a single "
-            "final line with one word: \"Correct\" or \"Incorrect\""
+            "Reason briefly, then give a concise, answer in a single final line in "
+            "exactly this format:\n"
+            "Answer: <Correct or Incorrect>"
         ),
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
@@ -915,12 +919,19 @@ def majority_grade_verdict(verdicts: list[bool | None]) -> bool | None:
 def parse_grade_verdict(text: str) -> bool | None:
     """Parse a 0/1 tag, Correct/Incorrect, or legacy Pass/Fail reply.
 
-    Returns None if unparseable. ``incorrect`` is matched before ``correct``
-    so a last-line ``Incorrect`` is never read as ``Correct``.
+    Prefers the last ``Answer:`` line, then ``<answer>`` tags / boxed /
+    last-line fallbacks. Returns None if unparseable. ``incorrect`` is
+    matched before ``correct`` so a last-line ``Incorrect`` is never read
+    as ``Correct``.
     """
     region = _answer_region(text)
     if not region:
         return None
+    extracted = split_answer_line(region)
+    if extracted is not None:
+        verdict = _label_verdict(_clean_verdict_token(extracted[1]))
+        if verdict is not None:
+            return verdict
     tag_matches = list(ANSWER_TAG_RE.finditer(region))
     if tag_matches:
         return _label_verdict(tag_matches[-1].group(1))
@@ -979,6 +990,12 @@ def _shot_prediction_text(shot: dict) -> str:
     """Extracted answer shown to the judge; never includes text before last ``</think>``."""
     raw = str(shot.get("model_output") or "")
     extracted = str(shot.get("answer_prediction") or "")
+    text = (raw or extracted).strip()
+    remainder = after_last_think_close(text) if text else ""
+    search = remainder or text
+    line = split_answer_line(search) if search else None
+    if line is not None:
+        return line[1]
     tagged = parse_answer_tagged_output(raw)
     if tagged is not None:
         return tagged[1]
@@ -1601,6 +1618,33 @@ NONGOLD_AUDIO_CHAT_LAYOUT = (
 )
 
 
+_ANSWER_FORMAT_TAIL_RE = re.compile(
+    r",?\s*then give a concise, answer in a single final line in exactly this format:\n"
+    r"Answer:.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _adapt_judge_instructions(label: str, instructions: str) -> str:
+    """Match generation output format: ``Answer:`` line, except Music Flamingo."""
+    text = instructions
+    if label == "af-next-think" and "with timestamps" not in text:
+        if "Reason step by step before answering" in text:
+            text = text.replace(
+                "Reason step by step before answering",
+                "Reason step by step with timestamps before answering",
+                1,
+            )
+        elif "Reason briefly," in text:
+            text = text.replace("Reason briefly,", "Reason briefly with timestamps,", 1)
+        else:
+            text = text.replace("Reason briefly ", "Reason briefly with timestamps ", 1)
+    if label == "music-flamingo":
+        stripped = _ANSWER_FORMAT_TAIL_RE.sub(".", text).rstrip()
+        text = f"{stripped}\n\n{MUSIC_FLAMINGO_THINK_SUFFIX}"
+    return text
+
+
 def _nongold_audio_system_text(label: str) -> str:
     """Model system prompt interpolated into templates that have ``{system}``."""
     if label == "qwen2.5-omni-7b":
@@ -1921,7 +1965,7 @@ def _grade_shot_batch_audio(
     fmt = get_judge_format(prompt, include_gold=include_gold)
     include_gold = fmt.include_gold
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
-    instructions = fmt.prompt
+    instructions = _adapt_judge_instructions(label, fmt.prompt)
     closer = fmt.closer
     n_samples = max(1, int(n_samples))
     duplicate_prompts = n_samples > 1 and backend_duplicates_shots(backend)
@@ -2763,7 +2807,7 @@ def format_grade_prompt_inspection(
             for name, fmt in nongold:
                 wrapped = _nongold_audio_prompt_string(
                     sample_label,
-                    fmt.prompt,
+                    _adapt_judge_instructions(sample_label, fmt.prompt),
                     fmt.fields(**PROMPT_PLACEHOLDERS),
                     fmt.closer,
                 )
