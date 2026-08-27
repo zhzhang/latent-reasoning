@@ -457,6 +457,27 @@ def parse_freeform_output(raw_text, choices=None):
     return "", text
 
 
+def extract_freeform_answer(raw_text: str) -> str:
+    """Final-answer span for freeform generations and judge replies.
+
+    Order: last ``Answer:`` line (after last ``</think>`` when that remainder
+    is non-empty, else the full text), then last ``<answer>`` block, then
+    ``parse_freeform_output`` fallbacks.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return ""
+    search = after_last_think_close(text) or text
+    line = split_answer_line(search)
+    if line is not None:
+        return line[1]
+    tagged = parse_answer_tagged_output(text)
+    if tagged is not None:
+        return tagged[1]
+    _, answer = parse_freeform_output(text)
+    return answer
+
+
 def string_match(answer, prediction, choices):
     """MMAR answer match: GT tokens present, no exclusive tokens from wrong choices."""
 

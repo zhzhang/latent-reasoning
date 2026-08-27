@@ -14,7 +14,7 @@ Sources, later runs only add models that are not already present:
 
     exp-mmar-question-difficulty/20260807T145000Z   # 5 models × 1000 q
     exp-mmar-question-difficulty/20260816T050944Z   # extra models × 784 q
-    mmar-freeform-5-shot                            # API models
+    mmar-freeform-5-shot-thinking                   # API models (volume root)
 
 Resume is the default: existing per-shot verdicts for this judge are
 kept, the H100 is not started when nothing is left, and only ungraded
@@ -42,10 +42,12 @@ import modal
 from aggregate import aggregate_difficulty, order_model_labels
 from mmar_common import recompute_multi_judge_scores, write_json, write_jsonl
 from modal_cache import (
+    FREEFORM_THINKING_MOUNT,
     JUDGING_MOUNT,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
     VLLM_WHEEL_INDEX,
+    freeform_thinking_volume,
     hf_secret,
     judging_volume,
     results_volume,
@@ -58,7 +60,7 @@ REMOTE_PACK_DIR = JUDGING_MOUNT / PACK_NAME
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 FULL_MMAR_RUN_ID = "20260807T145000Z"
 OPEN_ENDED_RUN_ID = "20260816T050944Z"
-COLLATED_PACK = RESULTS_MOUNT / "mmar-freeform-5-shot"
+COLLATED_PACK = FREEFORM_THINKING_MOUNT
 
 JUDGE_MODEL_ID = "qwen3.6-35b-a3b-fp8"
 GRADE_PROMPT = "neutral_with_gt_no_audio"
@@ -232,7 +234,7 @@ def _source_model_dirs() -> list[tuple[str, Path]]:
             OPEN_ENDED_RUN_ID,
             DEFAULT_OUTPUT_DIR / OPEN_ENDED_RUN_ID / "models",
         ),
-        ("mmar-freeform-5-shot", COLLATED_PACK / "models"),
+        ("mmar-freeform-5-shot-thinking", COLLATED_PACK / "models"),
     ]
 
 
@@ -336,12 +338,14 @@ def _stamp_manifest(
     volumes={
         VOLUME_MOUNT: volume,
         RESULTS_MOUNT: results_volume,
+        FREEFORM_THINKING_MOUNT: freeform_thinking_volume,
         JUDGING_MOUNT: judging_volume,
     },
 )
 def prepare_pack(models: str = "all") -> dict:
     """Copy 5-shot freeform answers onto ``mmar-judging/llm-judge-gt``."""
     results_volume.reload()
+    freeform_thinking_volume.reload()
     judging_volume.reload()
 
     ids_path = DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json"

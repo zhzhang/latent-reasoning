@@ -115,7 +115,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     "mimo-audio-7b": {
         "model_id": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
         "tokenizer_id": "XiaomiMiMo/MiMo-Audio-Tokenizer",
-        "gpu": "A100-80GB",
+        "gpu": "L40S",
         "backend": "vllm_omni",
         "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
         "sampling_rate": 24000,
@@ -138,7 +138,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     # https://github.com/stepfun-ai/Step-Audio2/blob/main/examples-think.py
     "step-audio-2-mini-think": {
         "model_id": "stepfun-ai/Step-Audio-2-mini-Think",
-        "gpu": "A100-80GB",
+        "gpu": "L40S",
         "backend": "hf_step",
         "sampling_rate": 16000,
         "native_thinking": True,

@@ -23,13 +23,10 @@ from mmar_common import (
     after_last_think_close,
     ensure_assistant_think_open,
     ensure_judge_schema,
+    extract_freeform_answer,
     judge_label,
-    parse_answer_tagged_output,
-    parse_freeform_output,
     recompute_multi_judge_scores,
     select_grade_question_ids,
-    split_answer_line,
-    split_last_think_close,
     write_jsonl,
 )
 
@@ -833,11 +830,10 @@ def build_grade_gold_prefix(
 # Verdict parsing
 # ---------------------------------------------------------------------------
 
-# Final-answer tokens: <answer>0</answer> / <answer>1</answer> (preferred),
-# <answer>Correct</answer> / <answer>Incorrect</answer>, plus legacy Pass/Fail
-# and YES/NO from older runs. Soft whole-region fallback stays narrow so
-# prose like "correct in meaning" does not count as a verdict; token labels
-# and last-line Correct/Incorrect still accept a bare final-line verdict.
+# Extraction order matches test-taker parsers (``extract_freeform_answer``):
+# last ``Answer:`` line, then ``<answer>`` tags, then last-line / boxed /
+# keyword fallbacks. Soft whole-region fallback stays narrow so prose like
+# "correct in meaning" does not count as a verdict.
 ANSWER_TAG_RE = re.compile(
     r"<answer>\s*(0|1|correct|incorrect|pass|fail|yes|no|true|false|wrong)\s*</answer>",
     re.IGNORECASE,
@@ -845,7 +841,6 @@ ANSWER_TAG_RE = re.compile(
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}", re.IGNORECASE)
 PASS_RE = re.compile(r"\b(pass|yes|true)\b", re.IGNORECASE)
 FAIL_RE = re.compile(r"\b(fail|no|false)\b", re.IGNORECASE)
-THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 # incorrect before correct so the longer token wins as a last-line word.
 VERDICT_LINE_RE = re.compile(
     r"""
@@ -888,59 +883,24 @@ def _clean_verdict_token(raw: str) -> str:
     return token.upper()
 
 
-def _answer_region(text: str) -> str:
-    """Prefer text after a closed ``</think>`` block; else the full string."""
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return ""
-    match = THINK_BLOCK_RE.search(cleaned)
-    if match:
-        remainder = (cleaned[: match.start()] + cleaned[match.end() :]).strip()
-        if remainder:
-            return remainder
-    return cleaned
-
-
-def majority_grade_verdict(verdicts: list[bool | None]) -> bool | None:
-    """Strict majority over ``len(verdicts)`` slots. Unparsed shots do not vote."""
-    n = len(verdicts)
-    if n == 0:
+def _verdict_from_text(snippet: str) -> bool | None:
+    """Map a snippet (extracted answer or post-think region) to a verdict."""
+    snippet = (snippet or "").strip()
+    if not snippet:
         return None
-    need = n // 2 + 1
-    n_true = sum(1 for value in verdicts if value is True)
-    n_false = sum(1 for value in verdicts if value is False)
-    if n_true >= need:
-        return True
-    if n_false >= need:
-        return False
-    return None
-
-
-def parse_grade_verdict(text: str) -> bool | None:
-    """Parse a 0/1 tag, Correct/Incorrect, or legacy Pass/Fail reply.
-
-    Prefers the last ``Answer:`` line, then ``<answer>`` tags / boxed /
-    last-line fallbacks. Returns None if unparseable. ``incorrect`` is
-    matched before ``correct`` so a last-line ``Incorrect`` is never read
-    as ``Correct``.
-    """
-    region = _answer_region(text)
-    if not region:
-        return None
-    extracted = split_answer_line(region)
-    if extracted is not None:
-        verdict = _label_verdict(_clean_verdict_token(extracted[1]))
+    if "\n" not in snippet:
+        verdict = _label_verdict(_clean_verdict_token(snippet))
         if verdict is not None:
             return verdict
-    tag_matches = list(ANSWER_TAG_RE.finditer(region))
+    tag_matches = list(ANSWER_TAG_RE.finditer(snippet))
     if tag_matches:
         return _label_verdict(tag_matches[-1].group(1))
-    boxed_matches = list(BOXED_RE.finditer(region))
+    boxed_matches = list(BOXED_RE.finditer(snippet))
     if boxed_matches:
         boxed = _label_verdict(_clean_verdict_token(boxed_matches[-1].group(1)))
         if boxed is not None:
             return boxed
-    lines = [line.strip() for line in region.splitlines() if line.strip()]
+    lines = [line.strip() for line in snippet.splitlines() if line.strip()]
     if not lines:
         return None
 
@@ -963,12 +923,47 @@ def parse_grade_verdict(text: str) -> bool | None:
 
     # Last resort: whole-region exclusive keyword match (legacy YES/NO dumps).
     # Do not search for correct/incorrect here — those words appear in prose.
-    has_pass = bool(PASS_RE.search(region))
-    has_fail = bool(FAIL_RE.search(region))
+    has_pass = bool(PASS_RE.search(snippet))
+    has_fail = bool(FAIL_RE.search(snippet))
     if has_pass and not has_fail:
         return True
     if has_fail and not has_pass:
         return False
+    return None
+
+
+def majority_grade_verdict(verdicts: list[bool | None]) -> bool | None:
+    """Strict majority over ``len(verdicts)`` slots. Unparsed shots do not vote."""
+    n = len(verdicts)
+    if n == 0:
+        return None
+    need = n // 2 + 1
+    n_true = sum(1 for value in verdicts if value is True)
+    n_false = sum(1 for value in verdicts if value is False)
+    if n_true >= need:
+        return True
+    if n_false >= need:
+        return False
+    return None
+
+
+def parse_grade_verdict(text: str) -> bool | None:
+    """Parse a 0/1 tag, Correct/Incorrect, or legacy Pass/Fail reply.
+
+    Uses the same answer extractor as test-takers (``Answer:`` line, then
+    ``<answer>`` tags, then freeform fallbacks). Returns None if unparseable.
+    ``incorrect`` is matched before ``correct`` so a last-line ``Incorrect``
+    is never read as ``Correct``.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    extracted = extract_freeform_answer(text)
+    region = after_last_think_close(text) or text
+    for snippet in (extracted, region):
+        verdict = _verdict_from_text(snippet)
+        if verdict is not None:
+            return verdict
     return None
 
 
@@ -990,20 +985,10 @@ def _shot_prediction_text(shot: dict) -> str:
     """Extracted answer shown to the judge; never includes text before last ``</think>``."""
     raw = str(shot.get("model_output") or "")
     extracted = str(shot.get("answer_prediction") or "")
-    text = (raw or extracted).strip()
-    remainder = after_last_think_close(text) if text else ""
-    search = remainder or text
-    line = split_answer_line(search) if search else None
-    if line is not None:
-        return line[1]
-    tagged = parse_answer_tagged_output(raw)
-    if tagged is not None:
-        return tagged[1]
-    source = raw if split_last_think_close(raw) is not None else (extracted or raw)
-    if split_last_think_close(source) is not None:
-        _, answer = parse_freeform_output(source)
-        return answer
-    return extracted or raw
+    source = (raw or extracted).strip()
+    if not source:
+        return ""
+    return extract_freeform_answer(source) or extracted or raw
 
 
 def _shot_judge_entry(shot: dict, judge_key: str) -> dict | None:

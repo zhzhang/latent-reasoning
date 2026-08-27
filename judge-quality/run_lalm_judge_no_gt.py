@@ -14,7 +14,7 @@ Sources, later runs only add models that are not already present:
     exp-mmar-question-difficulty/20260807T145000Z   # 5 models × 1000 q
     exp-mmar-question-difficulty/20260816T050944Z   # extra models × 784 q
     mmar-freeform                                   # collated pack (API, …)
-    mmar-freeform-5-shot                            # API models
+    mmar-freeform-5-shot-thinking                   # API models (volume root)
 
 The 1000-id list comes from the full MMAR run. Models that only exist
 on the 784-id packs are graded on the overlap.
@@ -49,10 +49,12 @@ import modal
 from aggregate import aggregate_difficulty, order_model_labels
 from mmar_common import write_json, write_jsonl
 from modal_cache import (
+    FREEFORM_THINKING_MOUNT,
     JUDGING_MOUNT,
     RESULTS_MOUNT,
     VOLUME_MOUNT,
     VLLM_WHEEL_INDEX,
+    freeform_thinking_volume,
     hf_secret,
     judging_volume,
     results_volume,
@@ -64,7 +66,7 @@ REMOTE_PACK_DIR = JUDGING_MOUNT / PACK_NAME
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
 FULL_MMAR_RUN_ID = "20260807T145000Z"
 OPEN_ENDED_RUN_ID = "20260816T050944Z"
-COLLATED_PACK = RESULTS_MOUNT / "mmar-freeform-5-shot"
+COLLATED_PACK = FREEFORM_THINKING_MOUNT
 FREEFORM_PACK = RESULTS_MOUNT / "mmar-freeform"
 LOCAL_FREEFORM_DIR = _REPO_ROOT / "outputs" / "mmar-freeform"
 LOCAL_FREEFORM_MOUNT = Path("/local-mmar-freeform")
@@ -260,7 +262,7 @@ def _source_model_dirs() -> list[tuple[str, Path]]:
             DEFAULT_OUTPUT_DIR / OPEN_ENDED_RUN_ID / "models",
         ),
         ("mmar-freeform", FREEFORM_PACK / "models"),
-        ("mmar-freeform-5-shot", COLLATED_PACK / "models"),
+        ("mmar-freeform-5-shot-thinking", COLLATED_PACK / "models"),
         ("local-mmar-freeform", LOCAL_FREEFORM_MOUNT / "models"),
     ]
 
@@ -392,6 +394,7 @@ def _stamp_manifest(
     volumes={
         VOLUME_MOUNT: volume,
         RESULTS_MOUNT: results_volume,
+        FREEFORM_THINKING_MOUNT: freeform_thinking_volume,
         JUDGING_MOUNT: judging_volume,
     },
 )
@@ -400,6 +403,7 @@ def prepare_pack(models: str = "all") -> dict:
     from grader import ROUND_ROBIN_SUITE
 
     results_volume.reload()
+    freeform_thinking_volume.reload()
     judging_volume.reload()
 
     ids_path = DEFAULT_OUTPUT_DIR / FULL_MMAR_RUN_ID / "question_ids.json"
