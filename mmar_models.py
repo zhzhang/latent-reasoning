@@ -12,12 +12,14 @@ from mmar_common import (
     AF3_THINK_SUFFIX,
     AF_NEXT_THINK_SUFFIX,
     ASSISTANT_THINK_OPEN,
+    MUSIC_FLAMINGO_THINK_SUFFIX,
     PREFIX_ASSISTANT_THINK_LABELS,
     build_mmar_freeform_prompt,
     build_mmar_prompt,
     ensure_assistant_think_open,
     parse_choice_output,
     parse_freeform_output,
+    parse_music_flamingo_output,
     parse_think_tagged_output,
 )
 
@@ -222,7 +224,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "top_k": 20,
             # Measured max output ~870 tokens; 2048 stops runaway CoT from
             # monopolizing KV without truncating real answers.
-            "max_tokens": 2048,
+            "max_tokens": 16384,
             "repetition_penalty": 1.0,
         },
     },
@@ -589,12 +591,126 @@ def _build_prompt(sample: dict, args: SimpleNamespace, *, think_suffix: str | No
 
 
 def _parse_fn_for(args: SimpleNamespace, default: Callable = parse_choice_output) -> Callable:
+    if default is parse_music_flamingo_output:
+        fallback = (
+            parse_freeform_output
+            if _prompt_mode(args) == "freeform"
+            else parse_think_tagged_output
+        )
+
+        def parse(raw_text, choices=None):
+            return parse_music_flamingo_output(
+                raw_text, choices, fallback=fallback
+            )
+
+        return parse
     if _prompt_mode(args) == "freeform":
         if default is parse_think_tagged_output:
             # Free-form still strips <think> blocks; choice matching is skipped.
             return parse_freeform_output
         return parse_freeform_output
     return default
+
+
+def _vllm_prompt_fn(label: str, args: SimpleNamespace) -> Callable[[dict], str]:
+    """String prompt builder used by the plain vLLM ``generate`` path."""
+    builders: dict[str, Callable] = {
+        "af-next-think": _af_next_prompt,
+        "music-flamingo": _music_flamingo_prompt,
+        "qwen3-omni": _qwen3_omni_prompt,
+        "qwen3-omni-instruct": _qwen3_omni_prompt,
+        "qwen2.5-omni-7b": _qwen25_omni_prompt,
+        "phi-4-multimodal": _phi4_prompt,
+    }
+    builder = builders.get(label, _build_prompt)
+
+    def prompt_fn(sample: dict) -> str:
+        return builder(sample, args)
+
+    return prompt_fn
+
+
+def _format_chat_messages(messages: list[dict]) -> str:
+    """Readable dump of ``LLM.chat`` / HF ``.chat`` message payloads."""
+    chunks: list[str] = []
+    for message in messages:
+        role = message.get("role") or "user"
+        chunks.append(f"role={role}")
+        chunks.append(_content_to_text(message.get("content")))
+        chunks.append("")
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            parts.append(str(item.get("text") or ""))
+        elif kind == "audio_url":
+            url = (item.get("audio_url") or {}).get("url") or ""
+            parts.append(f"<audio_url>{url}</audio_url>")
+        elif kind == "audio":
+            audio = item.get("audio") or item.get("audio_url") or ""
+            parts.append(f"<audio>{audio}</audio>")
+        else:
+            parts.append(str(item))
+    return "\n".join(parts)
+
+
+def render_prompt(
+    label: str,
+    sample: dict,
+    args: SimpleNamespace | None = None,
+) -> str:
+    """Return the text ``generate_batch`` would send for ``label``.
+
+    Audio is represented by the same placeholders used at generate time
+    (``<sound>``, ``<|audio_pad|>``, ``file://`` URLs, etc.). Chat backends
+    (``vllm_chat``, ``hf_chat``) dump the messages ``LLM.chat`` receives;
+    the model's Jinja chat template is applied later by vLLM / HF.
+    """
+    if label not in MODEL_SPECS:
+        raise ValueError(f"Unknown model label {label!r}")
+    ns = args or SimpleNamespace(prompt_mode="mc")
+    backend = str(MODEL_SPECS[label].get("backend") or "")
+
+    if backend == "hf_step":
+        return _step_audio_prompt(sample, ns)
+    if backend == "vllm_omni":
+        if label != "mimo-audio-7b":
+            raise ValueError(f"No Omni prompt builder for {label}")
+        return ensure_assistant_think_open(label, _mimo_audio_prompt(sample, ns))
+    if backend == "vllm_chat":
+        if label == "interactive-omni-8b":
+            messages = _interactive_omni_messages(sample, ns)
+        else:
+            messages = _audio_text_messages(sample, ns)
+        return _format_chat_messages(messages)
+    if backend == "hf_chat":
+        prompt = _build_prompt(sample, ns)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": sample["audio_path"]},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        return _format_chat_messages(messages)
+    if backend == "vllm_voxtral":
+        return _build_prompt(sample, ns)
+
+    prompt_fn = _vllm_prompt_fn(label, ns)
+    return ensure_assistant_think_open(label, prompt_fn(sample))
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +755,7 @@ def _music_flamingo_prompt(sample: dict, args: SimpleNamespace | None = None) ->
     question = _build_prompt(
         sample,
         args or SimpleNamespace(prompt_mode="mc"),
-        think_suffix=AF3_THINK_SUFFIX,
+        think_suffix=MUSIC_FLAMINGO_THINK_SUFFIX,
     )
     return (
         f"<|im_start|>system\n{MUSIC_FLAMINGO_SYSTEM}<|im_end|>\n"
@@ -840,7 +956,7 @@ def load_music_flamingo(args: SimpleNamespace):
     try:
         llm = LLM(model=local_id, **engine)
         print(f"Music Flamingo vLLM ready from {local_id} engine={engine}")
-        return {"backend": "vllm", "llm": llm, "parse_fn": parse_think_tagged_output}
+        return {"backend": "vllm", "llm": llm, "parse_fn": parse_music_flamingo_output}
     except Exception as exc:  # noqa: BLE001
         print(
             f"Music Flamingo vLLM load failed ({exc}); falling back to HF generate_batch"
@@ -848,8 +964,8 @@ def load_music_flamingo(args: SimpleNamespace):
         return _load_af_hf(
             local_id,
             args,
-            parse_fn=parse_think_tagged_output,
-            think_suffix=AF3_THINK_SUFFIX,
+            parse_fn=parse_music_flamingo_output,
+            think_suffix=MUSIC_FLAMINGO_THINK_SUFFIX,
         )
 
 
@@ -1351,18 +1467,7 @@ def generate_batch(
     parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output))
 
     if backend == "vllm":
-        if label == "af-next-think":
-            prompt_fn = lambda s: _af_next_prompt(s, args)  # noqa: E731
-        elif label == "music-flamingo":
-            prompt_fn = lambda s: _music_flamingo_prompt(s, args)  # noqa: E731
-        elif label in {"qwen3-omni", "qwen3-omni-instruct"}:
-            prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
-        elif label == "qwen2.5-omni-7b":
-            prompt_fn = lambda s: _qwen25_omni_prompt(s, args)  # noqa: E731
-        elif label == "phi-4-multimodal":
-            prompt_fn = lambda s: _phi4_prompt(s, args)  # noqa: E731
-        else:
-            prompt_fn = lambda s: _build_prompt(s, args)  # noqa: E731
+        prompt_fn = _vllm_prompt_fn(label, args)
         prompts, sampling = _build_vllm_audio_inputs(
             label,
             samples,
@@ -1391,9 +1496,12 @@ def generate_batch(
         sampling = resolve_sampling(label, args)
         think_suffix = handle.get("think_suffix")
         if think_suffix is None:
-            think_suffix = (
-                AF_NEXT_THINK_SUFFIX if label == "af-next-think" else AF3_THINK_SUFFIX
-            )
+            if label == "af-next-think":
+                think_suffix = AF_NEXT_THINK_SUFFIX
+            elif label == "music-flamingo":
+                think_suffix = MUSIC_FLAMINGO_THINK_SUFFIX
+            else:
+                think_suffix = AF3_THINK_SUFFIX
         # HF path has no per-row seeds in one generate call; run one sample at a
         # time so flattened question×shot rows keep distinct seeds.
         results: list[dict] = []
@@ -1947,18 +2055,7 @@ def generate_raw_trace(
     prompt_fallback = ""
 
     if backend == "vllm":
-        if label in {"qwen3-omni", "qwen3-omni-instruct"}:
-            prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
-        elif label == "qwen2.5-omni-7b":
-            prompt_fn = lambda s: _qwen25_omni_prompt(s, args)  # noqa: E731
-        elif label == "phi-4-multimodal":
-            prompt_fn = lambda s: _phi4_prompt(s, args)  # noqa: E731
-        elif label == "af-next-think":
-            prompt_fn = lambda s: _af_next_prompt(s, args)  # noqa: E731
-        elif label == "music-flamingo":
-            prompt_fn = lambda s: _music_flamingo_prompt(s, args)  # noqa: E731
-        else:
-            prompt_fn = lambda s: _build_prompt(s, args)  # noqa: E731
+        prompt_fn = _vllm_prompt_fn(label, args)
         prompt_fallback = ensure_assistant_think_open(label, prompt_fn(sample))
         prompts, sampling = _build_vllm_audio_inputs(
             label,

@@ -7,12 +7,17 @@ import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from tkinter import N
 from typing import Callable
 
 CHOICE_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 AF3_THINK_SUFFIX = "Please think and reason about the input audio before you respond."
 AF_NEXT_THINK_SUFFIX = (
     "Reason step by step with timestamps, then give the final answer."
+)
+MUSIC_FLAMINGO_THINK_SUFFIX = (
+    "Output the thinking process in <think> </think> and final answer in "
+    "<answer> </answer>"
 )
 ANSWER_MARKERS = (
     r"therefore[, ]+the answer is[:\s]*",
@@ -22,6 +27,7 @@ ANSWER_MARKERS = (
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 THINK_CLOSE = "</think>"
 THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+ANSWER_BLOCK_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 # Prefill on the assistant/model turn so these checkpoints enter native CoT.
 ASSISTANT_THINK_OPEN = "<think>\n"
 PREFIX_ASSISTANT_THINK_LABELS = frozenset(
@@ -200,7 +206,8 @@ def build_mmar_freeform_prompt(item, think_suffix: str | None = None):
     question = str(item["question"]).strip()
     prompt = (
         "Listen to the audio and answer the question. "
-        "Reason briefly, then give a concise final answer.\n"
+        "Reason step by step before answering, then give a concise, final answer in a single line in exactly this format:\n"
+        "Answer: <your answer>\n"
         f"This question is: {question}\n"
     )
     if think_suffix:
@@ -326,6 +333,50 @@ def parse_think_tagged_output(raw_text, choices):
         return thinking_prediction, ""
 
     return parse_choice_output(text, choices)
+
+
+def parse_answer_tagged_output(raw_text, choices=None):
+    """Extract ``(thinking, answer)`` from the last ``<answer>`` block.
+
+    Returns ``None`` when tags are missing or empty so callers can try other
+    extractors. Thinking is the last ``<think>`` prefix when present, else the
+    text before the answer tags. ``choices`` is used only to resolve the inner
+    text to a listed option.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    matches = list(ANSWER_BLOCK_RE.finditer(text))
+    if not matches:
+        return None
+    match = matches[-1]
+    answer_prediction = match.group(1).strip()
+    if not answer_prediction:
+        return None
+    prefix = text[: match.start()].strip()
+    split = split_last_think_close(prefix)
+    if split is not None:
+        thinking_prediction = _strip_think_tags(split[0])
+    else:
+        thinking_prediction = _strip_think_tags(prefix)
+    if choices:
+        matched = _match_choice_in_text(answer_prediction, choices)
+        if matched:
+            answer_prediction = matched
+    return thinking_prediction, answer_prediction
+
+
+def parse_music_flamingo_output(raw_text, choices=None, *, fallback=None):
+    """Music Flamingo: ``<answer>`` tags first, then ``fallback`` extractors.
+
+    Creators instruct the model to wrap the final answer in ``<answer>`` tags.
+    If that extractor fails, fall back to think-tagged (MC) or freeform rules.
+    """
+    tagged = parse_answer_tagged_output(raw_text, choices)
+    if tagged is not None:
+        return tagged
+    parser = fallback or parse_think_tagged_output
+    return parser(raw_text, choices)
 
 
 def parse_freeform_output(raw_text, choices=None):

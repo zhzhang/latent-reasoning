@@ -22,6 +22,7 @@ from mmar_common import (
     ensure_assistant_think_open,
     ensure_judge_schema,
     judge_label,
+    parse_answer_tagged_output,
     parse_freeform_output,
     recompute_multi_judge_scores,
     select_grade_question_ids,
@@ -978,6 +979,9 @@ def _shot_prediction_text(shot: dict) -> str:
     """Extracted answer shown to the judge; never includes text before last ``</think>``."""
     raw = str(shot.get("model_output") or "")
     extracted = str(shot.get("answer_prediction") or "")
+    tagged = parse_answer_tagged_output(raw)
+    if tagged is not None:
+        return tagged[1]
     source = raw if split_last_think_close(raw) is not None else (extracted or raw)
     if split_last_think_close(source) is not None:
         _, answer = parse_freeform_output(source)
