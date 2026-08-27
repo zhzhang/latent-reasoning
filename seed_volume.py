@@ -8,6 +8,7 @@ Layout on the ``latent-reasoning`` Volume:
       data/mmar-audio.tar.gz
     /models/nvidia/audio-flamingo-3-hf/
     /models/nvidia/audio-flamingo-next-think-hf/
+    /models/nvidia/music-flamingo-hf/
     /models/nvidia/audio-flamingo-2/
     /models/Qwen/Qwen3-Omni-30B-A3B-Thinking/
     /models/Qwen/Qwen3.6-35B-A3B-FP8/
@@ -67,6 +68,9 @@ MODEL_ALIASES: dict[str, str] = {
     "afnext-think": "nvidia/audio-flamingo-next-think-hf",
     "audio-flamingo-next-think": "nvidia/audio-flamingo-next-think-hf",
     "audio-flamingo-next-think-hf": "nvidia/audio-flamingo-next-think-hf",
+    "music-flamingo": "nvidia/music-flamingo-hf",
+    "music-flamingo-hf": "nvidia/music-flamingo-hf",
+    "mf": "nvidia/music-flamingo-hf",
     "af2": "nvidia/audio-flamingo-2",
     "audio-flamingo-2": "nvidia/audio-flamingo-2",
     "qwen3-omni": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
@@ -87,8 +91,9 @@ MODEL_ALIASES: dict[str, str] = {
     "qwen3.6-35b-a3b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6": "Qwen/Qwen3.6-35B-A3B-FP8",
-    "step-audio-2-mini": "stepfun-ai/Step-Audio-2-mini",
-    "step-audio-2": "stepfun-ai/Step-Audio-2-mini",
+    "step-audio-2-mini-think": "stepfun-ai/Step-Audio-2-mini-Think",
+    "step-audio-2-mini": "stepfun-ai/Step-Audio-2-mini-Think",
+    "step-audio-2": "stepfun-ai/Step-Audio-2-mini-Think",
     "mimo-audio-7b": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
     "mimo-audio-7b-instruct": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
     "mimo-audio-tokenizer": "XiaomiMiMo/MiMo-Audio-Tokenizer",
@@ -111,6 +116,7 @@ DEFAULT_MODELS = ("af3",)
 ALL_MODELS = (
     "af3",
     "af-next-think",
+    "music-flamingo",
     "af2",
     "qwen3-omni",
     "qwen3-omni-instruct",
@@ -120,7 +126,7 @@ ALL_MODELS = (
     "nemotron-3-nano-omni",
     "qwen2.5-3b",
     "qwen3.6-35b-a3b-fp8",
-    "step-audio-2-mini",
+    "step-audio-2-mini-think",
     "mimo-audio-7b",
     "interactive-omni-8b",
     "voxtral-small-24b",
@@ -129,6 +135,7 @@ ALL_MODELS = (
 # Checkpoints used by ``run_experiment.py --models all`` (no judges / unused AF2/AF3).
 EVAL_MODELS = (
     "af-next-think",
+    "music-flamingo",
     "mimo-audio-7b",
     "interactive-omni-8b",
     "qwen3-omni",
@@ -138,6 +145,7 @@ EVAL_MODELS = (
     "gemma-4-e4b",
     "qwen3-omni-instruct",
     "nemotron-3-nano-omni",
+    "step-audio-2-mini-think",
 )
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -375,7 +383,7 @@ def seed_model(
         "*.h5",
         "pytorch_model*.bin",
     ]
-    if "InteractiveOmni" not in repo_id and "interactive-omni" not in repo_id.lower():
+    if "InteractiveOmni" not in repo_id and "interactive-omni" not in repo_id.lower() and "Step-Audio" not in repo_id:
         patterns = ["*.onnx", *patterns]
 
     if hub_cache_layout:

@@ -22,6 +22,33 @@ ANSWER_MARKERS = (
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 THINK_CLOSE = "</think>"
 THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+# Prefill on the assistant/model turn so these checkpoints enter native CoT.
+ASSISTANT_THINK_OPEN = "<think>\n"
+PREFIX_ASSISTANT_THINK_LABELS = frozenset(
+    {
+        "af-next-think",
+        "music-flamingo",
+        "step-audio-2-mini-think",
+        "mimo-audio-7b",
+    }
+)
+_EMPTY_THINK_TAIL_RE = re.compile(r"<think>\s*</think>\s*$", re.IGNORECASE)
+
+
+def ensure_assistant_think_open(label: str, prompt: str) -> str:
+    """Make the assistant turn start with an open ``<think>`` for native CoT.
+
+    Strips a trailing empty ``<think></think>`` (the Qwen-style *disable*
+    pattern) then appends ``ASSISTANT_THINK_OPEN`` when it is not already
+    the last content.
+    """
+    if label not in PREFIX_ASSISTANT_THINK_LABELS:
+        return prompt
+    text = _EMPTY_THINK_TAIL_RE.sub("", prompt)
+    stripped = text.rstrip()
+    if stripped.lower().endswith("<think>"):
+        return text if text.endswith("\n") else f"{text}\n"
+    return f"{text}{ASSISTANT_THINK_OPEN}"
 
 
 # ---------------------------------------------------------------------------

@@ -271,6 +271,33 @@ def _unpack_generate_output(outputs):
     return outputs
 
 
+def _append_assistant_prefill(inputs, processor, text: str):
+    """Append tokenized assistant prefill (e.g. ``<think>\\n``) to ``input_ids``."""
+    import torch
+
+    if not text:
+        return inputs
+    tokenizer = processor_tokenizer(processor)
+    extra = tokenizer.encode(text, add_special_tokens=False)
+    if hasattr(extra, "tolist"):
+        extra = extra.tolist()
+    if extra and isinstance(extra[0], (list, tuple)):
+        extra = extra[0]
+    extra_ids = [int(x) for x in extra]
+    if not extra_ids:
+        return inputs
+    ids = inputs["input_ids"]
+    extra_t = torch.tensor([extra_ids], dtype=ids.dtype, device=ids.device)
+    if ids.shape[0] != 1:
+        extra_t = extra_t.expand(ids.shape[0], -1)
+    inputs["input_ids"] = torch.cat([ids, extra_t], dim=1)
+    mask = inputs.get("attention_mask")
+    if mask is not None:
+        ones = torch.ones(extra_t.shape, dtype=mask.dtype, device=mask.device)
+        inputs["attention_mask"] = torch.cat([mask, ones], dim=1)
+    return inputs
+
+
 def _build_conversations(samples, build_prompt):
     conversations = []
     for sample in samples:
@@ -298,6 +325,7 @@ def generate_batch(
     build_prompt,
     parse_output,
     generation_extra: dict | None = None,
+    assistant_prefill: str | None = None,
 ):
     """Run chat-template generation for a batch of MMAR samples."""
     import torch
@@ -312,6 +340,8 @@ def generate_batch(
         ),
         model,
     )
+    if assistant_prefill:
+        inputs = _append_assistant_prefill(inputs, processor, assistant_prefill)
 
     gen_kwargs = generation_kwargs(args, extra=generation_extra)
     with torch.inference_mode():

@@ -27,7 +27,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 from aggregate import MODEL_LABEL_ORDER
 from collate_mmar_freeform import ALL_API_LABELS, DEFAULT_OUT_DIR
 from mmar_common import (
+    AF3_THINK_SUFFIX,
     AF_NEXT_THINK_SUFFIX,
+    ASSISTANT_THINK_OPEN,
     build_mmar_freeform_prompt,
     count_wavs,
     load_jsonl,
@@ -62,6 +64,14 @@ SAMPLING_SOURCES: dict[str, dict[str, str]] = {
         "note": (
             "Card generate() example uses repetition_penalty=1.2. "
             "max_tokens=2048 matches generation_config; T=0.2 added for n-shot variance."
+        ),
+    },
+    "music-flamingo": {
+        "url": "https://huggingface.co/nvidia/music-flamingo-hf",
+        "label": "Hugging Face model card",
+        "note": (
+            "generation_config.json is greedy (max_new_tokens=2048). "
+            "T=0.2 added for n-shot variance; card optional example uses T=0.7, top_p=0.9."
         ),
     },
     "mimo-audio-7b": {
@@ -173,6 +183,20 @@ BENCHMARK_SCORES: dict[str, dict[str, dict[str, Any]]] = {
             "split": "v05.15.25 avg",
             "url": "https://huggingface.co/nvidia/audio-flamingo-next-think-hf",
             "label": "Hugging Face model card",
+        },
+    },
+    "music-flamingo": {
+        "mmar": {
+            "score": 48.66,
+            "split": "music",
+            "url": "https://arxiv.org/abs/2511.10289",
+            "label": "Music Flamingo paper",
+        },
+        "mmau": {
+            "score": 76.83,
+            "split": "music full-test",
+            "url": "https://arxiv.org/abs/2511.10289",
+            "label": "Music Flamingo paper",
         },
     },
     "mimo-audio-7b": {
@@ -723,10 +747,10 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
     """Reconstruct the freeform text prompts sent to each model."""
     base = build_mmar_freeform_prompt(item)
     af_base = build_mmar_freeform_prompt(item, think_suffix=AF_NEXT_THINK_SUFFIX)
+    mf_base = build_mmar_freeform_prompt(item, think_suffix=AF3_THINK_SUFFIX)
     step_system = (
-        "You are an expert in audio analysis. "
-        "Listen carefully and answer the question accurately.\n"
-        f"{base}"
+        "You are an expert in audio analysis. Activate deep thinking: "
+        "reason step by step about what you hear, then answer accurately."
     )
     return {
         "shared": base,
@@ -735,12 +759,20 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
             "<|im_start|>user\n"
             f"<sound>{af_base}<|im_end|>\n"
             "<|im_start|>assistant\n"
+            f"{ASSISTANT_THINK_OPEN}"
+        ),
+        "music-flamingo": (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"<sound>{mf_base}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            f"{ASSISTANT_THINK_OPEN}"
         ),
         "mimo-audio-7b": (
             "<|im_start|>user\n"
             f"<|sosp|><|empty|><|eosp|>{base}<|im_end|>\n"
             "<|im_start|>assistant\n"
-            "<think>\n\n</think>\n"
+            f"{ASSISTANT_THINK_OPEN}"
         ),
         "interactive-omni-8b": f"[audio attached]\n{base}",
         "qwen3-omni": (
@@ -759,10 +791,10 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
             "<|im_start|>assistant\n"
         ),
         "voxtral-small-24b": f"[audio attached]\n{base}",
-        "step-audio-2-mini": (
-            f"<|im_start|>system\n{step_system}<|im_end|>\n"
-            "<|im_start|>user\n<audio_patch><|im_end|>\n"
-            "<|im_start|>assistant\n"
+        "step-audio-2-mini-think": (
+            f"<|BOT|>system\n{step_system}<|EOT|>"
+            f"<|BOT|>human\n<audio_patch>{base}<|EOT|>"
+            f"<|BOT|>assistant\n\n{ASSISTANT_THINK_OPEN}"
         ),
         "gemini-3.7-flash": base,
         "gpt-4o-mini": base,
@@ -1649,6 +1681,7 @@ function bindSamplingModal() {
 function shortLabel(label) {
   const map = {
     "af-next-think": "af-next",
+    "music-flamingo": "mf",
     "mimo-audio-7b": "mimo",
     "interactive-omni-8b": "i-omni",
     "qwen3-omni": "qwen3",
@@ -1660,7 +1693,7 @@ function shortLabel(label) {
     "nemotron-3-nano-omni": "nemotron",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
-    "step-audio-2-mini": "step",
+    "step-audio-2-mini-think": "step",
   };
   return map[label] || label;
 }

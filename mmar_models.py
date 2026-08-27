@@ -9,9 +9,13 @@ from typing import Any, Callable
 
 from audio_flamingo_runtime import resolve_model_dir
 from mmar_common import (
+    AF3_THINK_SUFFIX,
     AF_NEXT_THINK_SUFFIX,
+    ASSISTANT_THINK_OPEN,
+    PREFIX_ASSISTANT_THINK_LABELS,
     build_mmar_freeform_prompt,
     build_mmar_prompt,
+    ensure_assistant_think_open,
     parse_choice_output,
     parse_freeform_output,
     parse_think_tagged_output,
@@ -28,7 +32,9 @@ _DEPLOY_MOUNT = Path("/root/deploy")
 # Backends that cannot use SamplingParams(n>1) shared prefill (Omni shares one
 # stage SamplingParams list per generate call; HF has no n= fork). Callers must
 # duplicate question×shot prompt rows for these.
-_DUPLICATE_SHOT_BACKENDS = frozenset({"vllm_omni", "hf_af_next", "hf_chat"})
+_DUPLICATE_SHOT_BACKENDS = frozenset(
+    {"vllm_omni", "hf_af_next", "hf_chat", "hf_step"}
+)
 
 
 def backend_duplicates_shots(backend: str) -> bool:
@@ -37,6 +43,7 @@ def backend_duplicates_shots(backend: str) -> bool:
 
 
 MODEL_SPECS: dict[str, dict[str, Any]] = {
+    # https://huggingface.co/nvidia/audio-flamingo-next-think-hf
     "af-next-think": {
         "model_id": "nvidia/audio-flamingo-next-think-hf",
         "gpu": "L40S",
@@ -59,9 +66,9 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
-        # HF generation_config.json: max_new_tokens=2048 + README repetition_penalty
-        # 1.2 (card omits do_sample ⇒ greedy). We use T=0.2 like Voxtral so
-        # n-shot difficulty runs keep mild sample variance.
+        # Card generate(): repetition_penalty=1.2; generation_config.json
+        # max_new_tokens=2048 and no do_sample (greedy). T=0.2 is for n-shot
+        # variance (official generate() is greedy; README example uses 4096).
         "native_thinking": True,
         "sampling": {
             "temperature": 0.2,
@@ -70,6 +77,35 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.2,
         },
     },
+    # https://huggingface.co/nvidia/music-flamingo-hf
+    "music-flamingo": {
+        "model_id": "nvidia/music-flamingo-hf",
+        "gpu": "L40S",
+        "backend": "vllm",
+        "engine": {
+            "dtype": "bfloat16",
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192,
+            "limit_mm_per_prompt": {"audio": 1},
+            "enforce_eager": False,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.95,
+            "disable_log_stats": False,
+            "attention_backend": "flashinfer",
+            "async_scheduling": True,
+        },
+        # Native CoT when the assistant turn is prefilled with ``<think>``.
+        # generation_config.json is greedy (max_new_tokens=2048). T=0.2 is for
+        # n-shot variance; the card's optional example uses T=0.7, top_p=0.9.
+        "native_thinking": True,
+        "sampling": {
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 2048,
+            "repetition_penalty": 1.0,
+        },
+    },
+    # https://github.com/XiaomiMiMo/MiMo-Audio/blob/main/src/mimo_audio/mimo_audio.py#L134
     "mimo-audio-7b": {
         "model_id": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
         "tokenizer_id": "XiaomiMiMo/MiMo-Audio-Tokenizer",
@@ -77,9 +113,11 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "backend": "vllm_omni",
         "deploy_config": str(DEPLOY_DIR / "mimo_audio_understand_throughput.yaml"),
         "sampling_rate": 24000,
-        # Official MiMo-Audio audio_understanding global sampler (HF card →
-        # XiaomiMiMo/MiMo-Audio inference): T=0.3, top_p=0.95. repetition_penalty
-        # 1.1 matches vLLM-Omni's mimo_audio deploy defaults.
+        # Native CoT when the assistant turn is prefilled with ``<think>``.
+        "native_thinking": True,
+        # Official audio_understanding global sampler: T=0.3, top_p=0.95.
+        # repetition_penalty 1.1 is vLLM-Omni's mimo_audio deploy default
+        # (https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/mimo_audio.yaml).
         "sampling": {
             "temperature": 0.3,
             "top_p": 0.95,
@@ -87,6 +125,25 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.1,
         },
     },
+    # Official StepAudio2 HF path. vLLM-Omni 0.24 does not register
+    # ``step_audio_2`` and infers TP world size 4.
+    # https://github.com/stepfun-ai/Step-Audio2/blob/main/examples-think.py
+    "step-audio-2-mini-think": {
+        "model_id": "stepfun-ai/Step-Audio-2-mini-Think",
+        "gpu": "A100-80GB",
+        "backend": "hf_step",
+        "sampling_rate": 16000,
+        "native_thinking": True,
+        # examples-think.py: T=0.7, max_new_tokens=2048. top_p=0.9 and
+        # repetition_penalty=1.05 match stepaudio2.py conversation defaults.
+        "sampling": {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 2048,
+            "repetition_penalty": 1.05,
+        },
+    },
+    # https://huggingface.co/sensenova/InteractiveOmni-8B
     "interactive-omni-8b": {
         "model_id": "sensenova/InteractiveOmni-8B",
         "gpu": "A100-80GB",
@@ -109,8 +166,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
-        # HF README: generation_config = dict(max_new_tokens=1024, do_sample=True)
-        # (no temp/top_p/rep → transformers sampling defaults T=1.0, top_p=1.0).
+        # README: generation_config = dict(max_new_tokens=1024, do_sample=True)
+        # (no temp/top_p/rep → transformers defaults T=1.0, top_p=1.0).
+        # tokenizer_config.json chat_template: skip CoT only when
+        # enable_thinking is explicitly false.
+        "native_thinking": True,
+        "enable_thinking": True,
         "sampling": {
             "temperature": 1.0,
             "top_p": 1.0,
@@ -119,6 +180,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         },
     },
     # MoE thinker-only (~3B active); fits one A100-80GB via plain vLLM.
+    # https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Thinking/blob/main/generation_config.json
     "qwen3-omni": {
         "model_id": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
         "gpu": "A100-80GB",
@@ -144,6 +206,11 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "async_scheduling": True,  # usually faster, but not all features supported
         },
         "native_thinking": True,
+        # chat_template.json: empty <think></think> only when enable_thinking
+        # is false. The generate() prompt omits that skip block.
+        # Card: Thinking models must use generation_config.json (T=0.6,
+        # top_p=0.95, top_k=20, max_new_tokens=32768). Cap max_tokens for MMAR.
+        "enable_thinking": True,
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
@@ -155,6 +222,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         },
     },
     # Dense 24B; ~55GB bf16 — needs A100-80GB. Mistral tokenizer/format.
+    # https://huggingface.co/mistralai/Voxtral-Small-24B-2507
     "voxtral-small-24b": {
         "model_id": "mistralai/Voxtral-Small-24B-2507",
         "gpu": "A100-80GB",
@@ -176,6 +244,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
         },
+        # Card: temperature=0.2 and top_p=0.95 for audio-understanding chat.
         "sampling": {
             "temperature": 0.2,
             "top_p": 0.95,
@@ -183,8 +252,9 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
-    # Dense 7B thinker-only; HF generation_config.json has no sampler.
-    # Official eval is greedy; T=0.2 keeps n-shot variance.
+    # Dense 7B thinker-only. Card generate() passes no sampler (greedy);
+    # generation_config.json has none either. T=0.2 keeps n-shot variance.
+    # https://huggingface.co/Qwen/Qwen2.5-Omni-7B
     "qwen2.5-omni-7b": {
         "model_id": "Qwen/Qwen2.5-Omni-7B",
         "gpu": "L40S",
@@ -212,6 +282,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     },
     # 5.6B; speech LoRA lives next to the checkpoint. Card uses
     # GenerationConfig.from_pretrained + max_new_tokens=1000 (greedy).
+    # T=0.2 keeps n-shot variance.
+    # https://huggingface.co/microsoft/Phi-4-multimodal-instruct
     "phi-4-multimodal": {
         "model_id": "microsoft/Phi-4-multimodal-instruct",
         "gpu": "L40S",
@@ -240,7 +312,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
-    # Effective 4B; native audio. Card Best Practices: T=1.0, top_p=0.95, top_k=64.
+    # Effective 4B; native audio.
+    # https://huggingface.co/google/gemma-4-E4B-it#best-practices
     "gemma-4-e4b": {
         "model_id": "google/gemma-4-E4B-it",
         "gpu": "L40S",
@@ -261,6 +334,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "async_scheduling": True,
             "allowed_local_media_path": "/",
         },
+        # chat_template.jinja: enable_thinking | default(false). Pass True so
+        # the template injects <|think|>.
+        # Best Practices / generation_config.json: T=1.0, top_p=0.95, top_k=64.
+        # README generate() example uses max_new_tokens=1024.
+        "native_thinking": True,
+        "enable_thinking": True,
         "sampling": {
             "temperature": 1.0,
             "top_p": 0.95,
@@ -269,37 +348,38 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
-    # Block-wise FP8 of Qwen3-Omni Instruct (thinker+talker MoE); H100 native FP8.
-    # Official Instruct eval is greedy.
-    "qwen3-omni-instruct": {
-        "model_id": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
-        "gpu": "H100",
-        "backend": "vllm",
-        "engine": {
-            "dtype": "auto",
-            "max_model_len": 4096,
-            "max_num_seqs": 64,
-            "max_num_batched_tokens": 8192,
-            # Unspecified modalities default to 999. Dummy video profiling then
-            # runs the FP8 vision MLP (hidden 4304) which is not divisible by
-            # the 128-wide block size and asserts in per_token_group_quant_fp8.
-            "limit_mm_per_prompt": {"audio": 1, "image": 0, "video": 0},
-            "enforce_eager": True,
-            "trust_remote_code": True,
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",
-            "async_scheduling": True,
-        },
-        "sampling": {
-            "temperature": 0.2,
-            "top_p": 1.0,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.0,
-        },
-    },
-    # Native FP8 MoE; thinking-mode card: T=0.6, top_p=0.95. Cap max_tokens for MMAR.
+    # # Block-wise FP8 of Qwen3-Omni Instruct (thinker+talker MoE); H100 native FP8.
+    # # Official Instruct eval is greedy.
+    # "qwen3-omni-instruct": {
+    #     "model_id": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
+    #     "gpu": "H100",
+    #     "backend": "vllm",
+    #     "engine": {
+    #         "dtype": "auto",
+    #         "max_model_len": 4096,
+    #         "max_num_seqs": 64,
+    #         "max_num_batched_tokens": 8192,
+    #         # Unspecified modalities default to 999. Dummy video profiling then
+    #         # runs the FP8 vision MLP (hidden 4304) which is not divisible by
+    #         # the 128-wide block size and asserts in per_token_group_quant_fp8.
+    #         "limit_mm_per_prompt": {"audio": 1, "image": 0, "video": 0},
+    #         "enforce_eager": True,
+    #         "trust_remote_code": True,
+    #         "enable_prefix_caching": True,
+    #         "gpu_memory_utilization": 0.95,
+    #         "disable_log_stats": False,
+    #         "attention_backend": "flashinfer",
+    #         "async_scheduling": True,
+    #     },
+    #     "sampling": {
+    #         "temperature": 0.2,
+    #         "top_p": 1.0,
+    #         "max_tokens": 2048,
+    #         "repetition_penalty": 1.0,
+    #     },
+    # },
+    # Native FP8 MoE. Cap max_tokens for MMAR (card recommends 20480).
+    # https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8#best-practices
     "nemotron-3-nano-omni": {
         "model_id": "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
         "gpu": "H100",
@@ -320,6 +400,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "allowed_local_media_path": "/",
         },
         "native_thinking": True,
+        "enable_thinking": True,
+        # Thinking-mode card / generation_config.json: T=0.6, top_p=0.95.
         "sampling": {
             "temperature": 0.6,
             "top_p": 0.95,
@@ -333,11 +415,22 @@ ALL_MODEL_LABELS = tuple(MODEL_SPECS.keys())
 NATIVE_THINKING_LABELS = frozenset(
     label for label, spec in MODEL_SPECS.items() if spec.get("native_thinking")
 )
+THINKING_ENABLED_LABELS = tuple(
+    label for label, spec in MODEL_SPECS.items() if spec.get("enable_thinking")
+)
 
 
 def has_native_thinking(label: str) -> bool:
     """True when the checkpoint emits native ``<think>`` / reasoning traces."""
     return label in NATIVE_THINKING_LABELS
+
+
+def chat_kwargs_for(label: str) -> dict[str, Any]:
+    """vLLM ``LLM.chat`` kwargs when the chat template defines ``enable_thinking``."""
+    spec = MODEL_SPECS.get(label) or {}
+    if "enable_thinking" not in spec:
+        return {}
+    return {"chat_template_kwargs": {"enable_thinking": bool(spec["enable_thinking"])}}
 
 
 def parse_model_list(value: str) -> list[str]:
@@ -350,7 +443,7 @@ def parse_model_list(value: str) -> list[str]:
             f"Unknown model label(s): {unknown}. "
             f"Choose from {list(ALL_MODEL_LABELS)} or 'all'."
         )
-    return raw
+    return list(dict.fromkeys(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +480,6 @@ def _load_audio_tuple(
     if max_samples is not None and audio.shape[0] > max_samples:
         audio = audio[: int(max_samples)]
     return audio, int(sr)
-
-
-# Step-Audio2 encoder pos-embed is n_audio_ctx=1500 after stride-2 conv, so mel
-# frames must be <= 3000. At 16 kHz that is just under 30s (exactly 30s → 3002).
-STEP_AUDIO_MAX_SAMPLES = 479_680
 
 
 def resolve_sampling(
@@ -517,6 +605,10 @@ AF_NEXT_SYSTEM = (
     "sound."
 )
 
+# Injected by nvidia/music-flamingo-hf chat_template.jinja when there is no
+# system turn.
+MUSIC_FLAMINGO_SYSTEM = "You are a helpful assistant."
+
 
 def _af_next_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     question = _build_prompt(
@@ -530,39 +622,69 @@ def _af_next_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
         "<|im_start|>user\n"
         f"<sound>{question}<|im_end|>\n"
         "<|im_start|>assistant\n"
+        f"{ASSISTANT_THINK_OPEN}"
     )
 
 
-def _step_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+def _music_flamingo_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    question = _build_prompt(
+        sample,
+        args or SimpleNamespace(prompt_mode="mc"),
+        think_suffix=AF3_THINK_SUFFIX,
+    )
+    return (
+        f"<|im_start|>system\n{MUSIC_FLAMINGO_SYSTEM}<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"<sound>{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        f"{ASSISTANT_THINK_OPEN}"
+    )
+
+
+STEP_AUDIO_SYSTEM = (
+    "You are an expert in audio analysis. Activate deep thinking: "
+    "reason step by step about what you hear, then answer accurately."
+)
+_STEP_AUDIO2_ROOT = Path("/opt/Step-Audio2")
+
+
+def _step_audio_messages(sample: dict, args: SimpleNamespace | None = None) -> list[dict]:
+    """Official StepAudio2 chat turns (examples-think.py / MMAU text)."""
     ns = args or SimpleNamespace(prompt_mode="mc")
     question = _build_prompt(sample, ns)
-    if _prompt_mode(ns) == "freeform":
-        system = (
-            "You are an expert in audio analysis. "
-            "Listen carefully and answer the question accurately.\n"
-            f"{question}"
-        )
-    else:
-        system = (
-            "You are an expert in audio analysis. "
-            "Listen carefully and answer the multiple-choice question accurately.\n"
-            f"{question}"
-        )
+    return [
+        {"role": "system", "content": STEP_AUDIO_SYSTEM},
+        {
+            "role": "human",
+            "content": [
+                {"type": "audio", "audio": sample["audio_path"]},
+                {"type": "text", "text": question},
+            ],
+        },
+        {"role": "assistant", "content": f"\n{ASSISTANT_THINK_OPEN}", "eot": False},
+    ]
+
+
+def _step_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
+    """String wrap for viewers; generation uses ``_step_audio_messages``."""
+    ns = args or SimpleNamespace(prompt_mode="mc")
+    question = _build_prompt(sample, ns)
     return (
-        f"<|im_start|>system\n{system}<|im_end|>\n"
-        "<|im_start|>user\n<audio_patch><|im_end|>\n"
-        "<|im_start|>assistant\n"
+        f"<|BOT|>system\n{STEP_AUDIO_SYSTEM}<|EOT|>"
+        f"<|BOT|>human\n<audio_patch>{question}<|EOT|>"
+        f"<|BOT|>assistant\n\n{ASSISTANT_THINK_OPEN}"
     )
 
 
 def _mimo_audio_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     # Placeholder audio span; waveform is supplied via multi_modal_data.
+    # Open ``<think>`` (not an empty close) so MiMo enters native CoT.
     return (
         "<|im_start|>user\n"
         f"<|sosp|><|empty|><|eosp|>{question}<|im_end|>\n"
         "<|im_start|>assistant\n"
-        "<think>\n\n</think>\n"
+        f"{ASSISTANT_THINK_OPEN}"
     )
 
 
@@ -582,7 +704,8 @@ def _interactive_omni_messages(sample: dict, args: SimpleNamespace | None = None
 def _qwen3_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     # Qwen3-Omni Thinking primary examples omit a system turn; the chat
     # template only emits one when messages[0].role == "system". Instruct
-    # eval notes also say no system prompt.
+    # eval notes also say no system prompt. Thinking stays on: the template
+    # injects empty <think></think> only when enable_thinking is false.
     question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     return (
         "<|im_start|>user\n"
@@ -674,11 +797,7 @@ def load_af_next(args: SimpleNamespace):
 
     spec = MODEL_SPECS["af-next-think"]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    engine = dict(spec["engine"])
-    if getattr(args, "max_num_seqs", None):
-        engine["max_num_seqs"] = int(args.max_num_seqs)
-    if getattr(args, "gpu_memory_utilization", None):
-        engine["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
+    engine = _apply_engine_overrides(spec["engine"], args)
 
     # Prefer native MusicFlamingo (vLLM 0.24).
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -692,10 +811,46 @@ def load_af_next(args: SimpleNamespace):
         return {"backend": "vllm", "llm": llm, "parse_fn": parse_think_tagged_output}
     except Exception as exc:  # noqa: BLE001
         print(f"AF-Next vLLM load failed ({exc}); falling back to HF generate_batch")
-        return _load_af_next_hf(local_id, args)
+        return _load_af_hf(
+            local_id,
+            args,
+            parse_fn=parse_think_tagged_output,
+            think_suffix=AF_NEXT_THINK_SUFFIX,
+        )
 
 
-def _load_af_next_hf(local_id: str, args: SimpleNamespace):
+def load_music_flamingo(args: SimpleNamespace):
+    from vllm import LLM
+
+    spec = MODEL_SPECS["music-flamingo"]
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = _apply_engine_overrides(spec["engine"], args)
+
+    # Native AudioFlamingo3 path in vLLM 0.24 (same image as AF-Next).
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    try:
+        llm = LLM(model=local_id, **engine)
+        print(f"Music Flamingo vLLM ready from {local_id} engine={engine}")
+        return {"backend": "vllm", "llm": llm, "parse_fn": parse_think_tagged_output}
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Music Flamingo vLLM load failed ({exc}); falling back to HF generate_batch"
+        )
+        return _load_af_hf(
+            local_id,
+            args,
+            parse_fn=parse_think_tagged_output,
+            think_suffix=AF3_THINK_SUFFIX,
+        )
+
+
+def _load_af_hf(
+    local_id: str,
+    args: SimpleNamespace,
+    *,
+    parse_fn: Callable,
+    think_suffix: str | None,
+):
     import torch
     from transformers import AutoModelForSeq2SeqLM, AutoProcessor
 
@@ -716,7 +871,7 @@ def _load_af_next_hf(local_id: str, args: SimpleNamespace):
     cast_model_floating_tensors(model, target_dtype)
     model.eval()
     print(
-        f"AF-Next HF ready: class={type(model).__name__} "
+        f"Audio Flamingo HF ready: class={type(model).__name__} "
         f"param_dtype={model_param_dtype(model)} "
         f"audio_tower_dtype={audio_tower_dtype(model)} "
         f"device={model_input_device(model)}"
@@ -725,7 +880,8 @@ def _load_af_next_hf(local_id: str, args: SimpleNamespace):
         "backend": "hf_af_next",
         "model": model,
         "processor": processor,
-        "parse_fn": parse_think_tagged_output,
+        "parse_fn": parse_fn,
+        "think_suffix": think_suffix,
     }
 
 
@@ -739,29 +895,28 @@ def _resolve_deploy_path(path: str) -> str:
     return str(candidate)
 
 
-def load_step_audio(args: SimpleNamespace):
-    from vllm_omni.entrypoints.omni import Omni
+def _ensure_stepaudio2_path() -> None:
+    """Official ``stepaudio2.py`` lives in the cloned Step-Audio2 repo."""
+    import sys
 
-    spec = MODEL_SPECS["step-audio-2-mini"]
+    root = str(_STEP_AUDIO2_ROOT)
+    if _STEP_AUDIO2_ROOT.is_dir() and root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def load_step_audio(args: SimpleNamespace):
+    _ensure_stepaudio2_path()
+    from stepaudio2 import StepAudio2
+
+    spec = MODEL_SPECS["step-audio-2-mini-think"]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    stage_configs_path = _resolve_deploy_path(
-        getattr(args, "deploy_config", None) or spec["deploy_config"]
-    )
-    omni = Omni(
-        model=local_id,
-        stage_configs_path=stage_configs_path,
-        trust_remote_code=True,
-    )
-    print(
-        f"Step-Audio-2-mini Omni ready from {local_id} "
-        f"stage_configs={stage_configs_path}"
-    )
+    model = StepAudio2(local_id)
+    print(f"Step-Audio-2-mini-Think HF ready from {local_id}")
     return {
-        "backend": "vllm_omni",
-        "llm": omni,
+        "backend": "hf_step",
+        "model": model,
         "sampling_rate": int(spec["sampling_rate"]),
-        "parse_fn": parse_choice_output,
-        "stages": 1,
+        "parse_fn": parse_think_tagged_output,
     }
 
 
@@ -793,7 +948,7 @@ def load_mimo_audio(args: SimpleNamespace):
         "backend": "vllm_omni",
         "llm": omni,
         "sampling_rate": int(spec["sampling_rate"]),
-        "parse_fn": parse_choice_output,
+        "parse_fn": parse_think_tagged_output,
         "stages": 2,
     }
 
@@ -832,18 +987,15 @@ def load_interactive_omni(args: SimpleNamespace):
     _ensure_transformers_onnx_shim()
     spec = MODEL_SPECS["interactive-omni-8b"]
     local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    engine = dict(spec["engine"])
-    if getattr(args, "max_num_seqs", None):
-        engine["max_num_seqs"] = int(args.max_num_seqs)
-    if getattr(args, "gpu_memory_utilization", None):
-        engine["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
+    engine = _apply_engine_overrides(spec["engine"], args)
     try:
         llm = LLM(model=local_id, **engine)
         print(f"InteractiveOmni vLLM(transformers) ready from {local_id}")
         return {
             "backend": "vllm_chat",
             "llm": llm,
-            "parse_fn": parse_choice_output,
+            "parse_fn": parse_think_tagged_output,
+            "chat_kwargs": chat_kwargs_for("interactive-omni-8b"),
         }
     except Exception as exc:  # noqa: BLE001 — fall back to HF chat path
         print(
@@ -910,7 +1062,8 @@ def _load_interactive_omni_hf(local_id: str):
         "backend": "hf_chat",
         "model": model,
         "tokenizer": tokenizer,
-        "parse_fn": parse_choice_output,
+        "parse_fn": parse_think_tagged_output,
+        "chat_kwargs": chat_kwargs_for("interactive-omni-8b"),
     }
 
 
@@ -922,7 +1075,46 @@ def _apply_engine_overrides(engine: dict, args: SimpleNamespace) -> dict:
         out["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
     if getattr(args, "max_model_len", None):
         out["max_model_len"] = int(args.max_model_len)
+    if getattr(args, "enforce_eager", None) is not None:
+        if bool(args.enforce_eager):
+            out.update(_eager_startup_kwargs())
+        else:
+            out["enforce_eager"] = False
     return out
+
+
+def _engine_arg_names() -> frozenset[str]:
+    """Top-level ``LLM(...)`` / ``EngineArgs`` field names for this vLLM."""
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+    except ImportError:
+        return frozenset()
+    fields = getattr(EngineArgs, "__dataclass_fields__", None)
+    if fields:
+        return frozenset(fields)
+    model_fields = getattr(EngineArgs, "model_fields", None)
+    if model_fields:
+        return frozenset(model_fields)
+    return frozenset()
+
+
+def _eager_startup_kwargs() -> dict[str, Any]:
+    """Skip torch.compile, CUDA graphs, and kernel autotune warmup.
+
+    ``enforce_eager`` is the portable knob (vLLM 0.24+). Newer EngineArgs also
+    expose FlashInfer / JIT warmup flags and ``optimization_level``.
+    """
+    known = _engine_arg_names()
+    wanted: dict[str, Any] = {
+        "enforce_eager": True,
+        "enable_flashinfer_autotune": False,
+        "enable_jit_warmup": False,
+        "enable_cutedsl_warmup": False,
+        "optimization_level": 0,
+    }
+    if not known:
+        return {"enforce_eager": True}
+    return {key: value for key, value in wanted.items() if key in known}
 
 
 def load_qwen3_omni(args: SimpleNamespace):
@@ -998,9 +1190,9 @@ def load_gemma_4_e4b(args: SimpleNamespace):
     return {
         "backend": "vllm_chat",
         "llm": llm,
-        "parse_fn": parse_choice_output,
+        "parse_fn": parse_think_tagged_output,
         "messages_fn": "audio_text",
-        "chat_kwargs": {"chat_template_kwargs": {"enable_thinking": False}},
+        "chat_kwargs": chat_kwargs_for("gemma-4-e4b"),
     }
 
 
@@ -1017,7 +1209,7 @@ def load_nemotron_omni(args: SimpleNamespace):
         "llm": llm,
         "parse_fn": parse_think_tagged_output,
         "messages_fn": "audio_text",
-        "chat_kwargs": {"chat_template_kwargs": {"enable_thinking": True}},
+        "chat_kwargs": chat_kwargs_for("nemotron-3-nano-omni"),
     }
 
 
@@ -1084,7 +1276,7 @@ def _build_vllm_audio_inputs(
         )
         prompts.append(
             {
-                "prompt": prompt_fn(sample),
+                "prompt": ensure_assistant_think_open(label, prompt_fn(sample)),
                 "multi_modal_data": {"audio": audio},
             }
         )
@@ -1152,6 +1344,8 @@ def generate_batch(
     if backend == "vllm":
         if label == "af-next-think":
             prompt_fn = lambda s: _af_next_prompt(s, args)  # noqa: E731
+        elif label == "music-flamingo":
+            prompt_fn = lambda s: _music_flamingo_prompt(s, args)  # noqa: E731
         elif label in {"qwen3-omni", "qwen3-omni-instruct"}:
             prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
         elif label == "qwen2.5-omni-7b":
@@ -1186,6 +1380,11 @@ def generate_batch(
         if n_completions != 1:
             raise ValueError("hf_af_next requires expanded shot rows (n_completions=1)")
         sampling = resolve_sampling(label, args)
+        think_suffix = handle.get("think_suffix")
+        if think_suffix is None:
+            think_suffix = (
+                AF_NEXT_THINK_SUFFIX if label == "af-next-think" else AF3_THINK_SUFFIX
+            )
         # HF path has no per-row seeds in one generate call; run one sample at a
         # time so flattened question×shot rows keep distinct seeds.
         results: list[dict] = []
@@ -1197,10 +1396,15 @@ def generate_batch(
                     handle["processor"],
                     [sample],
                     args,
-                    build_prompt=lambda item: _build_prompt(
-                        item, args, think_suffix=AF_NEXT_THINK_SUFFIX
+                    build_prompt=lambda item, suffix=think_suffix: _build_prompt(
+                        item, args, think_suffix=suffix
                     ),
                     parse_output=parse_fn,
+                    assistant_prefill=(
+                        ASSISTANT_THINK_OPEN
+                        if label in PREFIX_ASSISTANT_THINK_LABELS
+                        else None
+                    ),
                     generation_extra={
                         "repetition_penalty": float(
                             sampling.get("repetition_penalty", 1.0)
@@ -1214,20 +1418,19 @@ def generate_batch(
             )
         return results
 
+    if backend == "hf_step":
+        if n_completions != 1:
+            raise ValueError("hf_step requires expanded shot rows (n_completions=1)")
+        return [
+            _generate_step_audio_hf(handle, sample, args, seed, label=label)
+            for sample, seed in zip(samples, seeds)
+        ]
+
     if backend == "vllm_omni":
         if n_completions != 1:
             raise ValueError("vllm_omni requires expanded shot rows (n_completions=1)")
-        if label == "step-audio-2-mini":
-            prompt_fn = lambda s: _step_audio_prompt(s, args)  # noqa: E731
-            # Step-Audio2 Thinker can emit audio tokens (ids >= 151696). Without
-            # stopping at Qwen <|im_end|>, ASR-style text answers detokenize to
-            # empty after the thinker filters to text-only tokens (< 151688).
-            stop_token_ids = [151645]
-            repetition_penalty = 1.05
-        elif label == "mimo-audio-7b":
+        if label == "mimo-audio-7b":
             prompt_fn = lambda s: _mimo_audio_prompt(s, args)  # noqa: E731
-            stop_token_ids = None
-            repetition_penalty = None
         else:
             raise ValueError(f"No Omni prompt builder for {label}")
         prompts, sampling = _build_vllm_audio_inputs(
@@ -1238,15 +1441,9 @@ def generate_batch(
             args=args,
             seeds=seeds,
             n_completions=1,
-            stop_token_ids=stop_token_ids,
-            repetition_penalty=repetition_penalty,
-            max_audio_samples=(
-                STEP_AUDIO_MAX_SAMPLES if label == "step-audio-2-mini" else None
-            ),
         )
-        # Text-only MMAR answers: prefer text modality so audio-token stages
-        # are skipped / discouraged when the pipeline supports it.
-        if label in {"mimo-audio-7b", "step-audio-2-mini"}:
+        # Text-only MMAR answers: skip Token2Wav when the pipeline supports it.
+        if label == "mimo-audio-7b":
             for prompt in prompts:
                 prompt["modalities"] = ["text"]
         texts = _omni_generate_texts(
@@ -1271,7 +1468,7 @@ def generate_batch(
             _sampling_params_for_request(label, args, seed, n=n_completions)
             for seed in seeds
         ]
-        chat_kwargs = dict(handle.get("chat_kwargs") or {})
+        chat_kwargs = dict(handle.get("chat_kwargs") or chat_kwargs_for(label))
         outputs = handle["llm"].chat(
             messages, sampling_params=sampling, **chat_kwargs
         )
@@ -1486,6 +1683,35 @@ def _collect_omni_texts(omni_outputs: Any, *, n: int) -> list[str]:
     return texts
 
 
+def _generate_step_audio_hf(
+    handle: dict,
+    sample: dict,
+    args: SimpleNamespace,
+    seed: int,
+    *,
+    label: str = "step-audio-2-mini-think",
+) -> dict:
+    from audio_flamingo_runtime import seed_everything
+
+    seed_everything(int(seed))
+    sampling = resolve_sampling(label, args)
+    temperature = float(sampling["temperature"])
+    gen_kwargs: dict[str, Any] = {
+        "max_new_tokens": int(sampling["max_tokens"]),
+        "repetition_penalty": float(sampling.get("repetition_penalty", 1.0)),
+        "do_sample": temperature > 0,
+    }
+    if temperature > 0:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = float(sampling.get("top_p", 1.0))
+    _, text, _ = handle["model"](_step_audio_messages(sample, args), **gen_kwargs)
+    return _output_dict(
+        str(text or ""),
+        sample.get("choices") or [],
+        parse_fn=_parse_fn_for(args, handle.get("parse_fn", parse_think_tagged_output)),
+    )
+
+
 def _generate_interactive_omni_hf(
     handle: dict,
     sample: dict,
@@ -1532,7 +1758,7 @@ def _generate_interactive_omni_hf(
     return _output_dict(
         str(response or ""),
         sample.get("choices") or [],
-        parse_fn=_parse_fn_for(args, parse_choice_output),
+        parse_fn=_parse_fn_for(args, handle.get("parse_fn", parse_choice_output)),
     )
 
 
@@ -1542,7 +1768,9 @@ def _generate_interactive_omni_hf(
 
 _LOADERS = {
     "af-next-think": load_af_next,
+    "music-flamingo": load_music_flamingo,
     "mimo-audio-7b": load_mimo_audio,
+    "step-audio-2-mini-think": load_step_audio,
     "interactive-omni-8b": load_interactive_omni,
     "qwen3-omni": load_qwen3_omni,
     "qwen3-omni-instruct": load_qwen3_omni_instruct,
@@ -1563,3 +1791,316 @@ def load_model(label: str, args: SimpleNamespace):
 def generate_one(label: str, handle, sample: dict, args: SimpleNamespace) -> dict:
     """Single-sample convenience wrapper around ``generate_batch``."""
     return generate_batch(label, handle, [sample], args, seeds=[int(args.seed)])[0]
+
+
+def _unwrap_tokenizer(tokenizer: Any) -> Any:
+    for attr in ("tokenizer", "_tokenizer"):
+        inner = getattr(tokenizer, attr, None)
+        if inner is not None and inner is not tokenizer:
+            return inner
+    return tokenizer
+
+
+def _int_ids(raw: Any) -> list[int]:
+    if raw is None:
+        return []
+    # tokenizers.Encoding (rust fast tokenizer.encode)
+    ids = getattr(raw, "ids", None)
+    if ids is not None and not isinstance(raw, (bytes, str)):
+        raw = ids
+    # transformers BatchEncoding / BatchFeature
+    elif hasattr(raw, "input_ids"):
+        raw = raw["input_ids"] if hasattr(raw, "__getitem__") else raw.input_ids
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    if isinstance(raw, int):
+        return [int(raw)]
+    if isinstance(raw, (str, bytes)):
+        raise TypeError(f"cannot coerce {type(raw).__name__} to token ids")
+    # Nested batch: [[ids...]]
+    if raw and isinstance(raw[0], (list, tuple)):
+        raw = raw[0]
+    return [int(x) for x in list(raw)]
+
+
+def _token_pieces(tokenizer: Any, token_ids: list[int]) -> list[dict[str, Any]]:
+    """Per-id vocab piece + decoded text (skip_special_tokens=False)."""
+    tok = _unwrap_tokenizer(tokenizer) if tokenizer is not None else None
+    convert = getattr(tok, "convert_ids_to_tokens", None) if tok is not None else None
+    decode = getattr(tok, "decode", None) if tok is not None else None
+    pieces: list[dict[str, Any]] = []
+    for tid in token_ids:
+        token_name: str | None = None
+        if callable(convert):
+            try:
+                converted = convert(tid)
+                if isinstance(converted, list):
+                    converted = converted[0] if converted else None
+                if converted is not None:
+                    token_name = str(converted)
+            except Exception:
+                token_name = None
+        text = ""
+        if callable(decode):
+            try:
+                text = decode([tid], skip_special_tokens=False)
+            except TypeError:
+                try:
+                    text = decode([tid])
+                except Exception:
+                    text = ""
+            except Exception:
+                text = ""
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        if not text and token_name:
+            text = token_name
+        pieces.append({"id": int(tid), "token": token_name, "text": text})
+    return pieces
+
+
+def _decode_ids(tokenizer: Any, token_ids: list[int]) -> str:
+    tok = _unwrap_tokenizer(tokenizer) if tokenizer is not None else None
+    decode = getattr(tok, "decode", None) if tok is not None else None
+    if not callable(decode) or not token_ids:
+        return "".join(p["text"] for p in _token_pieces(tokenizer, token_ids))
+    try:
+        text = decode(token_ids, skip_special_tokens=False)
+    except TypeError:
+        text = decode(token_ids)
+    return "" if text is None else str(text)
+
+
+def _tokenizer_of(handle: dict) -> Any:
+    if handle.get("tokenizer") is not None:
+        return handle["tokenizer"]
+    llm = handle.get("llm")
+    if llm is not None and hasattr(llm, "get_tokenizer"):
+        try:
+            return llm.get_tokenizer()
+        except Exception:
+            return None
+    return None
+
+
+def _trace_from_ids(
+    tokenizer: Any,
+    token_ids: list[int],
+    *,
+    text_fallback: str | None = None,
+) -> dict[str, Any]:
+    ids = _int_ids(token_ids)
+    pieces = _token_pieces(tokenizer, ids)
+    decoded = _decode_ids(tokenizer, ids) if ids else (text_fallback or "")
+    concat = "".join(piece["text"] for piece in pieces)
+    return {
+        "ids": ids,
+        "pieces": pieces,
+        "text": decoded or concat or (text_fallback or ""),
+        "text_concat": concat,
+        "n_tokens": len(ids),
+    }
+
+
+def _request_output_ids(output: Any) -> tuple[list[int], list[int], str, str | None]:
+    """Return (prompt_ids, output_ids, output_text, finish_reason) from vLLM."""
+    prompt_ids = _int_ids(getattr(output, "prompt_token_ids", None))
+    completions = getattr(output, "outputs", None) or []
+    first = completions[0] if completions else None
+    output_ids = _int_ids(getattr(first, "token_ids", None) if first is not None else None)
+    output_text = ""
+    if first is not None and getattr(first, "text", None) is not None:
+        output_text = str(first.text)
+    elif getattr(output, "text", None) is not None:
+        output_text = str(output.text)
+    finish = getattr(first, "finish_reason", None) if first is not None else None
+    return prompt_ids, output_ids, output_text, str(finish) if finish else None
+
+
+def generate_raw_trace(
+    label: str,
+    handle: dict,
+    sample: dict,
+    args: SimpleNamespace,
+) -> dict[str, Any]:
+    """One-sample generate that keeps prompt/output token ids as consumed.
+
+    ``prompt.text`` / ``output.text`` are ``tokenizer.decode`` of those ids
+    (special tokens kept). ``pieces`` is the per-token split.
+    """
+    backend = handle["backend"]
+    seed = int(getattr(args, "seed", 0) or 0)
+    tokenizer = _tokenizer_of(handle)
+    prompt_ids: list[int] = []
+    output_ids: list[int] = []
+    output_text = ""
+    finish_reason: str | None = None
+    prompt_fallback = ""
+
+    if backend == "vllm":
+        if label in {"qwen3-omni", "qwen3-omni-instruct"}:
+            prompt_fn = lambda s: _qwen3_omni_prompt(s, args)  # noqa: E731
+        elif label == "qwen2.5-omni-7b":
+            prompt_fn = lambda s: _qwen25_omni_prompt(s, args)  # noqa: E731
+        elif label == "phi-4-multimodal":
+            prompt_fn = lambda s: _phi4_prompt(s, args)  # noqa: E731
+        elif label == "af-next-think":
+            prompt_fn = lambda s: _af_next_prompt(s, args)  # noqa: E731
+        elif label == "music-flamingo":
+            prompt_fn = lambda s: _music_flamingo_prompt(s, args)  # noqa: E731
+        else:
+            prompt_fn = lambda s: _build_prompt(s, args)  # noqa: E731
+        prompt_fallback = ensure_assistant_think_open(label, prompt_fn(sample))
+        prompts, sampling = _build_vllm_audio_inputs(
+            label,
+            [sample],
+            prompt_fn=prompt_fn,
+            sampling_rate=16000,
+            args=args,
+            seeds=[seed],
+            n_completions=1,
+        )
+        generate_kwargs: dict[str, Any] = {}
+        if handle.get("lora_request") is not None:
+            generate_kwargs["lora_request"] = handle["lora_request"]
+        outputs = handle["llm"].generate(
+            prompts, sampling_params=sampling, **generate_kwargs
+        )
+        prompt_ids, output_ids, output_text, finish_reason = _request_output_ids(
+            outputs[0]
+        )
+        if getattr(outputs[0], "prompt", None):
+            prompt_fallback = str(outputs[0].prompt)
+
+    elif backend == "vllm_chat":
+        if handle.get("messages_fn") == "audio_text":
+            messages = [_audio_text_messages(sample, args)]
+        else:
+            messages = [_interactive_omni_messages(sample, args)]
+        sampling = [_sampling_params_for_request(label, args, seed, n=1)]
+        chat_kwargs = dict(handle.get("chat_kwargs") or chat_kwargs_for(label))
+        outputs = handle["llm"].chat(
+            messages, sampling_params=sampling, **chat_kwargs
+        )
+        prompt_ids, output_ids, output_text, finish_reason = _request_output_ids(
+            outputs[0]
+        )
+        if getattr(outputs[0], "prompt", None):
+            prompt_fallback = str(outputs[0].prompt)
+
+    elif backend == "hf_chat":
+        parsed = _generate_interactive_omni_hf(
+            handle, sample, args, seed, label=label
+        )
+        output_text = str(parsed.get("model_output") or "")
+        prompt_fallback = _build_prompt(sample, args)
+        tok = tokenizer
+        if tok is not None and hasattr(tok, "apply_chat_template"):
+            template_kwargs = dict(
+                (handle.get("chat_kwargs") or chat_kwargs_for(label)).get(
+                    "chat_template_kwargs"
+                )
+                or {}
+            )
+            hf_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": sample["audio_path"]},
+                        {"type": "text", "text": prompt_fallback},
+                    ],
+                }
+            ]
+            try:
+                encoded = tok.apply_chat_template(
+                    hf_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
+                prompt_ids = _int_ids(encoded)
+            except Exception as exc:  # noqa: BLE001 — audio chat templates vary
+                print(f"[{label}] apply_chat_template failed ({exc}); text-only tokenize")
+                try:
+                    encoded = tok.apply_chat_template(
+                        [{"role": "user", "content": prompt_fallback}],
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        **template_kwargs,
+                    )
+                    prompt_ids = _int_ids(encoded)
+                except Exception:
+                    encode = getattr(tok, "encode", None)
+                    if callable(encode):
+                        prompt_ids = _int_ids(encode(prompt_fallback))
+        encode = getattr(tokenizer, "encode", None) if tokenizer else None
+        if output_text and callable(encode):
+            try:
+                output_ids = _int_ids(encode(output_text, add_special_tokens=False))
+            except TypeError:
+                output_ids = _int_ids(encode(output_text))
+        finish_reason = "hf_chat"
+
+    elif backend == "vllm_omni":
+        parsed = generate_batch(
+            label, handle, [sample], args, seeds=[seed], n_completions=1
+        )[0]
+        output_text = str(parsed.get("model_output") or "")
+        if label == "mimo-audio-7b":
+            prompt_fallback = _mimo_audio_prompt(sample, args)
+        else:
+            prompt_fallback = _build_prompt(sample, args)
+        prompt_fallback = ensure_assistant_think_open(label, prompt_fallback)
+        finish_reason = "vllm_omni"
+
+    elif backend == "hf_af_next":
+        parsed = generate_batch(
+            label, handle, [sample], args, seeds=[seed], n_completions=1
+        )[0]
+        output_text = str(parsed.get("model_output") or "")
+        if label == "af-next-think":
+            prompt_fallback = _af_next_prompt(sample, args)
+        else:
+            prompt_fallback = _music_flamingo_prompt(sample, args)
+        prompt_fallback = ensure_assistant_think_open(label, prompt_fallback)
+        finish_reason = "hf_af_next"
+
+    elif backend == "hf_step":
+        parsed = _generate_step_audio_hf(handle, sample, args, seed, label=label)
+        output_text = str(parsed.get("model_output") or "")
+        prompt_fallback = _step_audio_prompt(sample, args)
+        finish_reason = "hf_step"
+
+    elif backend == "vllm_voxtral":
+        request = _build_voxtral_request(handle["tokenizer"], sample, args)
+        prompt_fallback = _build_prompt(sample, args)
+        prompt_ids = _int_ids(request.get("prompt_token_ids"))
+        sampling = [_sampling_params_for_request(label, args, seed, n=1)]
+        outputs = handle["llm"].generate([request], sampling_params=sampling)
+        _, output_ids, output_text, finish_reason = _request_output_ids(outputs[0])
+        if getattr(outputs[0], "prompt", None):
+            prompt_fallback = str(outputs[0].prompt)
+
+    else:
+        raise ValueError(f"generate_raw_trace has no path for backend {backend!r}")
+
+    prompt_trace = _trace_from_ids(
+        tokenizer, prompt_ids, text_fallback=prompt_fallback
+    )
+    output_trace = _trace_from_ids(
+        tokenizer, output_ids, text_fallback=output_text
+    )
+    parse_fn = _parse_fn_for(args, handle.get("parse_fn", parse_choice_output))
+    parsed = _output_dict(output_trace["text"] or output_text, sample.get("choices") or [], parse_fn=parse_fn)
+    return {
+        "backend": backend,
+        "finish_reason": finish_reason,
+        "enable_thinking": bool(
+            (MODEL_SPECS.get(label) or {}).get("enable_thinking")
+        ),
+        "chat_kwargs": dict(handle.get("chat_kwargs") or chat_kwargs_for(label)),
+        "prompt": prompt_trace,
+        "output": output_trace,
+        "thinking_prediction": parsed.get("thinking_prediction"),
+        "answer_prediction": parsed.get("answer_prediction"),
+    }

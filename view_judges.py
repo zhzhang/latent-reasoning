@@ -997,6 +997,7 @@ function prettyJudge(key) {
 function shortLabel(label) {
   const map = {
     "af-next-think": "af-next",
+    "music-flamingo": "mf",
     "mimo-audio-7b": "mimo",
     "interactive-omni-8b": "i-omni",
     "qwen3-omni": "qwen3",
@@ -1008,7 +1009,7 @@ function shortLabel(label) {
     "nemotron-3-nano-omni": "nemotron",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
-    "step-audio-2-mini": "step",
+    "step-audio-2-mini-think": "step",
   };
   return map[label] || label;
 }

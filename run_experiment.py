@@ -1,7 +1,9 @@
 """MMAR question-difficulty experiment on Modal (vLLM / vLLM-Omni).
 
-Samples a fixed 200 MMAR questions, runs 10 temperature samples per
-model (per-model SamplingParams), then aggregates mean success rates.
+Runs the full MMAR set (every clip with audio), ``n_shots`` temperature
+samples per model (per-model SamplingParams), then aggregates mean
+success rates. Questions that already have ``n_shots`` generations are
+skipped on resume.
 
 Modes:
   - ``mc`` (default): multiple-choice prompts + string-match scoring
@@ -10,7 +12,9 @@ Modes:
 
 Inference backends:
   - af-next-think: vLLM 0.24 (native MusicFlamingo)
+  - music-flamingo: vLLM 0.24 AudioFlamingo3 (HF fallback)
   - mimo-audio-7b: vLLM-Omni 0.24
+  - step-audio-2-mini-think: HF StepAudio2 (official examples-think.py text path)
   - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
   - qwen3-omni: vLLM 0.28 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
   - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
@@ -36,26 +40,29 @@ Prereqs:
 Usage:
 
     uv run modal run --detach run_experiment.py
-    # Free-form + Qwen judge on the same 200 ids as a prior MC run:
-    uv run modal run --detach run_experiment.py \\
-      --mode freeform --source-run-id 20260727T154400Z
-    # Full-MMAR native MCQ sanity check (1 greedy pass; thinking models keep
-    # card sampling). Seed eval weights first if needed.
+    # Free-form + Qwen judge (full MMAR):
+    uv run modal run --detach run_experiment.py --mode freeform
+    # Native MCQ sanity check (1 greedy pass; thinking models keep card
+    # sampling). Seed eval weights first if needed.
     uv run modal run --detach seed_volume.py --datasets mmar --models eval
     uv run modal run --detach run_experiment.py \\
-      --models all --mode mc --num-samples -1 --n-shots 1 \\
-      --greedy-non-thinking --source-run-id none
+      --models all --mode mc --n-shots 1 --greedy-non-thinking
     uv run modal run run_experiment.py \\
-      --models af-next-think --num-samples 8 --n-shots 2
+      --models af-next-think --n-shots 2
+    # Music Flamingo 5-shot freeform (full MMAR; seed weights first):
+    uv run modal run --detach seed_volume.py --datasets none --models music-flamingo
+    uv run modal run --detach run_experiment.py \\
+      --run-id 20260807T145000Z --models music-flamingo \\
+      --mode freeform --n-shots 5 --seed 42
     # Open-ended freeform (seed the new checkpoints first):
     uv run modal run --detach seed_volume.py --datasets none \\
       --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni
     uv run modal run --detach run_experiment.py \\
       --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni \\
-      --mode freeform --n-shots 3 --num-samples -1 --source-run-id none \\
+      --mode freeform --n-shots 3 \\
       --question-ids-csv answer-variety/open_ended_question_ids.csv
-    # Resume after a crash (reuse question set; skip finished models /
-    # already-written questions):
+    # Resume after a crash (full MMAR; skip questions that already have
+    # the requested number of shots):
     uv run modal run --detach run_experiment.py \\
       --run-id <run_id>
     uv run modal run run_experiment.py \\
@@ -74,7 +81,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,6 +106,7 @@ from mmar_common import (
     load_jsonl,
     load_question_ids_csv,
     make_run_id,
+    recompute_n_shot_scores,
     resolve_path,
     write_json,
     write_jsonl,
@@ -121,11 +128,9 @@ _DEPLOY_MOUNT = "/root/deploy"
 _ANSWER_VARIETY_MOUNT = "/root/answer-variety"
 
 DEFAULT_OUTPUT_DIR = RESULTS_MOUNT / "exp-mmar-question-difficulty"
-DEFAULT_NUM_SAMPLES = 200
 DEFAULT_N_SHOTS = 10
 DEFAULT_SEED = 42
 DEFAULT_MODE = "mc"
-DEFAULT_SOURCE_RUN_ID = "20260727T154400Z"
 DEFAULT_JUDGE_MODEL_IDS = ("Qwen/Qwen3.6-35B-A3B-FP8",)
 DEFAULT_GRADER_MODEL_ID = DEFAULT_JUDGE_MODEL_IDS[0]
 
@@ -228,13 +233,12 @@ af_next_image = _mount_local_sources(
     .env(_INPROC_VLLM_ENV)
 )
 
-# Step / MiMo: vLLM-Omni on the same 0.24 line.
+# MiMo: vLLM-Omni on the 0.24 line.
 omni_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
         "vllm==0.24.0",
         "vllm-omni==0.24.0",
-        "step-audio2",
         "transformers>=5.5.3",
         "huggingface-hub>=0.30.0",
         "librosa>=0.11.0",
@@ -247,6 +251,30 @@ omni_image = _mount_local_sources(
         "onnxruntime",
     )
     .env(_VLLM_CACHE_ENV)
+)
+
+# Step-Audio-2-mini-Think: official HF StepAudio2 (no vLLM-Omni).
+step_audio_image = _mount_local_sources(
+    _cuda_base_image()
+    .uv_pip_install(
+        "torch==2.7.1",
+        "torchaudio==2.7.1",
+        "transformers==4.49.0",
+        "huggingface-hub>=0.30.0",
+        "librosa>=0.11.0",
+        "soundfile",
+        "numpy",
+        "tqdm>=4.67.0",
+        "accelerate==1.12.0",
+        "einops",
+        "onnxruntime",
+        extra_index_url="https://download.pytorch.org/whl/cu128",
+        extra_options="--index-strategy unsafe-best-match",
+    )
+    .run_commands(
+        "git clone --depth 1 https://github.com/stepfun-ai/Step-Audio2.git /opt/Step-Audio2"
+    )
+    .env({**_VLLM_CACHE_ENV, "PYTHONPATH": "/opt/Step-Audio2"})
 )
 
 # InteractiveOmni: newer vLLM transformers-audio backend + HF chat fallback.
@@ -360,17 +388,26 @@ def _shot_seed(seed: int, question_id: str, shot_index: int) -> int:
     return seed + (int(digest[:8], 16) % 1_000_000)
 
 
-def _load_completed_prediction_ids(predictions_path: Path) -> set[str]:
-    """Return completed question ids, tolerating a truncated trailing JSONL line.
+def _n_generated_shots(record: dict | None) -> int:
+    """How many shot generations are stored on this prediction record."""
+    if not record:
+        return 0
+    shots = record.get("shots")
+    if isinstance(shots, list):
+        return len(shots)
+    try:
+        return max(0, int(record.get("n_shots") or 0))
+    except (TypeError, ValueError):
+        return 0
 
-    A mid-batch crash can leave a partial last line. Skip corrupt lines and
-    rewrite the file so the next resume does not trip on them again.
-    """
+
+def _load_prediction_records(predictions_path: Path) -> dict[str, dict]:
+    """Return ``{id: record}`` in file order, repairing a truncated last line."""
     if not predictions_path.exists():
-        return set()
+        return {}
 
-    completed: set[str] = set()
-    valid_lines: list[str] = []
+    records: dict[str, dict] = {}
+    valid_items: list[dict] = []
     corrupt = False
     with open(predictions_path, encoding="utf-8") as handle:
         for line in handle:
@@ -385,35 +422,92 @@ def _load_completed_prediction_ids(predictions_path: Path) -> set[str]:
                 continue
             record_id = item.get("id")
             if record_id:
-                completed.add(str(record_id))
-            valid_lines.append(stripped)
+                records[str(record_id)] = item
+            valid_items.append(item)
 
     if corrupt:
         tmp_path = predictions_path.with_suffix(".jsonl.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            for line in valid_lines:
-                handle.write(line + "\n")
+        write_jsonl(tmp_path, valid_items, mode="w")
         tmp_path.replace(predictions_path)
-        print(f"Repaired predictions file -> {predictions_path} ({len(valid_lines)} lines)")
+        print(
+            f"Repaired predictions file -> {predictions_path} "
+            f"({len(valid_items)} lines)"
+        )
 
-    return completed
+    return records
+
+
+def _rewrite_predictions_file(
+    predictions_path: Path,
+    records: dict[str, dict],
+    order: list[str],
+) -> None:
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for qid in order:
+        rec = records.get(qid)
+        if rec is not None:
+            ordered.append(rec)
+            seen.add(qid)
+    for qid, rec in records.items():
+        if qid not in seen:
+            ordered.append(rec)
+    tmp_path = predictions_path.with_suffix(".jsonl.tmp")
+    write_jsonl(tmp_path, ordered, mode="w")
+    tmp_path.replace(predictions_path)
+
+
+def _merge_shot_record(
+    item: dict,
+    existing: dict | None,
+    new_outputs: list[dict],
+    *,
+    pending_grade: bool,
+    start_index: int,
+) -> dict:
+    """Append newly generated shots onto an existing record, or build a new one."""
+    new_record = aggregate_n_shot_record(
+        item, new_outputs, pending_grade=pending_grade
+    )
+    if not existing or start_index <= 0:
+        return new_record
+
+    shots = list(existing.get("shots") or [])[:start_index]
+    for offset, shot in enumerate(new_record.get("shots") or []):
+        merged = dict(shot)
+        merged["shot_index"] = start_index + offset
+        shots.append(merged)
+    record = {**existing, **item}
+    record["shots"] = shots
+    record["n_shots"] = len(shots)
+    if pending_grade:
+        record["pending_grade"] = True
+    else:
+        recompute_n_shot_scores(record)
+        record.pop("pending_grade", None)
+    return record
 
 
 def _model_progress(
     run_dir: Path,
     model_label: str,
     question_ids: list[str],
+    n_shots: int,
 ) -> dict:
-    """Per-model completion against the fixed question set."""
+    """Per-model completion: questions that already have ``n_shots`` generations."""
     predictions_path = run_dir / "models" / model_label / "predictions.jsonl"
-    completed = _load_completed_prediction_ids(predictions_path)
-    selected = set(question_ids)
-    n_done = len(completed & selected)
+    records = _load_prediction_records(predictions_path)
+    n_done = sum(
+        1
+        for qid in question_ids
+        if _n_generated_shots(records.get(qid)) >= n_shots
+    )
     n_total = len(question_ids)
     return {
         "model_label": model_label,
         "n_done": n_done,
         "n_total": n_total,
+        "n_shots": n_shots,
         "complete": n_total > 0 and n_done >= n_total,
         "predictions_path": str(predictions_path),
     }
@@ -476,24 +570,50 @@ def _judge_manifest_entries(judge_model_ids: list[str]) -> list[dict]:
     return entries
 
 
-def _normalize_source_run_id(
-    source_run_id: str | None,
+def _normalize_source_run_id(source_run_id: str | None) -> str | None:
+    """Parse ``--source-run-id``; ``none`` / empty means full MMAR."""
+    if source_run_id is None:
+        return None
+    value = str(source_run_id).strip()
+    if not value or value.lower() in {"none", "null", "-"}:
+        return None
+    return value
+
+
+def _mmar_ids_with_audio(meta_path: Path, data_root: Path) -> list[str]:
+    ids: list[str] = []
+    for item in load_jsonl(meta_path):
+        audio_path = resolve_path(data_root, item["audio_path"])
+        if not os.path.exists(audio_path):
+            print(f"Skipping {item['id']}: missing audio at {audio_path}")
+            continue
+        ids.append(str(item["id"]))
+    return ids
+
+
+def _write_question_ids(
+    ids_path: Path,
+    ids: list[str],
     *,
-    mode: str,
-    num_samples: int | None = None,
-) -> str | None:
-    """Resolve source-run-id; freeform defaults to the fixed MC difficulty set."""
-    if source_run_id is not None:
-        value = str(source_run_id).strip()
-        if not value or value.lower() in {"none", "null", "-"}:
-            return None
-        return value
-    # Only auto-pin the prior 200-id set for full freeform runs.
-    if mode == "freeform" and (
-        num_samples is None or int(num_samples) == DEFAULT_NUM_SAMPLES
-    ):
-        return DEFAULT_SOURCE_RUN_ID
-    return None
+    seed: int,
+    source_run_id: str | None = None,
+    source_path: str | None = None,
+    question_ids_csv: str | None = None,
+) -> None:
+    payload = {
+        "seed": seed,
+        "n": len(ids),
+        "ids": ids,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if source_run_id:
+        payload["source_run_id"] = source_run_id
+    if source_path:
+        payload["source_path"] = source_path
+    if question_ids_csv:
+        payload["question_ids_csv"] = question_ids_csv
+    write_json(ids_path, payload)
+    results_volume.commit()
 
 
 def _ensure_question_ids(
@@ -501,20 +621,12 @@ def _ensure_question_ids(
     *,
     meta_path: Path,
     data_root: Path,
-    num_samples: int,
     seed: int,
-    start: int = 0,
     source_run_id: str | None = None,
     output_dir: str | None = None,
     question_ids_csv: str | None = None,
 ) -> list[str]:
     ids_path = run_dir / "question_ids.json"
-    if ids_path.exists():
-        payload = json.loads(ids_path.read_text(encoding="utf-8"))
-        ids = [str(x) for x in payload.get("ids", [])]
-        if ids:
-            print(f"Reusing {len(ids)} question ids from {ids_path}")
-            return ids
 
     csv_path = _resolve_question_ids_csv(question_ids_csv)
     if csv_path is not None:
@@ -533,21 +645,12 @@ def _ensure_question_ids(
             ids.append(qid)
         if not ids:
             raise SystemExit(f"No usable ids from question-ids-csv={csv_path}")
-        payload = {
-            "seed": seed,
-            "start": start,
-            "num_samples": len(ids),
-            "n": len(ids),
-            "ids": ids,
-            "question_ids_csv": str(csv_path),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        write_json(ids_path, payload)
-        results_volume.commit()
+        _write_question_ids(
+            ids_path, ids, seed=seed, question_ids_csv=str(csv_path)
+        )
         print(f"Wrote {len(ids)} question ids from {csv_path} -> {ids_path}")
         return ids
 
-    # Copy the fixed question set from a prior run when requested.
     if source_run_id:
         source_root = (
             Path(output_dir).expanduser().resolve()
@@ -564,58 +667,45 @@ def _ensure_question_ids(
         ids = [str(x) for x in payload.get("ids", [])]
         if not ids:
             raise SystemExit(f"No ids in source question set: {source_ids_path}")
-        copied = {
-            "seed": payload.get("seed", seed),
-            "start": payload.get("start", start),
-            "num_samples": payload.get("num_samples", num_samples),
-            "n": len(ids),
-            "ids": ids,
-            "source_run_id": source_run_id,
-            "source_path": str(source_ids_path),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        write_json(ids_path, copied)
-        results_volume.commit()
+        _write_question_ids(
+            ids_path,
+            ids,
+            seed=int(payload.get("seed", seed)),
+            source_run_id=source_run_id,
+            source_path=str(source_ids_path),
+        )
         print(
             f"Copied {len(ids)} question ids from {source_run_id} -> {ids_path}"
         )
         return ids
 
-    meta_items = load_jsonl(meta_path)
-    pool = meta_items[start:]
-    rng = random.Random(seed)
-    if num_samples < 0 or num_samples >= len(pool):
-        selected = pool
-    else:
-        indices = rng.sample(range(len(pool)), num_samples)
-        selected = [pool[i] for i in indices]
+    full_ids = _mmar_ids_with_audio(meta_path, data_root)
+    if not full_ids:
+        raise SystemExit(f"No MMAR items with audio under {data_root}")
 
-    ids: list[str] = []
-    for item in selected:
-        audio_path = resolve_path(data_root, item["audio_path"])
-        if not os.path.exists(audio_path):
-            print(f"Skipping {item['id']}: missing audio at {audio_path}")
-            continue
-        ids.append(str(item["id"]))
+    existing: list[str] = []
+    if ids_path.exists():
+        try:
+            payload = json.loads(ids_path.read_text(encoding="utf-8"))
+            existing = [str(x) for x in payload.get("ids", [])]
+        except json.JSONDecodeError:
+            existing = []
+    full_set = set(full_ids)
+    merged = [qid for qid in existing if qid in full_set]
+    merged = list(dict.fromkeys([*merged, *full_ids]))
+    if merged == existing and existing and ids_path.exists():
+        print(f"Reusing {len(existing)} question ids from {ids_path}")
+        return existing
 
-    if len(ids) < min(num_samples if num_samples > 0 else len(pool), len(selected)):
+    _write_question_ids(ids_path, merged, seed=seed)
+    if existing and len(merged) > len(existing):
         print(
-            f"Warning: only {len(ids)} items with audio after sampling "
-            f"(requested {num_samples})."
+            f"Expanded question set {len(existing)} -> {len(merged)} "
+            f"(full MMAR) -> {ids_path}"
         )
-
-    payload = {
-        "seed": seed,
-        "start": start,
-        "num_samples": num_samples,
-        "n": len(ids),
-        "ids": ids,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    write_json(ids_path, payload)
-    results_volume.commit()
-    print(f"Wrote {len(ids)} question ids -> {ids_path}")
-    return ids
+    else:
+        print(f"Wrote {len(merged)} question ids (full MMAR) -> {ids_path}")
+    return merged
 
 
 def _load_selected_items(
@@ -645,7 +735,6 @@ def _run_model_eval(
     output_dir: str,
     meta: str,
     data_root: str,
-    num_samples: int,
     n_shots: int,
     seed: int,
     print_every: int,
@@ -661,7 +750,7 @@ def _run_model_eval(
     source_run_id: str | None = None,
     question_ids_csv: str | None = None,
 ) -> dict:
-    """Load one model and write n-shot predictions for the fixed question set."""
+    """Load one model and write n-shot predictions for the full question set."""
     volume.reload()
     results_volume.reload()
 
@@ -677,7 +766,6 @@ def _run_model_eval(
         meta=meta,
         data_root=data_root,
         output_dir=output_dir,
-        num_samples=num_samples,
         n_shots=n_shots,
         # Optional CLI overrides (None → use MODEL_SPECS[label].sampling).
         temperature=temperature,
@@ -722,26 +810,32 @@ def _run_model_eval(
         run_dir,
         meta_path=meta_path,
         data_root=data_root_path,
-        num_samples=num_samples,
         seed=seed,
         source_run_id=source_run_id,
         output_dir=output_dir,
         question_ids_csv=question_ids_csv,
     )
     items = _load_selected_items(meta_path, data_root_path, question_ids)
-    selected_ids = {str(item["id"]) for item in items}
-    completed = _load_completed_prediction_ids(predictions_path)
+    existing_records = _load_prediction_records(predictions_path)
     # Commit after a possible corrupt-line repair inside the loader.
     results_volume.commit()
-    n_done = len(completed & selected_ids)
-    pending = [item for item in items if str(item["id"]) not in completed]
+    pending_items: list[dict] = []
+    pending_have: list[int] = []
+    n_done = 0
+    for item in items:
+        n_have = _n_generated_shots(existing_records.get(str(item["id"])))
+        if n_have >= n_shots:
+            n_done += 1
+            continue
+        pending_items.append(item)
+        pending_have.append(n_have)
     print(
         f"[{model_label}] backend={spec.get('backend')} mode={prompt_mode} "
-        f"{len(items)} selected, {n_done} done, {len(pending)} pending "
-        f"(n_shots={n_shots}, sampling={sampling})"
+        f"{len(items)} selected, {n_done} done (>= {n_shots} shots), "
+        f"{len(pending_items)} pending (n_shots={n_shots}, sampling={sampling})"
     )
 
-    if not pending:
+    if not pending_items:
         return {
             "status": "already_complete",
             "model_label": model_label,
@@ -751,7 +845,7 @@ def _run_model_eval(
         }
 
     # Persist torch.compile / Triton JIT caches across cold starts. Per-model
-    # subdirs avoid concurrent writers under --parallel-models.
+    # subdirs avoid concurrent writers when models run in parallel.
     compile_cache = VOLUME_MOUNT / "vllm" / model_label
     compile_cache.mkdir(parents=True, exist_ok=True)
     os.environ["VLLM_CACHE_ROOT"] = str(compile_cache)
@@ -770,32 +864,40 @@ def _run_model_eval(
     duplicate_shots = backend_duplicates_shots(str(active_backend))
 
     start_time = time.time()
-    shot_outputs_by_index: list[list[dict]] = [[] for _ in pending]
+    n_pending = len(pending_items)
+    shot_outputs_by_index: list[list[dict]] = [[] for _ in pending_items]
+    all_fresh = all(n_have == 0 for n_have in pending_have)
 
-    if duplicate_shots:
+    if duplicate_shots or not all_fresh:
         gen_samples: list[dict] = []
         seeds: list[int] = []
         owners: list[tuple[int, int]] = []
-        for item_index, item in enumerate(pending):
-            for shot_index in range(n_shots):
+        for item_index, (item, n_have) in enumerate(
+            zip(pending_items, pending_have)
+        ):
+            for shot_index in range(n_have, n_shots):
                 gen_samples.append(item)
                 seeds.append(_shot_seed(seed, str(item["id"]), shot_index))
                 owners.append((item_index, shot_index))
         n_completions = 1
         n_requests = len(gen_samples)
     else:
-        gen_samples = list(pending)
-        seeds = [_shot_seed(seed, str(item["id"]), 0) for item in pending]
+        gen_samples = list(pending_items)
+        seeds = [
+            _shot_seed(seed, str(item["id"]), 0) for item in pending_items
+        ]
         owners = [
             (item_index, shot_index)
-            for item_index in range(len(pending))
+            for item_index in range(n_pending)
             for shot_index in range(n_shots)
         ]
         n_completions = n_shots
         n_requests = len(gen_samples)
 
+    n_missing = sum(n_shots - n_have for n_have in pending_have)
     print(
-        f"[{model_label}] generate n_questions={len(pending)} "
+        f"[{model_label}] generate n_questions={n_pending} "
+        f"n_missing_shots={n_missing} "
         f"n_requests={n_requests} n_completions={n_completions}"
     )
     try:
@@ -811,7 +913,7 @@ def _run_model_eval(
         # Offline generate is all-or-nothing; resume retries the same pending set.
         raise RuntimeError(
             f"[{model_label}] generate failed "
-            f"n_questions={len(pending)} "
+            f"n_questions={n_pending} "
             f"n_requests={n_requests} n_completions={n_completions}: {exc}"
         ) from exc
     if len(outputs) != len(owners):
@@ -822,20 +924,23 @@ def _run_model_eval(
     for (item_index, _shot_index), output in zip(owners, outputs):
         shot_outputs_by_index[item_index].append(output)
 
-    records = [
-        aggregate_n_shot_record(
+    for item, n_have, new_outputs in zip(
+        pending_items, pending_have, shot_outputs_by_index
+    ):
+        qid = str(item["id"])
+        existing_records[qid] = _merge_shot_record(
             item,
-            shot_outputs,
+            existing_records.get(qid),
+            new_outputs,
             pending_grade=pending_grade,
+            start_index=n_have,
         )
-        for item, shot_outputs in zip(pending, shot_outputs_by_index)
-    ]
-    write_jsonl(predictions_path, records, mode="a")
+    _rewrite_predictions_file(predictions_path, existing_records, question_ids)
     with open(predictions_path, "rb") as pred_file:
         os.fsync(pred_file.fileno())
     results_volume.commit()
 
-    written = len(records)
+    written = n_pending
     elapsed = time.time() - start_time
     try:
         # Persist any Triton JIT / inductor caches written during generate.
@@ -843,8 +948,9 @@ def _run_model_eval(
     except Exception as exc:  # noqa: BLE001
         print(f"[{model_label}] volume.commit after generate failed: {exc}")
     if print_every > 0:
-        for idx, record in enumerate(records, start=1):
+        for idx, item in enumerate(pending_items, start=1):
             if idx % print_every == 0 or idx == written:
+                record = existing_records[str(item["id"])]
                 if pending_grade:
                     score_msg = "pending_grade"
                 else:
@@ -856,10 +962,15 @@ def _run_model_eval(
                     f"id={record['id']} {score_msg} ({elapsed:.0f}s)"
                 )
 
-    total = len(_load_completed_prediction_ids(predictions_path) & selected_ids)
+    total = sum(
+        1
+        for qid in question_ids
+        if _n_generated_shots(existing_records.get(qid)) >= n_shots
+    )
     print(
-        f"[{model_label}] done: wrote {written} new, total={total} "
-        f"({elapsed:.0f}s)"
+        f"[{model_label}] done: updated {written} questions "
+        f"({n_missing} shots), total={total}/{len(question_ids)} "
+        f"with {n_shots} shots ({elapsed:.0f}s)"
     )
     return {
         "status": "ok",
@@ -873,128 +984,82 @@ def _run_model_eval(
 
 
 # ---------------------------------------------------------------------------
-# Modal functions (one image/GPU profile per model family)
+# Modal eval workers (one GPU container pool per model_label)
 # ---------------------------------------------------------------------------
+# Parametrized Cls: each model_label is its own autoscaler pool even when
+# models share an image / GPU type. single_use_containers keeps a GPU from
+# being reused after that model returns.
 
-
-@app.function(
-    image=af_next_image,
-    gpu="L40S",
+_EVAL_KW = dict(
     timeout=12 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
     secrets=[hf_secret],
     memory=65536,
+    single_use_containers=True,
 )
-def run_af_next(**kwargs) -> dict:
-    return _run_model_eval(model_label="af-next-think", **kwargs)
 
 
-@app.function(
-    image=omni_image,
-    gpu="A100-80GB",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_mimo_audio(**kwargs) -> dict:
-    return _run_model_eval(model_label="mimo-audio-7b", **kwargs)
+@app.cls(image=af_next_image, gpu="L40S", **_EVAL_KW)
+class EvalAfNext:
+    model_label: str = modal.parameter()
+
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
-@app.function(
-    image=interactive_omni_image,
-    gpu="A100-80GB",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_interactive_omni(**kwargs) -> dict:
-    return _run_model_eval(model_label="interactive-omni-8b", **kwargs)
+@app.cls(image=omni_image, gpu="A100-80GB", **_EVAL_KW)
+class EvalMimo:
+    model_label: str = modal.parameter()
+
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
-@app.function(
-    image=large_mm_image,
-    gpu="A100-80GB",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_qwen3_omni(**kwargs) -> dict:
-    return _run_model_eval(model_label="qwen3-omni", **kwargs)
+@app.cls(image=step_audio_image, gpu="A100-80GB", **_EVAL_KW)
+class EvalStepAudio:
+    model_label: str = modal.parameter()
+
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
-@app.function(
-    image=large_mm_image,
-    gpu="A100-80GB",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_voxtral(**kwargs) -> dict:
-    return _run_model_eval(model_label="voxtral-small-24b", **kwargs)
+@app.cls(image=interactive_omni_image, gpu="A100-80GB", **_EVAL_KW)
+class EvalInteractiveOmni:
+    model_label: str = modal.parameter()
+
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
-@app.function(
-    image=large_mm_image,
-    gpu="L40S",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_qwen25_omni(**kwargs) -> dict:
-    return _run_model_eval(model_label="qwen2.5-omni-7b", **kwargs)
+@app.cls(image=large_mm_image, gpu="A100-80GB", **_EVAL_KW)
+class EvalLargeMmA100:
+    model_label: str = modal.parameter()
+
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
-@app.function(
-    image=large_mm_image,
-    gpu="L40S",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_phi4_multimodal(**kwargs) -> dict:
-    return _run_model_eval(model_label="phi-4-multimodal", **kwargs)
+@app.cls(image=large_mm_image, gpu="L40S", **_EVAL_KW)
+class EvalLargeMmL40S:
+    model_label: str = modal.parameter()
+
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
-@app.function(
-    image=large_mm_image,
-    gpu="L40S",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_gemma_4_e4b(**kwargs) -> dict:
-    return _run_model_eval(model_label="gemma-4-e4b", **kwargs)
+@app.cls(image=large_mm_image, gpu="H100", **_EVAL_KW)
+class EvalLargeMmH100:
+    model_label: str = modal.parameter()
 
-
-@app.function(
-    image=large_mm_image,
-    gpu="H100",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_qwen3_omni_instruct(**kwargs) -> dict:
-    return _run_model_eval(model_label="qwen3-omni-instruct", **kwargs)
-
-
-@app.function(
-    image=large_mm_image,
-    gpu="H100",
-    timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
-    secrets=[hf_secret],
-    memory=65536,
-)
-def run_nemotron_omni(**kwargs) -> dict:
-    return _run_model_eval(model_label="nemotron-3-nano-omni", **kwargs)
+    @modal.method()
+    def run(self, **kwargs) -> dict:
+        return _run_model_eval(model_label=self.model_label, **kwargs)
 
 
 @app.function(
@@ -1006,7 +1071,6 @@ def prepare_run(
     run_id: str,
     output_dir: str,
     model_labels: list[str],
-    num_samples: int,
     n_shots: int,
     seed: int,
     meta: str,
@@ -1023,20 +1087,19 @@ def prepare_run(
 ) -> dict:
     """Create question_ids + manifest before parallel model workers start.
 
-    Re-running with the same ``run_id`` reuses ``question_ids.json``, merges
-    models into the existing manifest, and reports per-model progress so the
+    Defaults to the full MMAR set (every clip with audio). Re-running with
+    the same ``run_id`` expands an older sampled id list to full MMAR,
+    merges models into the existing manifest, and reports per-model
+    progress (questions that already have ``n_shots`` generations) so the
     pipeline orchestrator can skip already-complete workers.
     """
     volume.reload()
     results_volume.reload()
 
     prompt_mode = _normalize_mode(mode)
-    # CSV question sets skip the freeform 200-id auto-pin.
     effective_source = None
     if not question_ids_csv:
-        effective_source = _normalize_source_run_id(
-            source_run_id, mode=prompt_mode, num_samples=num_samples
-        )
+        effective_source = _normalize_source_run_id(source_run_id)
     judge_ids = _parse_judge_model_ids(
         judge_model_ids, grader_model_id=grader_model_id
     )
@@ -1056,7 +1119,6 @@ def prepare_run(
         run_dir,
         meta_path=meta_path,
         data_root=data_root_path,
-        num_samples=num_samples,
         seed=seed,
         source_run_id=effective_source,
         output_dir=output_dir,
@@ -1080,7 +1142,7 @@ def prepare_run(
     )
 
     progress = {
-        label: _model_progress(run_dir, label, question_ids)
+        label: _model_progress(run_dir, label, question_ids, n_shots)
         for label in merged_models
     }
 
@@ -1116,8 +1178,7 @@ def prepare_run(
         "experiment": "exp-mmar-question-difficulty",
         "mode": existing.get("mode") or prompt_mode,
         "models": merged_models,
-        "num_samples": existing.get("num_samples", num_samples),
-        "n_shots": existing.get("n_shots", n_shots),
+        "n_shots": n_shots,
         "seed": existing.get("seed", seed),
         # Per-model SamplingParams (no global temperature / top_p / max_tokens).
         "model_sampling": model_sampling,
@@ -1347,6 +1408,7 @@ _GRADE_FN_KW = dict(
     timeout=12 * 60 * 60,
     volumes={VOLUME_MOUNT: volume, RESULTS_MOUNT: results_volume},
     secrets=[hf_secret],
+    single_use_containers=True,
 )
 
 
@@ -1376,18 +1438,49 @@ def _grade_worker_for(model_id: str):
     return run_freeform_grade
 
 
-_MODEL_FNS = {
-    "af-next-think": run_af_next,
-    "mimo-audio-7b": run_mimo_audio,
-    "interactive-omni-8b": run_interactive_omni,
-    "qwen3-omni": run_qwen3_omni,
-    "qwen3-omni-instruct": run_qwen3_omni_instruct,
-    "qwen2.5-omni-7b": run_qwen25_omni,
-    "phi-4-multimodal": run_phi4_multimodal,
-    "gemma-4-e4b": run_gemma_4_e4b,
-    "nemotron-3-nano-omni": run_nemotron_omni,
-    "voxtral-small-24b": run_voxtral,
+_EVAL_CLS = {
+    "af-next-think": EvalAfNext,
+    "music-flamingo": EvalAfNext,
+    "mimo-audio-7b": EvalMimo,
+    "step-audio-2-mini-think": EvalStepAudio,
+    "interactive-omni-8b": EvalInteractiveOmni,
+    "qwen3-omni": EvalLargeMmA100,
+    "voxtral-small-24b": EvalLargeMmA100,
+    "qwen2.5-omni-7b": EvalLargeMmL40S,
+    "phi-4-multimodal": EvalLargeMmL40S,
+    "gemma-4-e4b": EvalLargeMmL40S,
+    "qwen3-omni-instruct": EvalLargeMmH100,
+    "nemotron-3-nano-omni": EvalLargeMmH100,
 }
+
+_missing_eval = [label for label in ALL_MODEL_LABELS if label not in _EVAL_CLS]
+if _missing_eval:
+    raise RuntimeError(f"No GPU eval worker for models: {_missing_eval}")
+
+
+def _spawn_model_eval(label: str, **common):
+    """Start one dedicated GPU container for ``label`` (does not wait)."""
+    cls = _EVAL_CLS.get(label)
+    if cls is None:
+        raise SystemExit(f"No GPU worker for model {label!r}")
+    call = cls(model_label=label).run.spawn(**common)
+    print(f"Spawned {label} call_id={call.object_id}")
+    return call
+
+
+def _collect_model_eval(calls: list[tuple[str, object]]) -> list[dict]:
+    results: list[dict] = []
+    for label, call in calls:
+        try:
+            result = call.get()
+            print(f"Finished {label}:", result)
+            results.append(result)
+        except Exception as exc:  # noqa: BLE001 — keep sibling workers alive
+            print(f"FAILED {label}: {exc}")
+            results.append(
+                {"status": "error", "model_label": label, "error": str(exc)}
+            )
+    return results
 
 
 @app.function(
@@ -1397,7 +1490,6 @@ _MODEL_FNS = {
 )
 def run_pipeline(
     models: str = "all",
-    num_samples: int = DEFAULT_NUM_SAMPLES,
     n_shots: int = DEFAULT_N_SHOTS,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -1434,15 +1526,16 @@ def run_pipeline(
     phases. Orchestrating from ``@app.local_entrypoint`` fails after the
     last model returns: with detach there are briefly no live inputs, the
     ephemeral app stops, and the next ``.spawn()`` raises ConflictError.
+
+    Each pending model is spawned on its own GPU container; a multi-model
+    run launches those containers in parallel.
     """
     resolved_run_id = run_id or make_run_id()
     model_labels = parse_model_list(models)
     prompt_mode = _normalize_mode(mode)
     effective_source = None
     if not question_ids_csv:
-        effective_source = _normalize_source_run_id(
-            source_run_id, mode=prompt_mode, num_samples=num_samples
-        )
+        effective_source = _normalize_source_run_id(source_run_id)
     judge_ids = _parse_judge_model_ids(
         judge_model_ids, grader_model_id=grader_model_id
     )
@@ -1538,7 +1631,6 @@ def run_pipeline(
         output_dir=output_dir,
         meta=meta,
         data_root=data_root,
-        num_samples=num_samples,
         n_shots=n_shots,
         temperature=temperature,
         top_p=top_p,
@@ -1555,18 +1647,22 @@ def run_pipeline(
 
     print(
         f"Experiment run_id={resolved_run_id} mode={prompt_mode} "
-        f"models={model_labels} num_samples={num_samples} n_shots={n_shots} "
-        f"parallel_models={parallel_models} inference=vllm "
+        f"models={model_labels} n_shots={n_shots} "
+        f"gpu_containers=per-model parallel_launch=True inference=vllm "
         f"source_run_id={effective_source} "
         f"sampling_overrides={{temperature={temperature}, top_p={top_p}, "
         f"max_new_tokens={max_new_tokens}, greedy_non_thinking={greedy_non_thinking}}}"
     )
+    if not parallel_models:
+        print(
+            "Note: --no-parallel-models is ignored; each model still gets "
+            "its own GPU container and all pending models spawn together."
+        )
 
     prep = prepare_run.remote(
         run_id=resolved_run_id,
         output_dir=output_dir,
         model_labels=model_labels,
-        num_samples=num_samples,
         n_shots=n_shots,
         seed=seed,
         meta=meta,
@@ -1596,6 +1692,7 @@ def run_pipeline(
             info = progress.get(label) or {}
             print(
                 f"  {label}: {info.get('n_done', 0)}/{info.get('n_total', '?')} "
+                f"questions with {n_shots} shots "
                 f"{'complete — skip spawn' if label in skipped_labels else 'pending'}"
             )
 
@@ -1610,31 +1707,16 @@ def run_pipeline(
     ]
 
     if pending_labels:
-        if parallel_models and len(pending_labels) > 1:
-            calls = []
-            for label in pending_labels:
-                call = _MODEL_FNS[label].spawn(**common)
-                print(f"Spawned {label} call_id={call.object_id}")
-                calls.append((label, call))
-            for label, call in calls:
-                try:
-                    result = call.get()
-                    print(f"Finished {label}:", result)
-                    results.append(result)
-                except Exception as exc:  # noqa: BLE001 — keep sibling workers alive
-                    print(f"FAILED {label}: {exc}")
-                    results.append({"status": "error", "model_label": label, "error": str(exc)})
-        else:
-            for label in pending_labels:
-                call = _MODEL_FNS[label].spawn(**common)
-                print(f"Spawned {label} call_id={call.object_id}")
-                try:
-                    result = call.get()
-                    print(f"Finished {label}:", result)
-                    results.append(result)
-                except Exception as exc:  # noqa: BLE001 — keep sibling workers alive
-                    print(f"FAILED {label}: {exc}")
-                    results.append({"status": "error", "model_label": label, "error": str(exc)})
+        print(
+            f"Launching {len(pending_labels)} dedicated GPU container(s)"
+            f"{' in parallel' if len(pending_labels) > 1 else ''}: "
+            f"{pending_labels}"
+        )
+        calls = [
+            (label, _spawn_model_eval(label, **common))
+            for label in pending_labels
+        ]
+        results.extend(_collect_model_eval(calls))
     else:
         print("All requested models already complete; skipping inference.")
 
@@ -1662,7 +1744,6 @@ def run_pipeline(
 @app.local_entrypoint()
 def main(
     models: str = "all",
-    num_samples: int = DEFAULT_NUM_SAMPLES,
     n_shots: int = DEFAULT_N_SHOTS,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -1697,37 +1778,41 @@ def main(
 
     Args:
         models: Comma-separated labels or ``all``.
-        num_samples: Fixed question sample size (default 200).
         n_shots: Independent temperature samples per question (default 10).
-            Plain vLLM uses SamplingParams(n=...) shared prefill; Omni/HF
-            duplicate prompts per shot. All pending questions go in one
-            offline generate() so vLLM continuous-batches.
+            Questions that already have this many generations are skipped;
+            missing shots are filled in. Plain vLLM uses SamplingParams(n=...)
+            shared prefill when every pending question is starting from
+            zero; Omni/HF (and partial fills) duplicate prompts per shot.
+            All pending questions go in one generate() so vLLM
+            continuous-batches.
         temperature: Optional override of each model's sampling temperature.
         top_p: Optional override of each model's top_p.
         max_new_tokens: Optional override of each model's max_tokens.
         greedy_non_thinking: Force temperature=0 on models without native
             ``<think>`` / reasoning mode. Thinking models keep card sampling
             unless ``temperature`` is also set.
-        seed: RNG seed for question sampling and per-question sample seeds.
+        seed: RNG seed for per-question sample seeds.
         max_num_seqs: Optional vLLM override (escape hatch; prefer defaults).
         gpu_memory_utilization: Optional vLLM GPU memory fraction override.
         meta: Path to MMAR-meta.jsonl on the data volume.
         data_root: MMAR root used to resolve audio paths.
         output_dir: Results volume directory for run folders.
         run_id: Optional run folder name; default is a UTC timestamp.
-            Pass an existing id to resume: finished models are skipped and
-            incomplete models continue from written ``predictions.jsonl``.
+            Pass an existing id to resume: questions that already have
+            ``n_shots`` generations are skipped; others (including the rest
+            of MMAR after an older sampled run) are generated.
         print_every: Progress print interval per model.
         aggregate_only: Skip inference; only build difficulty.jsonl.
         skip_aggregate: Run models but skip final aggregation.
-        parallel_models: Spawn all model workers concurrently (default True).
+        parallel_models: Kept for CLI compatibility. Multi-model runs always
+            spawn one dedicated GPU container per model in parallel.
         mode: ``mc`` (choices + string match) or ``freeform`` (no choices;
             local vLLM judges grade each shot).
-        source_run_id: Copy ``question_ids.json`` from this prior run.
-            Freeform defaults to ``20260727T154400Z``. Pass ``none`` when
-            using ``question_ids_csv``.
+        source_run_id: Copy ``question_ids.json`` from this prior run
+            instead of using full MMAR. Pass ``none`` (default) for the
+            full set. ``question_ids_csv`` wins when both are set.
         question_ids_csv: Restrict the run to ids in this CSV (mounted from
-            ``answer-variety/``). Wins over ``source_run_id`` sampling.
+            ``answer-variety/``). Wins over ``source_run_id``.
         grader_model_id: Back-compat single-judge HF id (used when
             ``judge_model_ids`` is unset).
         judge_model_ids: Comma-separated HF ids for freeform judges; first
@@ -1752,7 +1837,6 @@ def main(
     resolved_run_id = run_id or make_run_id()
     out = run_pipeline.spawn(
         models=models,
-        num_samples=num_samples,
         n_shots=n_shots,
         temperature=temperature,
         top_p=top_p,

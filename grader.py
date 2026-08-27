@@ -18,6 +18,8 @@ from typing import Any
 
 from audio_flamingo_runtime import resolve_model_dir
 from mmar_common import (
+    ASSISTANT_THINK_OPEN,
+    ensure_assistant_think_open,
     ensure_judge_schema,
     judge_label,
     parse_freeform_output,
@@ -93,6 +95,8 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
             # Text-only path: skip vision tower for grading.
             "language_model_only": True,
         },
+        # Chat template skips CoT only when enable_thinking is false.
+        "enable_thinking": True,
         # Thinking-mode defaults: T=1.0, top_p=0.95, top_k=20
         # (judging forces temperature=0 for determinism).
         # Grade replies average ~600 tokens; 4096 leaves headroom for the rare
@@ -1345,6 +1349,10 @@ def load_grader(
         llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     _ensure_tokenizer_chat_template(tokenizer, model_dir=local_id)
+    spec = resolve_judge_spec(model_id)
+    chat_template_kwargs: dict[str, Any] = {}
+    if "enable_thinking" in spec:
+        chat_template_kwargs["enable_thinking"] = bool(spec["enable_thinking"])
     dtype = engine.get("dtype", "?")
     print(
         f"Freeform grader ready: {model_id} ({local_id}) "
@@ -1361,8 +1369,12 @@ def load_grader(
         "SamplingParams": SamplingParams,
         "sampling": sampling,
         "lora_request": None,
-        "chat_kwargs": {},
-        "chat_template_kwargs": {},
+        "chat_kwargs": (
+            {"chat_template_kwargs": chat_template_kwargs}
+            if chat_template_kwargs
+            else {}
+        ),
+        "chat_template_kwargs": chat_template_kwargs,
     }
 
 
@@ -1553,20 +1565,24 @@ NONGOLD_AUDIO_PROMPT_TEMPLATES: dict[str, str] = {
         "<|im_start|>system\n{system}\n{instructions}<|im_end|>\n"
         "<|im_start|>user\n"
         "<sound>{fields}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
+    ),
+    "music-flamingo": (
+        "<|im_start|>system\n{system}\n{instructions}<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<sound>{fields}<|im_end|>\n"
+        "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
     ),
     "mimo-audio-7b": (
         "<|im_start|>user\n"
         "{instructions}\n\n"
         "<|sosp|><|empty|><|eosp|>{fields}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        "<think>\n\n</think>\n"
+        "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
     ),
-    "step-audio-2-mini": (
-        "<|im_start|>system\n{instructions}<|im_end|>\n"
-        "<|im_start|>user\n<audio_patch>\n"
-        "{fields}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+    "step-audio-2-mini-think": (
+        "<|BOT|>system\n{instructions}<|EOT|>"
+        "<|BOT|>human\n<audio_patch>{fields}<|EOT|>"
+        "<|BOT|>assistant\n\n" + ASSISTANT_THINK_OPEN
     ),
 }
 
@@ -1591,6 +1607,10 @@ def _nongold_audio_system_text(label: str) -> str:
         from mmar_models import AF_NEXT_SYSTEM
 
         return AF_NEXT_SYSTEM
+    if label == "music-flamingo":
+        from mmar_models import MUSIC_FLAMINGO_SYSTEM
+
+        return MUSIC_FLAMINGO_SYSTEM
     return ""
 
 
@@ -1637,12 +1657,13 @@ def _nongold_audio_prompt_string(
 ) -> str:
     """Wrap NO_GOLD inputs as: instructions, then audio placeholder, then fields + closer."""
     body = f"{fields}\n\n{closer}" if closer else fields
-    return _fill_placeholders(
+    text = _fill_placeholders(
         nongold_audio_prompt_template(label),
         instructions=instructions,
         fields=body,
         system=_nongold_audio_system_text(label),
     )
+    return ensure_assistant_think_open(label, text)
 
 
 def _nongold_audio_chat_messages(
@@ -1929,6 +1950,10 @@ def _grade_shot_batch_audio(
         include_gold=include_gold,
     )
 
+    if backend == "hf_step":
+        raise ValueError(
+            "step-audio-2-mini-think (hf_step) is a test-taker, not a supported audio judge"
+        )
     if backend == "vllm_chat":
         chat_kwargs = dict(handle.get("chat_kwargs") or {})
         messages = [
@@ -2107,7 +2132,7 @@ def _grade_shot_batch_audio(
             ),
             "multi_modal_data": {"audio": audio},
         }
-        if label in {"mimo-audio-7b", "step-audio-2-mini"}:
+        if label == "mimo-audio-7b":
             item["modalities"] = ["text"]
         prompts.append(item)
     outputs = handle["llm"].generate(
