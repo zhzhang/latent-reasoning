@@ -14,3 +14,4 @@ output/
 outputs/
 data/
 models/
+.env
