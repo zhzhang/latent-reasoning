@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1019,6 +1020,35 @@ def _grade_reuse_key(
     return (str(question or ""), gold, _normalize_grade_answer(prediction))
 
 
+def _shots_in_index_order(
+    record: dict,
+    shot_indices: tuple[int, ...] | list[int] | None,
+) -> list[tuple[int, dict]]:
+    """Return ``(shot_index, shot)`` in ``shot_indices`` order (or index order)."""
+    by_idx: dict[int, dict] = {}
+    for shot in record.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        try:
+            idx = int(shot.get("shot_index", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        by_idx.setdefault(idx, shot)
+    if shot_indices is None:
+        return [(idx, by_idx[idx]) for idx in sorted(by_idx)]
+    out: list[tuple[int, dict]] = []
+    seen: set[int] = set()
+    for raw in shot_indices:
+        idx = int(raw)
+        if idx in seen:
+            continue
+        seen.add(idx)
+        shot = by_idx.get(idx)
+        if shot is not None:
+            out.append((idx, shot))
+    return out
+
+
 def _shot_needs_grade(shot: dict, judge_key: str) -> bool:
     """True when this judge has no verdict yet for the shot."""
     if _shot_judge_entry(shot, judge_key) is not None:
@@ -1607,11 +1637,6 @@ NONGOLD_AUDIO_PROMPT_TEMPLATES: dict[str, str] = {
         "<|sosp|><|empty|><|eosp|>{fields}<|im_end|>\n"
         "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
     ),
-    "step-audio-r1.1": (
-        "<|BOT|>system\n{instructions}<|EOT|>"
-        "<|BOT|>human\n<audio_patch>{fields}<|EOT|>"
-        "<|BOT|>assistant\n\n" + ASSISTANT_THINK_OPEN
-    ),
 }
 
 # Chat-message backends (not a string template). Slots match the format fields.
@@ -2174,10 +2199,6 @@ def _grade_shot_batch_audio(
 
     label = str(handle.get("suite_label") or handle.get("judge_label") or "")
     backend = str(handle.get("backend") or "vllm")
-    if label == "step-audio-r1.1" or backend == "hf_step":
-        raise ValueError(
-            "step-audio-r1.1 is a test-taker, not a supported audio judge"
-        )
     sampling_rate = int(handle.get("sampling_rate") or 16000)
     fmt = get_judge_format(prompt, include_gold=include_gold)
     include_gold = fmt.include_gold
@@ -2795,6 +2816,342 @@ def grade_predictions_file(
         "include_gold": include_gold,
         "replaced": bool(force),
         "n_samples": n_samples,
+    }
+
+
+def grade_predictions_pack(
+    pack_dir: Path,
+    handle: dict[str, Any],
+    model_labels: list[str],
+    *,
+    judge_key: str | None = None,
+    batch_size: int | None = None,
+    force: bool = False,
+    prompt: str = DEFAULT_GRADE_PROMPT,
+    include_gold: bool = DEFAULT_INCLUDE_GOLD,
+    shot_indices: tuple[int, ...] | list[int] | None = None,
+    question_ids: list[str] | None = None,
+    n_questions: int | None = None,
+    n_samples: int = 1,
+    temperature: float | None = None,
+    sidecar: bool = True,
+    on_batch: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Grade every test-taker in question → model → shot order.
+
+    Jobs are emitted as ``for question: for test-taker: for shot`` so the
+    judge's question/audio prefix stays in cache across ``n_models ×
+    n_shots`` rows. Sidecars are written under each gradee's
+    ``judge_partials/`` unless ``sidecar`` is False (then each
+    ``predictions.jsonl`` is rewritten at the end).
+    ``on_batch`` runs after each sidecar flush (e.g. volume commit).
+    """
+    pack = Path(pack_dir)
+    labels = [str(label) for label in model_labels if str(label).strip()]
+    if not labels:
+        return {
+            "status": "ok",
+            "order": "question,model,shot",
+            "by_model": {},
+            "n_shots_graded": 0,
+            "n_shots_reused": 0,
+        }
+
+    model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
+    fmt = get_judge_format(prompt, include_gold=include_gold)
+    include_gold = fmt.include_gold
+    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    require_audio_nongold_judge(
+        handle=handle,
+        include_gold=include_gold,
+        audio_required=fmt.audio_included,
+    )
+    key = resolve_grade_judge_key(
+        handle, prompt=prompt_name, include_gold=include_gold, judge_key=judge_key
+    )
+    n_samples = max(1, int(n_samples))
+    if batch_size is not None:
+        effective_batch_size = int(batch_size)
+    elif handle.get("batch_size"):
+        effective_batch_size = int(handle["batch_size"])
+    else:
+        effective_batch_size = resolve_judge_batch_size(model_id, None)
+
+    files: dict[str, list[dict]] = {}
+    by_id: dict[str, dict[str, dict]] = {}
+    sidecar_paths: dict[str, Path] = {}
+    existing_sidecar: dict[str, dict[tuple[str, int], dict]] = {}
+    all_ids: list[str] = []
+    for gradee in labels:
+        pred = pack / "models" / gradee / "predictions.jsonl"
+        records: list[dict] = []
+        if pred.is_file():
+            with pred.open(encoding="utf-8") as handle_in:
+                for line in handle_in:
+                    stripped = line.strip()
+                    if stripped:
+                        records.append(json.loads(stripped))
+        for record in records:
+            ensure_judge_schema(
+                record,
+                fallback_label=key,
+                fallback_model_id=model_id,
+            )
+        files[gradee] = records
+        index: dict[str, dict] = {}
+        for record in records:
+            qid = str(record.get("id") or "").strip()
+            if not qid or qid in index:
+                continue
+            index[qid] = record
+            all_ids.append(qid)
+        by_id[gradee] = index
+        if sidecar:
+            path = pred.parent / "judge_partials" / f"{key}.jsonl"
+            sidecar_paths[gradee] = path
+            existing_sidecar[gradee] = _load_sidecar_rows(path)
+            if not force:
+                _overlay_sidecar_rows(
+                    records, existing_sidecar[gradee], judge_key=key
+                )
+
+    allowed_ids = resolve_grade_allowed_ids(
+        all_ids, question_ids=question_ids, n_questions=n_questions
+    )
+    if question_ids is not None:
+        qid_order = [str(qid).strip() for qid in question_ids if str(qid).strip()]
+    else:
+        qid_order = list(dict.fromkeys(all_ids))
+    if allowed_ids is not None:
+        qid_order = [qid for qid in qid_order if qid in allowed_ids]
+
+    reuse_cache: dict[tuple[str, str, str], dict] = {}
+    if not force:
+        for qid in qid_order:
+            for gradee in labels:
+                record = by_id.get(gradee, {}).get(qid)
+                if record is None:
+                    continue
+                question = str(record.get("question") or "")
+                answer = str(record.get("answer") or "")
+                for shot_index, shot in _shots_in_index_order(record, shot_indices):
+                    entry = _shot_judge_entry(shot, key)
+                    if entry is None:
+                        continue
+                    reuse_cache.setdefault(
+                        _grade_reuse_key(
+                            question,
+                            answer,
+                            _shot_prediction_text(shot, model_label=gradee),
+                            include_gold=include_gold,
+                        ),
+                        dict(entry),
+                    )
+
+    jobs: list[dict] = []
+    owners: list[list[tuple[str, str, int]]] = []
+    job_keys: list[tuple[str, str, str]] = []
+    pending_index: dict[tuple[str, str, str], int] = {}
+    reuse_owners: list[tuple[str, str, int, dict]] = []
+    for qid in qid_order:
+        for gradee in labels:
+            record = by_id.get(gradee, {}).get(qid)
+            if record is None:
+                continue
+            question = str(record.get("question") or "")
+            answer = str(record.get("answer") or "")
+            for shot_index, shot in _shots_in_index_order(record, shot_indices):
+                if not force and not _shot_needs_grade(shot, key):
+                    continue
+                prediction = _shot_prediction_text(shot, model_label=gradee)
+                cache_key = _grade_reuse_key(
+                    question, answer, prediction, include_gold=include_gold
+                )
+                cached = reuse_cache.get(cache_key)
+                if cached is not None:
+                    reuse_owners.append((gradee, qid, shot_index, cached))
+                    continue
+                idx = pending_index.get(cache_key)
+                if idx is None:
+                    pending_index[cache_key] = len(jobs)
+                    jobs.append(
+                        {
+                            "id": qid,
+                            "question": question,
+                            "answer": answer,
+                            "prediction": prediction,
+                            "audio_path": record.get("audio_path"),
+                        }
+                    )
+                    owners.append([(gradee, qid, shot_index)])
+                    job_keys.append(cache_key)
+                else:
+                    owners[idx].append((gradee, qid, shot_index))
+
+    print(
+        f"[grade] order=question,test-taker,shot "
+        f"jobs={len(jobs)} questions={len(qid_order)} "
+        f"gradees={len(labels)} n_samples={n_samples} "
+        f"prompt_batch={effective_batch_size}"
+    )
+
+    graded = 0
+    reused = 0
+    graded_by = {gradee: 0 for gradee in labels}
+    reused_by = {gradee: 0 for gradee in labels}
+    partials: dict[str, list[dict]] = {gradee: [] for gradee in labels}
+
+    def _find_shot(gradee: str, qid: str, shot_index: int) -> dict | None:
+        record = by_id.get(gradee, {}).get(qid)
+        if record is None:
+            return None
+        for idx, shot in _shots_in_index_order(record, None):
+            if idx == shot_index:
+                return shot
+        return None
+
+    def _apply(gradee: str, qid: str, shot_index: int, entry: dict) -> None:
+        nonlocal graded
+        copied = dict(entry)
+        if sidecar:
+            partials[gradee].append(
+                {
+                    "id": qid,
+                    "shot_index": shot_index,
+                    "judge_key": key,
+                    "entry": copied,
+                }
+            )
+            graded += 1
+            return
+        shot = _find_shot(gradee, qid, shot_index)
+        if shot is None:
+            return
+        shot.setdefault("judges", {})[key] = copied
+        graded += 1
+
+    def _flush_sidecars() -> None:
+        if not sidecar:
+            return
+        wrote = False
+        for gradee, rows in partials.items():
+            if not rows:
+                continue
+            path = sidecar_paths[gradee]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            combined = dict(existing_sidecar[gradee])
+            for row in rows:
+                row_key = _sidecar_row_key(row)
+                if row_key[0]:
+                    combined[row_key] = row
+            existing_sidecar[gradee] = combined
+            write_jsonl(path, list(combined.values()), mode="w")
+            rows.clear()
+            wrote = True
+        if wrote and on_batch is not None:
+            on_batch()
+
+    for gradee, qid, shot_index, entry in reuse_owners:
+        _apply(gradee, qid, shot_index, entry)
+        reused += 1
+        reused_by[gradee] += 1
+        graded_by[gradee] += 1
+    _flush_sidecars()
+
+    for start in range(0, len(jobs), effective_batch_size):
+        chunk = jobs[start : start + effective_batch_size]
+        chunk_owners = owners[start : start + effective_batch_size]
+        chunk_keys = job_keys[start : start + effective_batch_size]
+        results = grade_shot_batch(
+            handle,
+            chunk,
+            prompt=prompt_name,
+            include_gold=include_gold,
+            n_samples=n_samples,
+            temperature=temperature,
+        )
+        for cache_key, owner_list, result in zip(chunk_keys, chunk_owners, results):
+            entry = {
+                "correct": bool(result["correct"]),
+                "verdict": result.get("verdict"),
+                "output": result.get("grader_output"),
+                "generation": result.get("generation") or "",
+                "reasoning": result.get("reasoning") or "",
+                "model_id": model_id,
+                "prompt": prompt_name,
+                "include_gold": include_gold,
+            }
+            if result.get("samples"):
+                entry["samples"] = result["samples"]
+                entry["n_samples"] = result.get("n_samples") or n_samples
+            reuse_cache[cache_key] = entry
+            for extra_index, (gradee, qid, shot_index) in enumerate(owner_list):
+                _apply(gradee, qid, shot_index, entry)
+                graded_by[gradee] += 1
+                if extra_index:
+                    reused += 1
+                    reused_by[gradee] += 1
+        _flush_sidecars()
+
+    if not sidecar:
+        for gradee in labels:
+            records = files[gradee]
+            pred = pack / "models" / gradee / "predictions.jsonl"
+            for record in records:
+                qid = str(record.get("id") or "").strip()
+                if allowed_ids is not None and qid not in allowed_ids:
+                    continue
+                existing = [str(x) for x in (record.get("judges") or []) if x]
+                ordered: list[str] = []
+                for label in existing:
+                    if label not in ordered:
+                        ordered.append(label)
+                if key not in ordered:
+                    ordered.append(key)
+                record["judges"] = ordered
+                record["scoring"] = "qwen_freeform_judge"
+                recompute_multi_judge_scores(record, record.get("primary_judge"))
+            if pred.parent.is_dir() or records:
+                pred.parent.mkdir(parents=True, exist_ok=True)
+                write_jsonl(pred, records, mode="w")
+
+    by_model = {
+        gradee: {
+            "status": "ok" if files[gradee] else "missing",
+            "predictions_path": str(pack / "models" / gradee / "predictions.jsonl"),
+            "sidecar_path": (
+                str(sidecar_paths[gradee]) if gradee in sidecar_paths else None
+            ),
+            "n_records": len(files[gradee]),
+            "n_sampled": (
+                sum(1 for qid in qid_order if qid in by_id.get(gradee, {}))
+            ),
+            "n_questions": n_questions,
+            "n_shots_graded": graded_by[gradee],
+            "n_shots_reused": reused_by[gradee],
+            "grader": model_id,
+            "judge_label": key,
+            "prompt": prompt_name,
+            "include_gold": include_gold,
+            "replaced": bool(force),
+            "n_samples": n_samples,
+        }
+        for gradee in labels
+    }
+    return {
+        "status": "ok",
+        "order": "question,model,shot",
+        "pack_dir": str(pack),
+        "by_model": by_model,
+        "n_shots_graded": graded,
+        "n_shots_reused": reused,
+        "grader": model_id,
+        "judge_label": key,
+        "prompt": prompt_name,
+        "include_gold": include_gold,
+        "replaced": bool(force),
+        "n_samples": n_samples,
+        "prompt_batch": effective_batch_size,
     }
 
 

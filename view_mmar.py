@@ -1,8 +1,10 @@
 """Local viewer for the MMAR freeform-thinking pack.
 
 Shows questions from ``outputs/mmar-freeform-thinking`` with audio, gold
-reference, and stored shots. Only models that have generations in that
-pack are listed.
+reference, and stored shots. Grades each generation with Claude Sonnet 5
+majority-of-3 verdicts from the llm-judge-gt pack (the
+``claude-sonnet-5__neutral_with_gt_no_audio__gold`` run). Only models that
+have generations in the freeform pack are listed.
 
 Usage::
 
@@ -41,10 +43,37 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_PACK_DIR = REPO_ROOT / "outputs" / "mmar-freeform-thinking"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "mmar"
 DEFAULT_AUDIO_DIR = DEFAULT_DATA_DIR / "audio"
+DEFAULT_JUDGE_KEY = "claude-sonnet-5__neutral_with_gt_no_audio__gold"
+DEFAULT_JUDGE_DIR = (
+    REPO_ROOT
+    / "outputs"
+    / "judge-quality"
+    / "llm-judge-gt"
+    / "_anthropic_batch"
+    / DEFAULT_JUDGE_KEY
+)
+BATCH_DIR_NAMES = frozenset({"_anthropic_batch", "_openai_batch", "_batch"})
 MMAR_REPO = "BoJack/MMAR"
 MMAR_AUDIO_ARCHIVE = "mmar-audio.tar.gz"
 MIN_MMAR_WAVS = 1000
 LABEL_ORDER = MODEL_LABEL_ORDER + ALL_API_LABELS
+
+# Official MMAR taxonomy (evaluation.py / run_judges.py).
+MMAR_CATEGORIES = (
+    "Signal Layer",
+    "Perception Layer",
+    "Semantic Layer",
+    "Cultural Layer",
+)
+MMAR_MODALITIES = (
+    "sound",
+    "music",
+    "speech",
+    "mix-sound-music",
+    "mix-sound-speech",
+    "mix-music-speech",
+    "mix-sound-music-speech",
+)
 
 # API models are not in MODEL_SPECS (run_experiment_api.API_SPECS).
 API_SAMPLING: dict[str, dict[str, Any]] = {
@@ -126,6 +155,11 @@ SAMPLING_SOURCES: dict[str, dict[str, str]] = {
     },
     "gemma-4-e4b": {
         "url": "https://huggingface.co/google/gemma-4-E4B-it#best-practices",
+        "label": "Hugging Face Best Practices",
+        "note": "Card Best Practices: temperature=1.0, top_p=0.95, top_k=64.",
+    },
+    "gemma-4-12b": {
+        "url": "https://huggingface.co/google/gemma-4-12B-it#best-practices",
         "label": "Hugging Face Best Practices",
         "note": "Card Best Practices: temperature=1.0, top_p=0.95, top_k=64.",
     },
@@ -306,9 +340,11 @@ JUDGE_ENTRY_KEYS = (
     "verdict",
     "output",
     "generation",
+    "reasoning",
     "model_id",
     "prompt",
     "include_gold",
+    "n_samples",
 )
 
 CONFIG: dict[str, Any] = {}
@@ -401,6 +437,11 @@ def order_model_labels(labels: list[str]) -> list[str]:
     return known + rest
 
 
+def _ordered_unique(values: set[str], canonical: tuple[str, ...] = ()) -> list[str]:
+    extras = sorted(name for name in values if name and name not in canonical)
+    return [name for name in canonical if name in values] + extras
+
+
 def _ordered_sampling(sampling: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in SAMPLING_KEY_ORDER:
@@ -486,7 +527,203 @@ def _compact_judge_entry(entry: Any) -> dict[str, Any] | None:
         out["correct"] = entry.get("correct")
     if "verdict" not in out and out.get("correct") is not None:
         out["verdict"] = "pass" if out.get("correct") else "fail"
+    samples = entry.get("samples")
+    if isinstance(samples, list) and samples:
+        compacted_samples: list[dict[str, Any]] = []
+        for item in samples:
+            if not isinstance(item, dict):
+                continue
+            sample: dict[str, Any] = {}
+            for key in ("correct", "verdict", "output", "generation", "reasoning"):
+                if key in item:
+                    sample[key] = item.get(key)
+            if sample:
+                compacted_samples.append(sample)
+        if compacted_samples:
+            out["samples"] = compacted_samples
+            out.setdefault("n_samples", len(compacted_samples))
     return out
+
+
+def _judge_key_from_dir(judge_dir: Path) -> str:
+    name = judge_dir.name
+    if name.count("__") >= 2:
+        return name
+    return DEFAULT_JUDGE_KEY
+
+
+def _judge_pack_dir(judge_dir: Path) -> Path | None:
+    """Pack that holds applied verdicts for a judge work dir or pack path."""
+    if (judge_dir / "models").is_dir():
+        return judge_dir
+    if judge_dir.parent.name in BATCH_DIR_NAMES:
+        pack = judge_dir.parent.parent
+        if (pack / "models").is_dir():
+            return pack
+    return None
+
+
+def _anthropic_output_text(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    result = row.get("result")
+    if not isinstance(result, dict):
+        return ""
+    if str(result.get("type") or "") != "succeeded":
+        return ""
+    message = result.get("message")
+    if not isinstance(message, dict):
+        return ""
+    parts: list[str] = []
+    for block in message.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and block.get("text"):
+            parts.append(str(block["text"]))
+    return "\n".join(parts).strip()
+
+
+def _majority_entry_from_texts(
+    texts: list[str],
+    *,
+    model_id: str,
+    prompt_name: str,
+    include_gold: bool,
+) -> dict[str, Any] | None:
+    from grader import _verdict_fields, format_grade_output, majority_grade_verdict
+
+    if not any(texts):
+        return None
+    sample_fields = [_verdict_fields(text) for text in texts]
+    raw = [item["grader_verdict_raw"] for item in sample_fields]
+    majority = majority_grade_verdict(raw)
+    generation = ""
+    reasoning = ""
+    for item, verdict in zip(sample_fields, raw):
+        if majority is not None and verdict is majority:
+            generation = item["generation"]
+            reasoning = item.get("reasoning") or ""
+            break
+    if not generation and sample_fields:
+        generation = sample_fields[0]["generation"]
+        reasoning = sample_fields[0].get("reasoning") or ""
+    return {
+        "correct": bool(majority) if majority is not None else False,
+        "verdict": (
+            "pass" if majority is True else "fail" if majority is False else None
+        ),
+        "output": format_grade_output(majority),
+        "generation": generation,
+        "reasoning": reasoning,
+        "model_id": model_id,
+        "prompt": prompt_name,
+        "include_gold": include_gold,
+        "samples": [
+            {
+                "correct": item["correct"],
+                "verdict": item["verdict"],
+                "generation": item["generation"],
+                "reasoning": item.get("reasoning") or "",
+                "output": item["grader_output"],
+            }
+            for item in sample_fields
+        ],
+        "n_samples": len(sample_fields),
+    }
+
+
+def _load_grades_from_judge_pack(
+    pack_dir: Path, judge_key: str
+) -> dict[tuple[str, str, int], dict[str, Any]]:
+    overlay: dict[tuple[str, str, int], dict[str, Any]] = {}
+    models_root = pack_dir / "models"
+    if not models_root.is_dir():
+        return overlay
+    for child in sorted(models_root.iterdir()):
+        pred = child / "predictions.jsonl"
+        if not child.is_dir() or not pred.is_file():
+            continue
+        label = child.name
+        for record in load_jsonl(pred):
+            qid = str(record.get("id") or "")
+            if not qid:
+                continue
+            for shot in record.get("shots") or []:
+                entry = _shot_judge_entry(shot, judge_key)
+                compact = _compact_judge_entry(entry) if entry else None
+                if compact is None:
+                    continue
+                overlay[(label, qid, _shot_index(shot))] = compact
+    return overlay
+
+
+def _load_grades_from_batch_dir(
+    batch_dir: Path, judge_key: str
+) -> dict[tuple[str, str, int], dict[str, Any]]:
+    from grader import parse_judge_key
+
+    jobs_path = batch_dir / "jobs.jsonl"
+    output_path = batch_dir / "output.jsonl"
+    if not jobs_path.is_file() or not output_path.is_file():
+        return {}
+    parsed = parse_judge_key(judge_key)
+    model_id = parsed.get("model") or "claude-sonnet-5"
+    prompt_name = parsed.get("prompt") or "neutral_with_gt_no_audio"
+    include_gold = parsed.get("gold_tag") != "nongold"
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in load_jsonl(output_path):
+        cid = str(row.get("custom_id") or "")
+        if cid:
+            by_id[cid] = row
+    overlay: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for job in load_jsonl(jobs_path):
+        sample_ids = [
+            str(cid)
+            for cid in (job.get("sample_custom_ids") or [job.get("custom_id")])
+            if cid
+        ]
+        if not sample_ids:
+            continue
+        texts = [_anthropic_output_text(by_id.get(cid)) for cid in sample_ids]
+        entry = _majority_entry_from_texts(
+            texts,
+            model_id=model_id,
+            prompt_name=prompt_name,
+            include_gold=include_gold,
+        )
+        compact = _compact_judge_entry(entry) if entry else None
+        if compact is None:
+            continue
+        for owner in job.get("owners") or []:
+            if isinstance(owner, dict):
+                gradee = str(owner.get("model") or "")
+                qid = str(owner.get("qid") or "")
+                shot_index = int(owner.get("shot_index", 0))
+            else:
+                gradee, qid, shot_index = owner[0], owner[1], int(owner[2])
+            if not gradee or not qid:
+                continue
+            overlay[(gradee, qid, shot_index)] = compact
+    return overlay
+
+
+def load_judge_overlay(
+    judge_dir: Path | None,
+) -> tuple[str | None, dict[tuple[str, str, int], dict[str, Any]]]:
+    """Load Claude (or other) majority-of-n verdicts keyed by model/qid/shot."""
+    if judge_dir is None:
+        return None, {}
+    judge_dir = judge_dir.expanduser()
+    if not judge_dir.exists():
+        return None, {}
+    judge_key = _judge_key_from_dir(judge_dir)
+    overlay: dict[tuple[str, str, int], dict[str, Any]] = {}
+    pack_dir = _judge_pack_dir(judge_dir)
+    if pack_dir is not None:
+        overlay = _load_grades_from_judge_pack(pack_dir, judge_key)
+    if not overlay:
+        overlay = _load_grades_from_batch_dir(judge_dir, judge_key)
+    return (judge_key if overlay else None), overlay
 
 
 _TOKEN_PIECE_RE = re.compile(
@@ -591,15 +828,43 @@ def _shot_correct(shot: dict[str, Any], judge_key: str | None = None) -> bool | 
     return bool(value)
 
 
-def _shot_disagreement(shot: dict[str, Any]) -> float | None:
-    """1 - max(pass rate, fail rate) across judges on one generation.
+def _sample_disagreement(entry: dict[str, Any]) -> float | None:
+    """1 - max(pass rate, fail rate) across majority-vote samples."""
+    samples = entry.get("samples")
+    if not isinstance(samples, list) or not samples:
+        return None
+    n_pass = 0
+    n = 0
+    for item in samples:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("correct")
+        if value is None:
+            continue
+        n += 1
+        if value:
+            n_pass += 1
+    if n == 0:
+        return None
+    pct_pass = n_pass / n
+    return 1.0 - max(pct_pass, 1.0 - pct_pass)
 
-    Unanimous pass or fail is 0. A 50/50 split is 0.5. Shots with no
-    scored judges return None.
+
+def _shot_disagreement(shot: dict[str, Any]) -> float | None:
+    """1 - max(pass rate, fail rate) on one generation.
+
+    Prefers the judge's n-sample votes (Claude majority-of-3) when present.
+    Otherwise uses the split across judges. Unanimous is 0; a 50/50 split
+    is 0.5. Shots with no scored votes return None.
     """
     judges = shot.get("judges")
     if not isinstance(judges, dict) or not judges:
         return None
+    for entry in judges.values():
+        if isinstance(entry, dict):
+            sample_value = _sample_disagreement(entry)
+            if sample_value is not None:
+                return sample_value
     n_pass = 0
     n = 0
     for entry in judges.values():
@@ -785,7 +1050,10 @@ def _shot_success(
 
 
 def _question_fields(record: dict[str, Any]) -> dict[str, Any]:
-    return {key: record.get(key) for key in QUESTION_KEYS if key in record}
+    out = {key: record.get(key) for key in QUESTION_KEYS if key in record}
+    if not out.get("sub-category") and record.get("sub_category"):
+        out["sub-category"] = record.get("sub_category")
+    return out
 
 
 def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
@@ -793,10 +1061,6 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
     base = build_mmar_freeform_prompt(item)
     af_base = build_mmar_freeform_prompt(item, with_timestamps=True)
     mf_base = build_mmar_freeform_prompt(item, think_suffix=MUSIC_FLAMINGO_THINK_SUFFIX)
-    step_system = (
-        "You are an expert in audio analysis. Activate deep thinking: "
-        "reason step by step about what you hear, then answer accurately."
-    )
     return {
         "shared": base,
         "af-next-think": (
@@ -836,11 +1100,6 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
             "<|im_start|>assistant\n"
         ),
         "voxtral-small-24b": f"[audio attached]\n{base}",
-        "step-audio-r1.1": (
-            f"<|BOT|>system\n{step_system}<|EOT|>"
-            f"<|BOT|>human\n<audio_patch>{base}<|EOT|>"
-            f"<|BOT|>assistant\n\n{ASSISTANT_THINK_OPEN}"
-        ),
         "gemini-3.7-flash": base,
         "gpt-4o-mini": base,
     }
@@ -863,14 +1122,38 @@ def resolve_audio(audio_path: str | None) -> Path | None:
     return None
 
 
+def _apply_judge_overlay(
+    shots: list[dict[str, Any]],
+    *,
+    model: str,
+    qid: str,
+    overlay: dict[tuple[str, str, int], dict[str, Any]],
+    judge_key: str,
+) -> None:
+    for shot in shots:
+        entry = overlay.get((model, qid, _shot_index(shot)))
+        if entry is None:
+            if isinstance(shot.get("judges"), dict):
+                shot["judges"] = {
+                    key: value
+                    for key, value in shot["judges"].items()
+                    if key == judge_key
+                }
+            continue
+        shot["judges"] = {judge_key: entry}
+        if entry.get("correct") is not None:
+            shot["correct"] = bool(entry.get("correct"))
+
+
 @lru_cache(maxsize=2)
-def load_pack(pack_dir_s: str) -> dict[str, Any]:
+def load_pack(pack_dir_s: str, judge_dir_s: str = "") -> dict[str, Any]:
     pack_dir = Path(pack_dir_s)
     if not pack_dir.is_dir():
         raise FileNotFoundError(pack_dir)
     manifest = load_json(pack_dir / "manifest.json")
     ids_payload = load_json(pack_dir / "question_ids.json")
     model_labels = discover_model_labels(pack_dir, manifest)
+    overlay_key, overlay = load_judge_overlay(Path(judge_dir_s) if judge_dir_s else None)
 
     predictions: dict[str, dict[str, dict[str, Any]]] = {}
     for label in model_labels:
@@ -882,17 +1165,34 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 continue
             shots = [_compact_shot(shot) for shot in (record.get("shots") or [])]
             shots.sort(key=_shot_index)
-            rate, n_correct, n_shots = _shot_success({**record, "shots": shots})
-            judge_keys = [
-                str(x)
-                for x in (record.get("judges") or [])
-                if x
-            ]
-            for shot in shots:
-                for key in (shot.get("judges") or {}):
-                    if key not in judge_keys:
-                        judge_keys.append(key)
-            stored_per_judge = record.get("per_judge") or {}
+            if overlay_key:
+                _apply_judge_overlay(
+                    shots,
+                    model=label,
+                    qid=qid,
+                    overlay=overlay,
+                    judge_key=overlay_key,
+                )
+            if overlay_key:
+                rate, n_correct, n_shots = _shot_success(
+                    {"shots": shots, "per_judge": {}},
+                    overlay_key,
+                )
+            else:
+                rate, n_correct, n_shots = _shot_success({**record, "shots": shots})
+            if overlay_key:
+                judge_keys = [overlay_key]
+            else:
+                judge_keys = [
+                    str(x)
+                    for x in (record.get("judges") or [])
+                    if x
+                ]
+                for shot in shots:
+                    for key in (shot.get("judges") or {}):
+                        if key not in judge_keys:
+                            judge_keys.append(key)
+            stored_per_judge = {} if overlay_key else (record.get("per_judge") or {})
             per_judge = {
                 key: _judge_stats(shots, key, stored_per_judge) for key in judge_keys
             }
@@ -904,7 +1204,7 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "n_shot_correct": n_correct,
                 "shot_success_rate": rate,
                 "judges": judge_keys,
-                "primary_judge": record.get("primary_judge"),
+                "primary_judge": overlay_key or record.get("primary_judge"),
                 "per_judge": per_judge,
                 "shots": shots,
             }
@@ -918,6 +1218,25 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
     predictions = {label: predictions[label] for label in model_labels}
 
     judge_entries, primary_judge = _pack_judge_entries(manifest, predictions)
+    if overlay_key:
+        primary_judge = overlay_key
+        if not any(entry.get("label") == overlay_key for entry in judge_entries):
+            judge_entries.insert(
+                0,
+                {
+                    "label": overlay_key,
+                    "model_id": overlay_key.split("__")[0],
+                    "prompt": "neutral_with_gt_no_audio",
+                    "include_gold": True,
+                    "primary": True,
+                },
+            )
+        for entry in judge_entries:
+            entry["primary"] = entry["label"] == overlay_key
+        judge_entries.sort(
+            key=lambda row: (0 if row["label"] == overlay_key else 1, row["label"])
+        )
+        judge_entries = [entry for entry in judge_entries if entry["label"] == overlay_key]
 
     preferred_ids = [str(qid) for qid in (ids_payload.get("ids") or []) if qid]
     seen: set[str] = set(preferred_ids)
@@ -931,6 +1250,9 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
     questions: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
     modalities: set[str] = set()
+    categories: set[str] = set()
+    subcategories: set[str] = set()
+    category_subs: dict[str, set[str]] = {}
     n_complete = 0
     for qid in all_ids:
         sample: dict[str, Any] | None = None
@@ -982,8 +1304,16 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
             if has_grades:
                 break
         modality = str(sample.get("modality") or "")
+        category = str(sample.get("category") or "")
+        subcat = str(sample.get("sub-category") or "")
         if modality:
             modalities.add(modality)
+        if category:
+            categories.add(category)
+        if subcat:
+            subcategories.add(subcat)
+        if category and subcat:
+            category_subs.setdefault(category, set()).add(subcat)
         row = {
             "id": qid,
             "question": sample.get("question") or "",
@@ -993,8 +1323,8 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
             "url": sample.get("url") or "",
             "source": sample.get("source") or "",
             "modality": modality,
-            "category": sample.get("category") or "",
-            "sub-category": sample.get("sub-category") or "",
+            "category": category,
+            "sub-category": subcat,
             "language": sample.get("language") or "",
             "thinking": sample.get("thinking") or "",
             "rubric": sample.get("rubric") or "",
@@ -1012,7 +1342,8 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "id": qid,
                 "question": row["question"],
                 "modality": modality,
-                "category": row["category"],
+                "category": category,
+                "sub-category": subcat,
                 "avg_success_rate": avg,
                 "avg_disagreement": avg_disagreement,
                 "n_models": n_present,
@@ -1037,6 +1368,19 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
     for label in model_labels:
         n_done = len(predictions[label])
         row = progress.get(label) or {}
+        n_shot_correct = 0
+        n_graded_shots = 0
+        for record in predictions[label].values():
+            for shot in record.get("shots") or []:
+                value = _shot_correct(shot, overlay_key or primary_judge)
+                if value is None:
+                    continue
+                n_graded_shots += 1
+                if value:
+                    n_shot_correct += 1
+        accuracy = (
+            n_shot_correct / n_graded_shots if n_graded_shots else None
+        )
         coverage.append(
             {
                 "model": label,
@@ -1044,6 +1388,9 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
                 "n_total": int(row.get("n_total") or ids_payload.get("n") or len(questions)),
                 "complete": bool(row.get("complete")) if "complete" in row else n_done >= len(questions),
                 "source_run_id": row.get("source_run_id"),
+                "n_shot_correct": n_shot_correct if n_graded_shots else None,
+                "n_graded": n_graded_shots,
+                "accuracy": accuracy,
             }
         )
 
@@ -1054,7 +1401,13 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
         "predictions": predictions,
         "questions": questions,
         "by_id": by_id,
-        "modalities": sorted(modalities),
+        "modalities": _ordered_unique(modalities, MMAR_MODALITIES),
+        "categories": _ordered_unique(categories, MMAR_CATEGORIES),
+        "subcategories": _ordered_unique(subcategories),
+        "category_subcategories": {
+            name: _ordered_unique(category_subs.get(name) or set())
+            for name in _ordered_unique(categories, MMAR_CATEGORIES)
+        },
         "n_shots": int(manifest.get("n_shots") or ids_payload.get("n_shots") or 5),
         "coverage": coverage,
         "n_complete": n_complete,
@@ -1062,6 +1415,8 @@ def load_pack(pack_dir_s: str) -> dict[str, Any]:
         "n_questions": len(questions),
         "judges": judge_entries,
         "primary_judge": primary_judge,
+        "judge_dir": judge_dir_s,
+        "n_overlay_grades": len(overlay),
     }
 
 
@@ -1124,7 +1479,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--card); border: 1px solid var(--line);
     border-radius: 8px; padding: 0.45rem 0.65rem;
   }
-  select, input[type="search"] { min-width: 12rem; }
+  select, input[type="search"] { min-width: 10rem; }
+  select.filter-select { max-width: 14rem; }
   button { cursor: pointer; }
   button.active { background: #e2eef6; border-color: #8fb3c9; }
   main {
@@ -1323,6 +1679,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .vg-cell.pending { background: #d5dde3; border-color: var(--line); }
   .vg-cell.missing { background: transparent; border: 1px dashed var(--line); }
   .judge-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.25rem 0 0.15rem; }
+  .judge-chips .sample {
+    font-size: 0.72rem; opacity: 0.92;
+  }
   .judge-rationale { margin-top: 0.35rem; }
   .header-right {
     display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end;
@@ -1426,7 +1785,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <h1>MMAR Freeform</h1>
         <span class="mode-badge">Freeform</span>
       </div>
-      <p>All models × all shots from the freeform pack</p>
+      <p>All models × all shots from the freeform pack. Graded by Claude Sonnet 5 (majority of 3, with gold, no audio).</p>
       <div class="run-meta" id="run-meta"></div>
     </div>
     <div class="header-right">
@@ -1434,8 +1793,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <label>Search
         <input id="search" type="search" placeholder="id / question text" />
       </label>
+      <label>Category
+        <select id="category" class="filter-select"><option value="">All</option></select>
+      </label>
+      <label>Subcategory
+        <select id="subcategory" class="filter-select"><option value="">All</option></select>
+      </label>
       <label>Modality
-        <select id="modality"><option value="">All</option></select>
+        <select id="modality" class="filter-select"><option value="">All</option></select>
       </label>
       <label>Sort
         <select id="sort">
@@ -1485,6 +1850,9 @@ const state = {
   modelLabels: [],
   questions: [],
   modalities: [],
+  categories: [],
+  subcategories: [],
+  categorySubcategories: {},
   coverage: [],
   nShots: 5,
   nComplete: 0,
@@ -1568,6 +1936,10 @@ function shortJudge(key) {
 
 function modelJudgeStats(pm) {
   const per = (pm && pm.per_judge) || {};
+  const primary = state.primaryJudge;
+  if (primary && per[primary] && Number.isFinite(Number(per[primary].shot_success_rate))) {
+    return per[primary];
+  }
   const rows = Object.values(per).filter(row =>
     row && row.shot_success_rate !== null && row.shot_success_rate !== undefined
       && Number.isFinite(Number(row.shot_success_rate))
@@ -1599,6 +1971,14 @@ function questionHasGrades(row) {
       stats && stats.n_shots > 0 && stats.n_shot_correct !== null && stats.n_shot_correct !== undefined
     );
   });
+}
+
+function sampleVotes(entry) {
+  const samples = (entry && entry.samples) || [];
+  return samples.map(s => {
+    if (!s || s.correct === undefined || s.correct === null) return null;
+    return !!s.correct;
+  }).filter(v => v !== null);
 }
 
 function shotJudgeKeys(shot) {
@@ -1633,6 +2013,14 @@ function shotConsensus(shot) {
 
 function shotDisagreement(shot) {
   const keys = shotJudgeKeys(shot);
+  for (const key of keys) {
+    const votes = sampleVotes((shot.judges || {})[key] || {});
+    if (votes.length >= 2) {
+      const nPass = votes.filter(Boolean).length;
+      const pctPass = nPass / votes.length;
+      return 1 - Math.max(pctPass, 1 - pctPass);
+    }
+  }
   const verdicts = keys.map(key => {
     const entry = (shot.judges || {})[key] || {};
     if (entry.correct === undefined || entry.correct === null) return null;
@@ -1741,22 +2129,55 @@ function shortLabel(label) {
     "qwen2.5-omni-7b": "qwen2.5",
     "voxtral-small-24b": "voxtral",
     "phi-4-multimodal": "phi-4",
-    "gemma-4-e4b": "gemma",
+    "gemma-4-e4b": "gemma-e4b",
+    "gemma-4-12b": "gemma-12b",
     "nemotron-3-nano-omni": "nemotron",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
-    "step-audio-r1.1": "step",
-    "step-audio-2-mini-think": "step",
+    "claude-sonnet-5": "claude",
   };
   return map[label] || label;
 }
 
+function questionSubcat(row) {
+  return String((row && (row["sub-category"] || row.sub_category)) || "");
+}
+
+function fillSelect(sel, values, allLabel) {
+  const prev = sel.value;
+  const items = (values || []).filter(Boolean);
+  sel.innerHTML = `<option value="">${escapeHtml(allLabel)}</option>` + items.map(v =>
+    `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
+  ).join("");
+  sel.value = items.includes(prev) ? prev : "";
+}
+
+function fillSubcategorySelect() {
+  const category = document.getElementById("category").value;
+  const values = category
+    ? (state.categorySubcategories[category] || [])
+    : (state.subcategories || []);
+  fillSelect(document.getElementById("subcategory"), values, "All");
+}
+
+function applyTaxonomyFilters() {
+  renderList();
+  const items = filteredQuestions();
+  if (items.length && !items.some(row => row.id === state.selectedId)) {
+    selectQuestion(items[0].id);
+  }
+}
+
 function filteredQuestions() {
   const q = (document.getElementById("search").value || "").trim().toLowerCase();
+  const category = document.getElementById("category").value;
+  const subcategory = document.getElementById("subcategory").value;
   const modality = document.getElementById("modality").value;
   const items = state.questions.filter(row => {
     if (state.filterIncomplete && row.complete) return false;
     if (state.filterGraded && !questionHasGrades(row)) return false;
+    if (category && row.category !== category) return false;
+    if (subcategory && questionSubcat(row) !== subcategory) return false;
     if (modality && row.modality !== modality) return false;
     if (!q) return true;
     return String(row.id).toLowerCase().includes(q)
@@ -1792,10 +2213,21 @@ function renderStats() {
     `<span>${state.nGraded} graded</span>`,
     `<span>${state.nShots} shots</span>`,
   ];
+  const accParts = [];
   for (const row of state.coverage) {
-    parts.push(
-      `<span>${escapeHtml(shortLabel(row.model))}: <strong>${row.n_done}</strong>/${row.n_total}</span>`
-    );
+    if (row.n_graded) {
+      accParts.push(
+        `<span>${escapeHtml(shortLabel(row.model))}: <strong>${fmtRate(row.accuracy)}</strong> (${row.n_shot_correct}/${row.n_graded})</span>`
+      );
+    } else {
+      accParts.push(
+        `<span>${escapeHtml(shortLabel(row.model))}: <strong>${row.n_done}</strong>/${row.n_total}</span>`
+      );
+    }
+  }
+  if (accParts.length) {
+    parts.push(`<span>accuracy</span>`);
+    parts.push(...accParts);
   }
   document.getElementById("stats").innerHTML = parts.join(" · ");
 }
@@ -1812,13 +2244,17 @@ function renderList() {
         return `<span class="chip missing" title="${escapeHtml(label)} missing">${escapeHtml(shortLabel(label))} —</span>`;
       }
       const stats = modelJudgeStats(pm);
-      return `<span class="chip" title="${escapeHtml(label)}">${escapeHtml(shortLabel(label))} ${fmtRate(stats.shot_success_rate)}</span>`;
+      const counted = (stats.n_shot_correct != null && stats.n_shots)
+        ? ` ${stats.n_shot_correct}/${stats.n_shots}`
+        : "";
+      return `<span class="chip" title="${escapeHtml(label)}">${escapeHtml(shortLabel(label))} ${fmtRate(stats.shot_success_rate)}${counted}</span>`;
     }).join("");
     const active = row.id === state.selectedId ? "active" : "";
     const cover = `${row.n_models}/${row.n_models_total}`;
-    const disagreeTitle = "1 − max(percent pass, percent fail). 0 = unanimous, 0.50 = even split.";
+    const disagreeTitle = "Claude 3-sample disagreement: 1 − max(percent pass, percent fail). 0 = unanimous, 0.33 = 2/3 split.";
+    const taxonomy = [row.modality, row.category, questionSubcat(row)].filter(Boolean).join(" · ");
     return `<li class="${active}" data-id="${escapeHtml(row.id)}">
-      <div class="qid">${escapeHtml(row.id)}</div>
+      <div class="qid">${escapeHtml(row.id)}${taxonomy ? ` · ${escapeHtml(taxonomy)}` : ""}</div>
       <div class="rate">${fmtRate(questionAvg(row))} avg · <span title="${escapeHtml(disagreeTitle)}">${fmtDisagree(questionDisagree(row))} disagree</span> · ${cover} models</div>
       <div class="mini-rates">${chips}</div>
       <p class="qtext">${escapeHtml(row.question || "")}</p>
@@ -1893,7 +2329,7 @@ function renderVerdictGrid(modelLabels, predictions, nShots) {
     return `<div class="vg-model">${escapeHtml(label)}</div>${cells}`;
   }).join("");
   return `<div class="verdict-grid-wrap">
-    <div class="vg-title">Verdict grid · all judges · model × shot</div>
+    <div class="vg-title">Verdict grid · Claude majority of 3 · model × shot</div>
     <div class="verdict-grid" style="grid-template-columns: max-content repeat(${shotsN}, 1.15rem)">
       <div class="vg-corner"></div>
       ${shotHeaders}
@@ -1912,15 +2348,39 @@ function shotJudgeChips(shot) {
     const pending = entry.correct === null || entry.correct === undefined;
     const klass = pending ? "chip" : (entry.correct ? "pass" : "fail");
     const text = pending ? "pending" : (entry.correct ? "pass" : "fail");
-    return `<span class="${klass}" title="${escapeHtml(prettyJudge(key))}">${escapeHtml(shortJudge(key))}: ${text}</span>`;
+    const votes = sampleVotes(entry);
+    const nPass = votes.filter(Boolean).length;
+    const voteLabel = votes.length ? ` ${nPass}/${votes.length}` : "";
+    const majority = `<span class="${klass}" title="${escapeHtml(prettyJudge(key))} majority of ${votes.length || 1}">${escapeHtml(shortJudge(key))}: ${text}${voteLabel}</span>`;
+    const sampleChips = votes.map((v, i) => {
+      const label = v ? "pass" : "fail";
+      return `<span class="${v ? "pass" : "fail"} sample" title="sample ${i + 1}">s${i} ${label}</span>`;
+    }).join("");
+    return majority + sampleChips;
   }).join("")}</div>`;
+}
+
+function shortJudgeText(text) {
+  const t = String(text || "").trim();
+  return !t || /^(correct|incorrect|pass|fail|yes|no|0|1)$/i.test(t);
 }
 
 function shotJudgeAccordions(shot) {
   return shotJudgeKeys(shot).map(key => {
     const entry = (shot.judges || {})[key] || {};
-    const text = entry.generation || entry.output || "";
-    if (!text) return "";
+    const samples = entry.samples || [];
+    const blocks = samples.map((sample, i) => {
+      const text = (sample && (sample.generation || sample.reasoning || sample.output)) || "";
+      if (shortJudgeText(text)) return "";
+      const v = sample.correct === true ? "pass" : sample.correct === false ? "fail" : "pending";
+      return `<details class="accordion judge-rationale">
+        <summary><span>Claude sample ${i + 1} · ${v}</span></summary>
+        <div class="accordion-body"><pre>${escapeHtml(text)}</pre></div>
+      </details>`;
+    }).join("");
+    if (blocks) return blocks;
+    const text = entry.generation || entry.reasoning || entry.output || "";
+    if (shortJudgeText(text)) return "";
     return `<details class="accordion judge-rationale">
       <summary><span>Judge ${escapeHtml(prettyJudge(key))}</span></summary>
       <div class="accordion-body"><pre>${escapeHtml(text)}</pre></div>
@@ -1990,7 +2450,10 @@ async function selectQuestion(id) {
       const shots = (pred.shots || []).slice().sort((a, b) => (a.shot_index ?? 0) - (b.shot_index ?? 0));
       const shotsHtml = shots.map(shotBlock).join("");
       const stats = modelJudgeStats(pm);
-      const rateChip = `<span class="chip">${fmtRate(stats.shot_success_rate)}</span>`;
+      const counted = (stats.n_shot_correct != null && stats.n_shots)
+        ? ` ${stats.n_shot_correct}/${stats.n_shots}`
+        : "";
+      const rateChip = `<span class="chip">${fmtRate(stats.shot_success_rate)}${counted}</span>`;
       modelsHtml += `<div class="model-block">
         <h3>${escapeHtml(label)} ${rateChip}</h3>
         ${shotsHtml || "<p class='muted'>No shots stored.</p>"}
@@ -2011,7 +2474,7 @@ async function selectQuestion(id) {
         ${row.complete ? "" : `<span class="chip missing">${escapeHtml(cover)}</span>`}
       </div>
       <h3 style="margin:0.4rem 0 0.2rem;font-family:Space Grotesk,sans-serif">${escapeHtml(row.question || "")}</h3>
-      <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")} · avg ${fmtRate(questionAvg(row))} · disagree ${fmtDisagree(questionDisagree(row))} · ${escapeHtml(cover)}</p>
+      <p class="muted">${escapeHtml(row.modality || "")} · ${escapeHtml(row.category || "")}${questionSubcat(row) ? ` · ${escapeHtml(questionSubcat(row))}` : ""} · avg ${fmtRate(questionAvg(row))} · disagree ${fmtDisagree(questionDisagree(row))} · ${escapeHtml(cover)}</p>
       ${renderVerdictGrid(labels, data.predictions || {}, nShots)}
       ${audio}
       ${audioSource}
@@ -2037,6 +2500,9 @@ async function init() {
   state.modelLabels = data.model_labels || [];
   state.questions = data.questions || [];
   state.modalities = data.modalities || [];
+  state.categories = data.categories || [];
+  state.subcategories = data.subcategories || [];
+  state.categorySubcategories = data.category_subcategories || {};
   state.coverage = data.coverage || [];
   state.nShots = data.n_shots || 5;
   state.nComplete = data.n_complete || 0;
@@ -2049,14 +2515,19 @@ async function init() {
   metaBits.push(`${state.questions.length} questions`);
   if (data.n_complete != null) metaBits.push(`${data.n_complete} with every model`);
   if (state.nGraded) metaBits.push(`${state.nGraded} graded`);
-  if (state.judges.length) metaBits.push(`${state.judges.length} judges`);
+  if (state.primaryJudge) metaBits.push(`judge ${prettyJudge(state.primaryJudge)}`);
+  if (state.judges.length && !state.primaryJudge) metaBits.push(`${state.judges.length} judges`);
   document.getElementById("run-meta").textContent = metaBits.join(" · ");
-  const sel = document.getElementById("modality");
-  sel.innerHTML = `<option value="">All</option>` + state.modalities.map(m =>
-    `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`
-  ).join("");
+  fillSelect(document.getElementById("category"), state.categories, "All");
+  fillSelect(document.getElementById("modality"), state.modalities, "All");
+  fillSubcategorySelect();
   document.getElementById("search").addEventListener("input", renderList);
-  sel.addEventListener("change", renderList);
+  document.getElementById("category").addEventListener("change", () => {
+    fillSubcategorySelect();
+    applyTaxonomyFilters();
+  });
+  document.getElementById("subcategory").addEventListener("change", applyTaxonomyFilters);
+  document.getElementById("modality").addEventListener("change", applyTaxonomyFilters);
   document.getElementById("sort").addEventListener("change", renderList);
   document.getElementById("filter-graded").addEventListener("click", () => {
     state.filterGraded = !state.filterGraded;
@@ -2099,6 +2570,13 @@ init().catch(err => {
 """
 
 
+def _current_pack() -> dict[str, Any]:
+    return load_pack(
+        str(CONFIG.get("pack_dir") or ""),
+        str(CONFIG.get("judge_dir") or ""),
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
         print(f"[view_mmar] {self.address_string()} {fmt % args}")
@@ -2124,13 +2602,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/pack":
-                bundle = load_pack(str(CONFIG["pack_dir"]))
+                bundle = _current_pack()
                 self._send_json(
                     {
                         "questions": bundle["questions"],
                         "manifest": bundle["manifest"],
                         "model_labels": bundle["model_labels"],
                         "modalities": bundle["modalities"],
+                        "categories": bundle.get("categories") or [],
+                        "subcategories": bundle.get("subcategories") or [],
+                        "category_subcategories": bundle.get("category_subcategories")
+                        or {},
                         "coverage": bundle["coverage"],
                         "n_shots": bundle["n_shots"],
                         "n_complete": bundle["n_complete"],
@@ -2143,7 +2625,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/sampling":
-                bundle = load_pack(str(CONFIG["pack_dir"]))
+                bundle = _current_pack()
                 self._send_json({"models": sampling_entries(bundle["model_labels"])})
                 return
 
@@ -2152,7 +2634,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not qid:
                     self._send_json({"error": "missing id"}, 400)
                     return
-                bundle = load_pack(str(CONFIG["pack_dir"]))
+                bundle = _current_pack()
                 row = bundle["by_id"].get(qid)
                 if row is None:
                     self._send_json({"error": "question not found"}, 404)
@@ -2225,11 +2707,23 @@ def main() -> None:
         action="store_true",
         help="Re-download the MMAR wav archive even if wavs are present",
     )
+    parser.add_argument(
+        "--judge-dir",
+        type=Path,
+        default=DEFAULT_JUDGE_DIR,
+        help=(
+            "Claude majority-of-3 verdicts. Default is the "
+            "claude-sonnet-5__neutral_with_gt_no_audio__gold batch dir; "
+            "applied grades are read from the parent llm-judge-gt pack."
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
     pack_dir = args.pack_dir.expanduser().resolve()
     CONFIG["pack_dir"] = pack_dir
+    judge_dir = args.judge_dir.expanduser().resolve()
+    CONFIG["judge_dir"] = judge_dir
     audio_dir = args.audio_dir.expanduser().resolve()
     if not args.skip_audio_download:
         try:
@@ -2244,19 +2738,33 @@ def main() -> None:
 
     print(f"Pack:  {pack_dir}")
     print(f"Audio: {audio_dir}")
+    print(f"Judge: {judge_dir}")
     if not pack_dir.is_dir():
         print("Pack directory not found. Run download_results.py first.")
     else:
-        bundle = load_pack(str(pack_dir))
+        bundle = load_pack(str(pack_dir), str(judge_dir))
         print(
             f"Loaded {bundle['n_questions']} questions, "
             f"{len(bundle['model_labels'])} models, "
             f"{bundle['n_shots']} shots"
         )
+        if bundle.get("primary_judge"):
+            n_overlay = bundle.get("n_overlay_grades") or 0
+            print(
+                f"Grading: {bundle['primary_judge']} "
+                f"({n_overlay} shot verdicts overlaid)"
+            )
         for row in bundle["coverage"]:
             status = "complete" if row["complete"] else "partial"
+            acc = row.get("accuracy")
+            acc_s = (
+                f"  acc {100 * acc:5.1f}% ({row.get('n_shot_correct')}/{row.get('n_graded')})"
+                if acc is not None
+                else ""
+            )
             print(
-                f"  {row['model']:<24} {row['n_done']:>4}/{row['n_total']:<4} {status}"
+                f"  {row['model']:<24} {row['n_done']:>4}/{row['n_total']:<4} "
+                f"{status}{acc_s}"
             )
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)

@@ -186,6 +186,10 @@ def gt_sample_ratings(entry: Any) -> list[bool]:
 
 
 def pick_gt_judge_key(keys: list[str], manifest: dict[str, Any]) -> str:
+    for key in keys:
+        parsed = parse_judge_key(key)
+        if parsed.get("model") == "claude-sonnet-5" and parsed.get("prompt") == GT_PROMPT:
+            return key
     primary = str(manifest.get("primary_judge") or "")
     if primary and primary in keys:
         return primary

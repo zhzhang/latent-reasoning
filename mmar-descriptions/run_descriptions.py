@@ -1,50 +1,28 @@
-"""MMAR freeform generation on Modal (vLLM / vLLM-Omni).
+"""MMAR audio caption + transcription on Modal (vLLM / vLLM-Omni).
 
 Runs the full MMAR set (every clip with audio), ``n_shots`` temperature
-samples per model (per-model SamplingParams). Writes to the root of the
-``mmar-freeform-thinking`` Modal Volume. Subsequent runs read existing
-generations and fill in missing models, questions, and shots. Grading is
-a separate pipeline (``run_judges.py``).
+samples per model. Each model captions and transcribes the audio (no MMAR
+question text). Thinking is forced off for every model via
+``enable_thinking=False``. Writes to the root of the ``mmar-descriptions``
+Modal Volume.
 
-Inference backends:
-  - af-next-think: vLLM 0.24 (native MusicFlamingo)
-  - music-flamingo: vLLM 0.24 AudioFlamingo3 (HF fallback)
-  - mimo-audio-7b: vLLM-Omni 0.24
-  - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
-  - qwen3-omni: vLLM 0.28 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
-  - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
-    gemma-4-12b / nemotron-3-nano-omni: vLLM 0.28 audio
-  - voxtral-small-24b: vLLM 0.28 Mistral-format audio
-
-Results layout on ``mmar-freeform-thinking`` (volume root):
+Results layout on ``mmar-descriptions`` (volume root):
 
     question_ids.json
     manifest.json
     models/<label>/predictions.jsonl
-    difficulty.jsonl
-    scores.json
 
 Prereqs:
 
     uv run modal run seed_volume.py --datasets mmar \\
-      --models af-next-think,mimo-audio-7b,interactive-omni-8b,qwen3-omni,voxtral-small-24b
+      --models af-next-think,music-flamingo,qwen3-omni,gemma-4-e4b,nemotron-3-nano-omni
 
 Usage:
 
-    uv run modal run --detach run_experiment.py
-    uv run modal run --detach run_experiment.py \\
-      --models af-next-think --n-shots 2
-    uv run modal run --detach seed_volume.py --datasets none --models music-flamingo
-    uv run modal run --detach run_experiment.py \\
-      --models music-flamingo --n-shots 5 --seed 42
-    uv run modal run --detach seed_volume.py --datasets none \\
-      --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni
-    uv run modal run --detach run_experiment.py \\
-      --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni \\
-      --n-shots 3
-    # Fill missing models / questions / shots (skip GPU workers with no work):
-    uv run modal run --detach run_experiment.py --n-shots 5
-    uv run modal run run_experiment.py --aggregate-only
+    uv run modal run --detach mmar-descriptions/run_descriptions.py
+    uv run modal run --detach mmar-descriptions/run_descriptions.py \\
+      --models gemma-4-e4b --n-shots 6
+    uv run modal run --detach mmar-descriptions/run_descriptions.py --n-shots 6
 """
 
 from __future__ import annotations
@@ -52,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,8 +38,11 @@ from types import SimpleNamespace
 
 import modal
 
-from aggregate import aggregate_difficulty
-from mmar_models import (
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from mmar_models import (  # noqa: E402
     ALL_MODEL_LABELS,
     MODEL_SPECS,
     backend_duplicates_shots,
@@ -69,7 +51,7 @@ from mmar_models import (
     parse_model_list,
     resolve_sampling,
 )
-from mmar_common import (
+from mmar_common import (  # noqa: E402
     aggregate_n_shot_record,
     count_wavs,
     load_jsonl,
@@ -77,22 +59,24 @@ from mmar_common import (
     write_json,
     write_jsonl,
 )
-from modal_cache import (
+from modal_cache import (  # noqa: E402
     DEFAULT_MMAR_DATA_ROOT,
     DEFAULT_MMAR_META,
-    MMAR_FREEFORM_THINKING_MOUNT,
+    MMAR_DESCRIPTIONS_MOUNT,
     VOLUME_MOUNT,
     hf_secret,
-    mmar_freeform_thinking_volume,
+    mmar_descriptions_volume,
     volume,
 )
-from modal_images import EVAL_IMAGES, cpu_image
+from modal_images import EVAL_IMAGES, cpu_image  # noqa: E402
 
-DEFAULT_OUTPUT_DIR = MMAR_FREEFORM_THINKING_MOUNT
-DEFAULT_N_SHOTS = 5
+DEFAULT_OUTPUT_DIR = MMAR_DESCRIPTIONS_MOUNT
+DEFAULT_N_SHOTS = 6
 DEFAULT_SEED = 42
+EXPERIMENT_NAME = "mmar-descriptions"
+MODE = "description"
 
-app = modal.App("exp-mmar-question-difficulty")
+app = modal.App("exp-mmar-descriptions")
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +249,7 @@ def _write_question_ids(ids_path: Path, ids: list[str], *, seed: int) -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     write_json(ids_path, payload)
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
 
 
 def _ensure_question_ids(
@@ -343,9 +327,9 @@ def _run_model_eval(
     model_id: str | None = None,
     tokenizer_id: str | None = None,
 ) -> dict:
-    """Load one model and write n-shot freeform predictions for the full question set."""
+    """Load one model and write n-shot description predictions for the full set."""
     volume.reload()
-    mmar_freeform_thinking_volume.reload()
+    mmar_descriptions_volume.reload()
 
     spec = MODEL_SPECS[model_label]
     args = SimpleNamespace(
@@ -357,7 +341,6 @@ def _run_model_eval(
         data_root=data_root,
         output_dir=output_dir,
         n_shots=n_shots,
-        # Optional CLI overrides (None → use MODEL_SPECS[label].sampling).
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
@@ -367,10 +350,10 @@ def _run_model_eval(
         print_every=print_every,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
-        prompt_mode="freeform",
+        prompt_mode=MODE,
+        enable_thinking=False,
     )
     sampling = resolve_sampling(model_label, args)
-    # Materialize effective sampling for HF fallbacks / logging.
     args.temperature = float(sampling["temperature"])
     args.top_p = float(sampling.get("top_p", 1.0))
     args.max_new_tokens = int(sampling["max_tokens"])
@@ -403,8 +386,7 @@ def _run_model_eval(
     )
     items = _load_selected_items(meta_path, data_root_path, question_ids)
     existing_records = _load_prediction_records(predictions_path)
-    # Commit after a possible corrupt-line repair inside the loader.
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
     pending_items: list[dict] = []
     pending_have: list[int] = []
     n_done = 0
@@ -416,9 +398,10 @@ def _run_model_eval(
         pending_items.append(item)
         pending_have.append(n_have)
     print(
-        f"[{model_label}] backend={spec.get('backend')} mode=freeform "
-        f"{len(items)} selected, {n_done} done (>= {n_shots} shots), "
-        f"{len(pending_items)} pending (n_shots={n_shots}, sampling={sampling})"
+        f"[{model_label}] backend={spec.get('backend')} mode={MODE} "
+        f"enable_thinking=False {len(items)} selected, {n_done} done "
+        f"(>= {n_shots} shots), {len(pending_items)} pending "
+        f"(n_shots={n_shots}, sampling={sampling})"
     )
 
     if not pending_items:
@@ -427,7 +410,7 @@ def _run_model_eval(
             "model_label": model_label,
             "n_predictions": n_done,
             "predictions_path": str(predictions_path),
-            "mode": "freeform",
+            "mode": MODE,
         }
 
     handle = load_model(model_label, args)
@@ -436,9 +419,6 @@ def _run_model_eval(
     except Exception as exc:  # noqa: BLE001 — cache commit is best-effort
         print(f"[{model_label}] volume.commit after load failed: {exc}")
     active_backend = handle.get("backend", spec.get("backend"))
-    # Omni / HF cannot fork SamplingParams(n>1); expand question×shot rows.
-    # Plain vLLM uses n=n_shots on one prompt per question (shared prefill).
-    # Submit all pending in one generate() so vLLM continuous-batches.
     duplicate_shots = backend_duplicates_shots(str(active_backend))
 
     start_time = time.time()
@@ -488,7 +468,6 @@ def _run_model_eval(
             n_completions=n_completions,
         )
     except Exception as exc:
-        # Offline generate is all-or-nothing; resume retries the same pending set.
         raise RuntimeError(
             f"[{model_label}] generate failed "
             f"n_questions={n_pending} "
@@ -515,12 +494,11 @@ def _run_model_eval(
     _rewrite_predictions_file(predictions_path, existing_records, question_ids)
     with open(predictions_path, "rb") as pred_file:
         os.fsync(pred_file.fileno())
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
 
     written = n_pending
     elapsed = time.time() - start_time
     try:
-        # Persist any Triton JIT / inductor caches written during generate.
         volume.commit()
     except Exception as exc:  # noqa: BLE001
         print(f"[{model_label}] volume.commit after generate failed: {exc}")
@@ -530,7 +508,7 @@ def _run_model_eval(
                 record = existing_records[str(item["id"])]
                 print(
                     f"[{model_label}] {idx}/{written} "
-                    f"id={record['id']} pending_grade ({elapsed:.0f}s)"
+                    f"id={record['id']} ({elapsed:.0f}s)"
                 )
 
     total = sum(
@@ -550,18 +528,17 @@ def _run_model_eval(
         "n_predictions": total,
         "predictions_path": str(predictions_path),
         "backend": active_backend,
-        "mode": "freeform",
+        "mode": MODE,
     }
 
 
 # ---------------------------------------------------------------------------
 # Modal eval workers (one GPU function per model_label)
 # ---------------------------------------------------------------------------
-# single_use_containers keeps a GPU from being reused after that model returns.
 
 _PACK_VOLUMES = {
     VOLUME_MOUNT: volume,
-    MMAR_FREEFORM_THINKING_MOUNT: mmar_freeform_thinking_volume,
+    MMAR_DESCRIPTIONS_MOUNT: mmar_descriptions_volume,
 }
 
 _EVAL_KW = dict(
@@ -572,14 +549,11 @@ _EVAL_KW = dict(
     single_use_containers=True,
 )
 
+
 def _eval_function(label: str, image: modal.Image, gpu: str):
     def run(**kwargs) -> dict:
         return _run_model_eval(model_label=label, **kwargs)
 
-    # Modal rejects nested @app.function unless serialized=True (cloudpickle
-    # from this process into the CUDA image). Give the worker a global
-    # __qualname__ and bind it on the module so FILE load works. Dots must
-    # go too: a dotted __qualname__ looks like a class method.
     name = f"eval_{label.replace('-', '_').replace('.', '_')}"
     run.__name__ = name
     run.__qualname__ = name
@@ -618,16 +592,9 @@ def prepare_run(
     max_new_tokens: int | None = None,
     greedy_non_thinking: bool = False,
 ) -> dict:
-    """Create question_ids + manifest and compute missing-shot workload.
-
-    Defaults to the full MMAR set (every clip with audio). Re-running
-    expands an older sampled id list to full MMAR, merges models into the
-    existing manifest, and reports per-model missing shots so the
-    pipeline can skip GPU workers that already have ``n_shots``
-    generations for every question.
-    """
+    """Create question_ids + manifest and compute missing-shot workload."""
     volume.reload()
-    mmar_freeform_thinking_volume.reload()
+    mmar_descriptions_volume.reload()
 
     pack_dir = _pack_dir(output_dir)
     pack_dir.mkdir(parents=True, exist_ok=True)
@@ -672,26 +639,26 @@ def prepare_run(
     requested_workload = {
         label: pack_workload[label] for label in model_labels
     }
-    # Commit after a possible corrupt-line repair inside the loaders.
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
 
     override_ns = SimpleNamespace(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
         greedy_non_thinking=greedy_non_thinking,
+        enable_thinking=False,
     )
     model_sampling = {
         label: resolve_sampling(label, override_ns) for label in merged_models
     }
 
     manifest = {
-        "experiment": "mmar-freeform-thinking",
-        "mode": "freeform",
+        "experiment": EXPERIMENT_NAME,
+        "mode": MODE,
+        "enable_thinking": False,
         "models": merged_models,
         "n_shots": n_shots,
         "seed": existing.get("seed", seed),
-        # Per-model SamplingParams (no global temperature / top_p / max_tokens).
         "model_sampling": model_sampling,
         "sampling_overrides": {
             "temperature": temperature,
@@ -719,59 +686,20 @@ def prepare_run(
                 "gpu": MODEL_SPECS[label].get("gpu"),
                 "sampling": MODEL_SPECS[label].get("sampling"),
                 "native_thinking": bool(MODEL_SPECS[label].get("native_thinking")),
+                "enable_thinking": False,
             }
             for label in ALL_MODEL_LABELS
         },
     }
-    # Preserve judge metadata written by other pathways.
-    for key in ("scoring", "grader_model_id", "judges", "primary_judge"):
-        if key in existing:
-            manifest[key] = existing[key]
     write_json(manifest_path, manifest)
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
     return {
         "manifest": manifest,
         "workload": requested_workload,
         "question_ids": question_ids,
         "resumed": is_resume,
-        "mode": "freeform",
+        "mode": MODE,
     }
-
-
-@app.function(
-    image=cpu_image,
-    timeout=30 * 60,
-    volumes=_PACK_VOLUMES,
-)
-def run_aggregate(output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dict:
-    mmar_freeform_thinking_volume.reload()
-    pack_dir = _pack_dir(output_dir)
-    if not pack_dir.exists():
-        raise SystemExit(f"Pack dir not found: {pack_dir}")
-    result = aggregate_difficulty(pack_dir)
-    # Stamp scoring mode from manifest when present.
-    manifest_path = pack_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            scores = result.get("scores") or {}
-            if manifest.get("scoring"):
-                scores["scoring"] = manifest["scoring"]
-            if manifest.get("mode"):
-                scores["mode"] = manifest["mode"]
-            if manifest.get("grader_model_id"):
-                scores["grader_model_id"] = manifest["grader_model_id"]
-            if manifest.get("judges") is not None:
-                scores["judges"] = manifest["judges"]
-            if manifest.get("primary_judge"):
-                scores["primary_judge"] = manifest["primary_judge"]
-            write_json(pack_dir / "scores.json", scores)
-            result["scores"] = scores
-        except json.JSONDecodeError:
-            pass
-    mmar_freeform_thinking_volume.commit()
-    print("Aggregated:", result.get("scores"))
-    return result
 
 
 def _spawn_model_eval(label: str, **common):
@@ -834,29 +762,9 @@ def run_pipeline(
     data_root: str = str(DEFAULT_MMAR_DATA_ROOT),
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     print_every: int = 5,
-    aggregate_only: bool = False,
 ) -> dict:
-    """Remote orchestrator: prepare workload, spawn GPU workers, return.
-
-    Does not wait on inference. GPU FunctionCalls keep a ``--detach`` app
-    alive; waiting here would pin a preemptible CPU container for hours
-    and re-spawn workers if that container is redelivered.
-
-    Workload is computed on CPU before any GPU container starts. Each
-    pending model is spawned on its own GPU container; a multi-model run
-    launches those containers in parallel. Grading is a separate pipeline
-    (``run_judges.py``).
-    """
+    """Remote orchestrator: prepare workload, spawn GPU workers, return."""
     model_labels = parse_model_list(models)
-
-    if aggregate_only:
-        result = run_aggregate.remote(output_dir=output_dir)
-        print("Done (aggregate-only):", result)
-        return {
-            "mode": "freeform",
-            "aggregate_only": True,
-            "aggregate": result,
-        }
 
     common = dict(
         output_dir=output_dir,
@@ -874,7 +782,7 @@ def run_pipeline(
     )
 
     print(
-        f"Experiment pack={output_dir} mode=freeform "
+        f"Experiment pack={output_dir} mode={MODE} enable_thinking=False "
         f"models={model_labels} n_shots={n_shots} "
         f"gpu_containers=per-model parallel_launch=True inference=vllm "
         f"sampling_overrides={{temperature={temperature}, top_p={top_p}, "
@@ -934,7 +842,8 @@ def run_pipeline(
         print("All requested models already complete; skipping inference.")
 
     return {
-        "mode": "freeform",
+        "mode": MODE,
+        "enable_thinking": False,
         "models": results,
         "pending_labels": pending_labels,
         "skipped_labels": skipped_labels,
@@ -968,41 +877,8 @@ def main(
     data_root: str = str(DEFAULT_MMAR_DATA_ROOT),
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     print_every: int = 5,
-    aggregate_only: bool = False,
 ):
-    """Launch MMAR freeform generation.
-
-    Args:
-        models: Comma-separated labels or ``all``.
-        n_shots: Independent temperature samples per question (default 5).
-            Existing generations on the ``mmar-freeform-thinking`` volume
-            are kept; only missing models, questions, and shots are
-            generated. Plain vLLM uses SamplingParams(n=...) shared
-            prefill when every pending question is starting from zero;
-            Omni/HF (and partial fills) duplicate prompts per shot. All
-            pending questions go in one generate() so vLLM
-            continuous-batches. Models with no remaining shots are not
-            spawned on a GPU.
-        temperature: Optional override of each model's sampling temperature.
-        top_p: Optional override of each model's top_p.
-        max_new_tokens: Optional override of each model's max_tokens.
-        greedy_non_thinking: Force temperature=0 on models without native
-            ``<think>`` / reasoning mode. Thinking models keep card sampling
-            unless ``temperature`` is also set.
-        seed: RNG seed for per-question sample seeds.
-        max_num_seqs: Optional vLLM override (escape hatch; prefer defaults).
-        gpu_memory_utilization: Optional vLLM GPU memory fraction override.
-        meta: Path to MMAR-meta.jsonl on the data volume.
-        data_root: MMAR root used to resolve audio paths.
-        output_dir: Pack directory on the ``mmar-freeform-thinking`` volume
-            (default: volume root).
-        print_every: Progress print interval per model.
-        aggregate_only: Skip inference; only build difficulty.jsonl /
-            scores.json from existing predictions (after grading via
-            ``run_judges.py``).
-    """
-    # Remote prepare+spawn so ``--detach`` keeps GPU FunctionCalls after
-    # this process exits. Do not wait on workers here.
+    """Launch MMAR audio caption + transcription (thinking off, 6 shots default)."""
     out = run_pipeline.spawn(
         models=models,
         n_shots=n_shots,
@@ -1017,7 +893,6 @@ def main(
         data_root=data_root,
         output_dir=output_dir,
         print_every=print_every,
-        aggregate_only=aggregate_only,
     ).get()
 
     pending = out.get("pending_labels") or []
@@ -1031,10 +906,10 @@ def main(
     print("Orchestrator:", out)
     print(
         "Download with:\n"
-        "  uv run modal run download_results.py"
+        "  uv run modal run download_results.py --volume-name mmar-descriptions"
     )
     if pending or out.get("skipped_labels"):
         print(
             "To fill remaining generations later:\n"
-            "  uv run modal run --detach run_experiment.py"
+            "  uv run modal run --detach mmar-descriptions/run_descriptions.py"
         )

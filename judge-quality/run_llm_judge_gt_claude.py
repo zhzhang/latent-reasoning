@@ -5,11 +5,12 @@ Same setup as ``run_llm_judge_gt.py`` (``neutral_with_gt_no_audio``,
 Anthropic's live Messages API. Grades ``shot_index`` 0–4.
 Runs locally; no Modal container is started.
 
-Prompt caching: each request marks the gold prefix (instructions +
-question + ground truth) and the full prompt with ``cache_control``.
-The prefix is reused across shots of the same question; the full prompt
-is reused across the 3 samples. Sample 0 streams until the response
-begins so samples 1–2 can hit the cache.
+Prompt caching: a long static system prompt is marked with
+``cache_control`` (Sonnet 5 ignores prefixes under 1,024 tokens; the
+gold user message alone is too short). The user message is a second
+breakpoint so the 3 samples of one generation share the full prefix.
+The system cache is pre-warmed before the first grade. Sample 0 streams
+until the response begins so samples 1–2 can hit the cache.
 
 Scheduling is question × model, not a pass over every question for
 shot 0 and then a second pass for shot 1. For each question, each model
@@ -29,6 +30,10 @@ get`` (CLI only). Existing Qwen GT verdicts are kept; Claude is added as
 a second judge and does not steal ``primary_judge`` unless you pass
 ``--make-primary``.
 
+``--apply-batch`` writes an already-downloaded Anthropic batch
+(``_anthropic_batch/<judge_key>/output.jsonl``) into the pack instead of
+calling the API.
+
 Resume is the default: already-graded shots for this judge key are
 skipped. Pass ``--force`` to replace them. Verdicts are checkpointed
 after each question.
@@ -40,6 +45,7 @@ Usage::
     uv run python judge-quality/run_llm_judge_gt_claude.py
     uv run python judge-quality/run_llm_judge_gt_claude.py --force
     uv run python judge-quality/run_llm_judge_gt_claude.py --models qwen3-omni
+    uv run python judge-quality/run_llm_judge_gt_claude.py --apply-batch --make-primary
 """
 
 from __future__ import annotations
@@ -47,8 +53,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import subprocess
 import sys
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,14 +66,24 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from aggregate import aggregate_difficulty, order_model_labels
-from grader import compose_judge_key, remaining_grade_work
-from mmar_api import grade_pack_with_anthropic
+from grader import compose_judge_key, remaining_grade_work, _grade_reuse_key, _shot_prediction_text
+from mmar_api import (
+    ANTHROPIC_BATCH_DIR_NAME,
+    BATCH_MAX_REQUESTS,
+    apply_local_batch_output,
+    grade_pack_with_anthropic,
+)
 from mmar_common import recompute_multi_judge_scores, write_json, write_jsonl
 from modal_cache import JUDGING_VOLUME_NAME
 
 PACK_NAME = "llm-judge-gt"
 DEFAULT_PACK_DIR = _REPO_ROOT / "outputs" / "judge-quality" / PACK_NAME
 LOCAL_FREEFORM_THINKING_DIR = _REPO_ROOT / "outputs" / "mmar-freeform-thinking"
+LOCAL_RESULTS_DIR = _REPO_ROOT / "outputs" / "exp-mmar-question-difficulty"
+FULL_MMAR_RUN_ID = "20260807T145000Z"
+OPEN_ENDED_RUN_ID = "20260816T050944Z"
+# Empty in the thinking pack when the first 80k-request Claude batch ran.
+HISTORICAL_SKIP_THINKING = frozenset({"nemotron-3-nano-omni"})
 JUDGE_LABEL = "claude-sonnet-5"
 GRADE_PROMPT = "neutral_with_gt_no_audio"
 N_SHOTS = 5
@@ -192,6 +210,116 @@ def _source_model_dirs() -> list[tuple[str, Path]]:
     return [
         ("mmar-freeform-thinking", LOCAL_FREEFORM_THINKING_DIR / "models"),
     ]
+
+
+def _historical_batch_sources(pack_dir: Path) -> list[tuple[str, Path, frozenset[str]]]:
+    """Overlay order used when the first 80k-request Claude batch was submitted."""
+    return [
+        (
+            "mmar-freeform-thinking",
+            LOCAL_FREEFORM_THINKING_DIR / "models",
+            HISTORICAL_SKIP_THINKING,
+        ),
+        (
+            FULL_MMAR_RUN_ID,
+            LOCAL_RESULTS_DIR / FULL_MMAR_RUN_ID / "models",
+            frozenset(),
+        ),
+        (
+            OPEN_ENDED_RUN_ID,
+            LOCAL_RESULTS_DIR / OPEN_ENDED_RUN_ID / "models",
+            frozenset(),
+        ),
+        ("llm-judge-gt-pack", pack_dir / "models", frozenset()),
+    ]
+
+
+def _load_predictions_by_id(path: Path) -> dict[str, dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return found
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                record = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            qid = str(record.get("id") or "")
+            if qid:
+                found[qid] = record
+    return found
+
+
+def _reconstruct_capped_batch_jobs(
+    pack_dir: Path,
+    question_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Rebuild ``req-NNNNNN`` jobs for the first Anthropic chunk (80k / n_samples)."""
+    by_model: dict[str, dict[str, dict[str, Any]]] = {}
+    for tag, models_dir, skip in _historical_batch_sources(pack_dir):
+        if not models_dir.is_dir():
+            print(f"[llm-judge-gt-claude] skip missing historical source {tag}")
+            continue
+        for child in sorted(models_dir.iterdir()):
+            if not child.is_dir() or child.name in skip or child.name in by_model:
+                continue
+            rows = _load_predictions_by_id(child / "predictions.jsonl")
+            kept = {qid: rows[qid] for qid in question_ids if qid in rows}
+            if not kept:
+                continue
+            by_model[child.name] = kept
+            print(
+                f"[llm-judge-gt-claude] historical {tag}/{child.name}: "
+                f"{len(kept)} questions"
+            )
+    labels = order_model_labels(list(by_model))
+    pending: OrderedDict[tuple[str, str, str], list[dict[str, Any]]] = OrderedDict()
+    allowed = set(SHOT_INDICES)
+    for label in labels:
+        for qid in question_ids:
+            record = by_model[label].get(qid)
+            if record is None:
+                continue
+            question = str(record.get("question") or "")
+            answer = str(record.get("answer") or "")
+            shots = [s for s in (record.get("shots") or []) if isinstance(s, dict)]
+            shots.sort(key=_shot_index)
+            seen: set[int] = set()
+            for shot in shots:
+                idx = _shot_index(shot)
+                if idx not in allowed or idx in seen:
+                    continue
+                seen.add(idx)
+                pred = _shot_prediction_text(shot, model_label=label)
+                reuse = _grade_reuse_key(
+                    question, answer, pred, include_gold=True
+                )
+                pending.setdefault(reuse, []).append(
+                    {"model": label, "qid": qid, "shot_index": idx}
+                )
+    cap = max(1, int(BATCH_MAX_REQUESTS["anthropic_batch"]) // max(1, N_SAMPLES))
+    jobs: list[dict[str, Any]] = []
+    for index, (reuse, owners) in enumerate(list(pending.items())[:cap], start=1):
+        custom_id = f"req-{index:06d}"
+        jobs.append(
+            {
+                "custom_id": custom_id,
+                "sample_custom_ids": [
+                    f"{custom_id}-s{i:02d}" for i in range(N_SAMPLES)
+                ],
+                "owners": owners,
+                "qid": owners[0]["qid"] if owners else "",
+                "reuse_key": list(reuse),
+            }
+        )
+    print(
+        f"[llm-judge-gt-claude] reconstructed {len(jobs)}/{len(pending)} "
+        f"unique jobs (cap={cap})"
+    )
+    return jobs
 
 
 def _question_id_candidates() -> list[tuple[str, Path]]:
@@ -468,9 +596,11 @@ def _stamp_manifest(
     manifest["judges"] = ordered
     if make_primary or not existing_primary:
         manifest["primary_judge"] = primary
-        manifest["grader_model_id"] = model_id if primary == judge_key else manifest.get(
-            "grader_model_id", model_id
-        )
+        if primary == judge_key:
+            manifest["grader_model_id"] = model_id
+            manifest["judge_model_id"] = model_id
+        else:
+            manifest["grader_model_id"] = manifest.get("grader_model_id", model_id)
     manifest["scoring"] = manifest.get("scoring") or "qwen_freeform_judge"
     manifest["graded_at"] = now
     manifest["updated_at"] = now
@@ -503,6 +633,53 @@ def _run_aggregate(
     return result
 
 
+def _apply_existing_batch(
+    pack_dir: Path,
+    *,
+    question_ids: list[str],
+    make_primary: bool,
+) -> dict[str, Any]:
+    judge_key = compose_judge_key(
+        JUDGE_LABEL, prompt=GRADE_PROMPT, include_gold=True
+    )
+    work_dir = pack_dir / ANTHROPIC_BATCH_DIR_NAME / judge_key
+    output_path = work_dir / "output.jsonl"
+    jobs_path = work_dir / "jobs.jsonl"
+    if not output_path.is_file():
+        raise SystemExit(f"No batch output at {output_path}")
+    jobs = _reconstruct_capped_batch_jobs(pack_dir, question_ids)
+    if jobs_path.is_file() and jobs_path.stat().st_size:
+        leftover = jobs_path.with_name("jobs.leftover.jsonl")
+        if not leftover.is_file():
+            shutil.copy2(jobs_path, leftover)
+            print(f"[llm-judge-gt-claude] backed up truncated jobs -> {leftover}")
+    write_jsonl(jobs_path, jobs, mode="w")
+    rows: list[dict[str, Any]] = []
+    with output_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return apply_local_batch_output(
+        pack_dir,
+        jobs,
+        rows,
+        judge_key=judge_key,
+        model_id=JUDGE_LABEL,
+        prompt_name=GRADE_PROMPT,
+        include_gold=True,
+        n_samples=N_SAMPLES,
+        make_primary=make_primary,
+        backend="anthropic_batch",
+    )
+
+
 def run_claude_judge(
     *,
     models: str = "all",
@@ -513,6 +690,7 @@ def run_claude_judge(
     qps: float = 8.0,
     max_workers: int = 8,
     download: bool = True,
+    apply_batch: bool = False,
 ) -> dict[str, Any]:
     dest = Path(pack_dir or DEFAULT_PACK_DIR).expanduser().resolve()
     dest = _require_pack(dest, download=download)
@@ -527,6 +705,27 @@ def run_claude_judge(
         f"n_samples={N_SAMPLES} qps={qps} max_workers={max_workers} "
         f"group=question×model models={model_labels}"
     )
+    if apply_batch:
+        grade = _apply_existing_batch(
+            dest,
+            question_ids=question_ids,
+            make_primary=make_primary,
+        )
+        print("[llm-judge-gt-claude] applied batch:", grade)
+        manifest_path = dest / "manifest.json"
+        manifest = _load_json(manifest_path)
+        manifest = _stamp_manifest(
+            manifest,
+            model_id=str(grade.get("model_id") or JUDGE_LABEL),
+            judge_key=str(grade.get("judge_key") or judge_key),
+            prompt=GRADE_PROMPT,
+            make_primary=make_primary,
+        )
+        write_json(manifest_path, manifest)
+        agg = None if skip_aggregate else _run_aggregate(
+            dest, model_labels=list(prep["model_labels"])
+        )
+        return {"grade": grade, "aggregate": agg, "pack_dir": str(dest)}
     remaining = remaining_grade_work(
         dest,
         model_labels,
@@ -627,6 +826,14 @@ def parse_args() -> argparse.Namespace:
         help="Make Claude the pack primary judge (default: keep Qwen GT).",
     )
     parser.add_argument(
+        "--apply-batch",
+        action="store_true",
+        help=(
+            "Apply _anthropic_batch output.jsonl into the pack instead of "
+            "calling Anthropic."
+        ),
+    )
+    parser.add_argument(
         "--pack-dir",
         type=Path,
         default=DEFAULT_PACK_DIR,
@@ -672,6 +879,7 @@ def main() -> None:
         qps=args.qps,
         max_workers=args.max_workers,
         download=not args.no_download,
+        apply_batch=args.apply_batch,
     )
 
 

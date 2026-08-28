@@ -104,21 +104,6 @@ omni_image = mount_local_sources(
     .env(_VLLM_CACHE_ENV)
 )
 
-# Step-Audio-R1.1: StepFun custom vLLM fork (registers step_audio_2).
-step_audio_image = mount_local_sources(
-    modal.Image.from_registry("stepfun2025/vllm:step-audio-2-v20250909")
-    .entrypoint([])
-    .apt_install("ffmpeg", "git")
-    .uv_pip_install(
-        "librosa>=0.11.0",
-        "soundfile",
-        "numpy",
-        "tqdm>=4.67.0",
-        "huggingface-hub>=0.30.0",
-    )
-    .env(_INPROC_VLLM_ENV)
-)
-
 # InteractiveOmni: newer vLLM transformers-audio backend + HF chat fallback.
 interactive_omni_image = mount_local_sources(
     cuda_base_image()
@@ -198,13 +183,13 @@ EVAL_IMAGES: dict[str, modal.Image] = {
     "af-next-think": af_next_image,
     "music-flamingo": af_next_image,
     "mimo-audio-7b": omni_image,
-    "step-audio-r1.1": step_audio_image,
     "interactive-omni-8b": interactive_omni_image,
     "qwen3-omni": large_mm_image,
     "voxtral-small-24b": large_mm_image,
     "qwen2.5-omni-7b": large_mm_image,
     "phi-4-multimodal": large_mm_image,
     "gemma-4-e4b": large_mm_image,
+    "gemma-4-12b": large_mm_image,
     "qwen3-omni-instruct": large_mm_image,
     "nemotron-3-nano-omni": large_mm_image,
 }

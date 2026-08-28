@@ -17,10 +17,10 @@ MODEL_LABELS = (
 # Preferred display / discovery order; extras append after known labels.
 MODEL_LABEL_ORDER = MODEL_LABELS + (
     "music-flamingo",
-    "step-audio-r1.1",
     "qwen2.5-omni-7b",
     "phi-4-multimodal",
     "gemma-4-e4b",
+    "gemma-4-12b",
     "qwen3-omni-instruct",
     "nemotron-3-nano-omni",
 )

@@ -1005,11 +1005,11 @@ function shortLabel(label) {
     "qwen2.5-omni-7b": "qwen2.5",
     "voxtral-small-24b": "voxtral",
     "phi-4-multimodal": "phi-4",
-    "gemma-4-e4b": "gemma",
+    "gemma-4-e4b": "gemma-e4b",
+    "gemma-4-12b": "gemma-12b",
     "nemotron-3-nano-omni": "nemotron",
     "gemini-3.7-flash": "gemini",
     "gpt-4o-mini": "4o-mini",
-    "step-audio-r1.1": "step",
   };
   return map[label] || label;
 }

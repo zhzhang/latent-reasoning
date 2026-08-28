@@ -20,7 +20,6 @@ one prefill; Omni/HF duplicate the prompt per shot and rely on prefix caching.
 |-------|------------|---------|
 | `af-next-think` | `nvidia/audio-flamingo-next-think-hf` | vLLM 0.24 MusicFlamingo (HF fallback); `T=0.2, max_tokens=2048, rep=1.2` |
 | `mimo-audio-7b` | `XiaomiMiMo/MiMo-Audio-7B-Instruct` (+ tokenizer) | vLLM-Omni; `T=0.3, top_p=0.95, max_tokens=512, rep=1.1` |
-| `step-audio-2-mini-think` | [`stepfun-ai/Step-Audio-2-mini-Think`](https://huggingface.co/stepfun-ai/Step-Audio-2-mini-Think) | HF StepAudio2 (official text path); `T=0.7, top_p=0.9, max_tokens=2048, rep=1.05` |
 | `interactive-omni-8b` | `sensenova/InteractiveOmni-8B` | HF `.chat` (vLLM transformers backend incompatible); `T=1.0, max_tokens=1024` |
 | `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.28 thinker-only (A100-80GB); `T=0.6, top_p=0.95, top_k=20, max_tokens=2048` |
 | `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.28 Mistral audio (A100-80GB); `T=0.2, top_p=0.95, max_tokens=512` |
@@ -48,9 +47,6 @@ uv run modal run --detach run_experiment.py
 # Smoke test one model (plain vLLM: SamplingParams n=2)
 uv run modal run --detach run_experiment.py \
   --models af-next-think --n-shots 2
-
-# Step-Audio-2-mini-Think: one MMAR clip via a standalone HF script
-uv run modal run smoke_step_audio.py
 
 # Fill missing models / questions / shots (skip GPU workers with no work)
 uv run modal run --detach run_experiment.py --n-shots 5
@@ -96,6 +92,16 @@ writes `models/<label>/predictions.jsonl`. Grade those predictions with
   are on for the thinker-only path. Keep `VLLM_ENABLE_V1_MULTIPROCESSING=0`
   (in-process EngineCore) — multiprocess `profile_run` was the other
   meta/cuda failure mode.
+- **Compile cache**: `compile_cache.py` warms torch.compile / Triton / nvcc
+  artifacts per model onto `/cache/vllm/<label>/`. Later eval / smoke / judge
+  containers load that tree (`VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`,
+  `TRITON_CACHE_DIR`). CUDA graphs still recapture on each boot.
+
+    ```bash
+    uv run modal run --detach compile_cache.py
+    uv run modal run --detach compile_cache.py --models qwen3-omni
+    uv run modal run --detach compile_cache.py::compile_gemma_4_e4b
+    ```
 - Prefill-oriented: engines set `max_num_batched_tokens` (≥8192 where possible)
   and `enable_prefix_caching`. Qwen3 Thinking is decode-heavy
   (`max_tokens=2048`; measured outputs peak ~870).

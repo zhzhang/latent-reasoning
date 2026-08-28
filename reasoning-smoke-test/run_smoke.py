@@ -159,21 +159,6 @@ omni_image = _mount_local_sources(
     .env(_VLLM_CACHE_ENV)
 )
 
-# Step-Audio-R1.1: StepFun custom vLLM fork (registers step_audio_2).
-step_audio_image = _mount_local_sources(
-    modal.Image.from_registry("stepfun2025/vllm:step-audio-2-v20250909")
-    .entrypoint([])
-    .apt_install("ffmpeg", "git")
-    .uv_pip_install(
-        "librosa>=0.11.0",
-        "soundfile",
-        "numpy",
-        "tqdm>=4.67.0",
-        "huggingface-hub>=0.30.0",
-    )
-    .env(_INPROC_VLLM_ENV)
-)
-
 interactive_omni_image = _mount_local_sources(
     _cuda_base_image()
     .uv_pip_install(
@@ -370,11 +355,6 @@ def smoke_omni_a100(model_label: str, **kwargs) -> dict:
     return _smoke_one(model_label=model_label, **kwargs)
 
 
-@app.function(image=step_audio_image, gpu="A100-80GB", **_FN_KW)
-def smoke_step(model_label: str, **kwargs) -> dict:
-    return _smoke_one(model_label=model_label, **kwargs)
-
-
 @app.function(image=interactive_omni_image, gpu="A100-80GB", **_FN_KW)
 def smoke_interactive_a100(model_label: str, **kwargs) -> dict:
     return _smoke_one(model_label=model_label, **kwargs)
@@ -401,8 +381,6 @@ def _smoke_worker_for(label: str):
     gpu = str(spec.get("gpu") or "")
     if label in {"af-next-think", "music-flamingo"}:
         return smoke_af_l40s
-    if label == "step-audio-r1.1":
-        return smoke_step
     if backend == "vllm_omni":
         return smoke_omni_a100
     if label == "interactive-omni-8b":

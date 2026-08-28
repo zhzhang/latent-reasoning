@@ -44,9 +44,11 @@ import modal
 
 from modal_cache import (
     FREEFORM_THINKING_VOLUME_NAME,
+    MMAR_DESCRIPTIONS_VOLUME_NAME,
     MMAR_FREEFORM_THINKING_VOLUME_NAME,
     RESULTS_VOLUME_NAME,
     freeform_thinking_volume,
+    mmar_descriptions_volume,
     mmar_freeform_thinking_volume,
     results_volume,
 )
@@ -69,6 +71,11 @@ VOLUME_SPECS: dict[str, dict] = {
         "handle": freeform_thinking_volume,
         "remote": "/",
         "local": REPO_ROOT / "outputs" / "mmar-freeform-5-shot-thinking",
+    },
+    MMAR_DESCRIPTIONS_VOLUME_NAME: {
+        "handle": mmar_descriptions_volume,
+        "remote": "/",
+        "local": REPO_ROOT / "outputs" / "mmar-descriptions",
     },
 }
 

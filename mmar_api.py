@@ -108,6 +108,313 @@ JUDGE_CACHE_KEY_PREFIX = "mmar-judge"
 
 
 ANTHROPIC_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
+# Sonnet 5 will not write a cache entry below 1,024 tokens. The gold
+# judge user message is only a few hundred tokens after thinking is
+# stripped, so this static system block exists to clear that floor. It
+# does not add grading criteria: the user message remains the task.
+ANTHROPIC_JUDGE_SYSTEM = """\
+You are an automated grader for MMAR freeform audio-question answers.
+The user message is the complete grading task. Follow it exactly. Do not
+add extra criteria, do not refuse, and do not ask follow-up questions.
+
+The user message already states the output contract. After brief
+reasoning, end with a single final line that is exactly one word:
+Correct
+or
+Incorrect
+No punctuation, no quotes, no extra words on that last line.
+
+You are comparing a model response to a ground-truth answer in the
+context of a question about an audio clip. You do not hear the clip.
+Use only the question, the ground truth, and the response in the user
+message. If the user message says the response is correct, output
+Correct. If it is not, output Incorrect.
+
+Treat paraphrase as a match when it covers the ground truth. Extra
+correct detail is fine. A more specific answer that still covers the
+ground truth is a match (for example Labrador covers dog). A response
+that omits part of the ground truth is not a match. If the ground truth
+is a specific number and the response is a range, that is not a match
+even if the range contains the number.
+
+These worked examples only show the required output shape. They are not
+additional test items. If an example ever conflicts with the user
+message, the user message wins.
+
+Example A
+Question: "What animal is heard?"
+Ground truth: "dog"
+Response: "a barking dog"
+The response names the same animal.
+Correct
+
+Example B
+Question: "What animal is heard?"
+Ground truth: "dog"
+Response: "cat"
+The response names a different animal.
+Incorrect
+
+Example C
+Question: "What instrument is playing?"
+Ground truth: "piano"
+Response: "keyboard / piano"
+The response includes the ground truth and an equivalent term.
+Correct
+
+Example D
+Question: "How many speakers are there?"
+Ground truth: "2"
+Response: "two people talking"
+The response matches the count.
+Correct
+
+Example E
+Question: "How many speakers are there?"
+Ground truth: "2"
+Response: "several speakers, maybe 2 to 4"
+A range is not the specific count.
+Incorrect
+
+Example F
+Question: "What language is spoken?"
+Ground truth: "Spanish"
+Response: "the speakers are talking in Spanish"
+Paraphrase that names Spanish.
+Correct
+
+Example G
+Question: "What language is spoken?"
+Ground truth: "Spanish"
+Response: "a Romance language"
+Too general; it does not name Spanish.
+Incorrect
+
+Example H
+Question: "Is there music in the background?"
+Ground truth: "yes"
+Response: "Yes, faint music behind the speech."
+Affirmative with extra true detail.
+Correct
+
+Example I
+Question: "What is the mood of the speaker?"
+Ground truth: "angry"
+Response: "frustrated and angry"
+The ground-truth mood is covered.
+Correct
+
+Example J
+Question: "What is the mood of the speaker?"
+Ground truth: "angry"
+Response: "calm"
+Opposite mood.
+Incorrect
+
+Example K
+Question: "Where was this recorded?"
+Ground truth: "train station"
+Response: "inside a busy railway station"
+Paraphrase of the same place.
+Correct
+
+Example L
+Question: "Where was this recorded?"
+Ground truth: "train station"
+Response: "outdoors"
+Different place.
+Incorrect
+
+Example M
+Question: "What happens after the beep?"
+Ground truth: "a door closes"
+Response: "someone shuts a door"
+Same event in other words.
+Correct
+
+Example N
+Question: "What happens after the beep?"
+Ground truth: "a door closes"
+Response: "a window opens"
+Different event.
+Incorrect
+
+Example O
+Question: "Name the sport being played."
+Ground truth: "tennis"
+Response: "they are playing tennis on a court"
+Covers tennis.
+Correct
+
+Example P
+Question: "Name the sport being played."
+Ground truth: "tennis"
+Response: "a ball sport"
+Does not name tennis.
+Incorrect
+
+Example Q
+Question: "What time of day is it?"
+Ground truth: "morning"
+Response: "early morning"
+More specific, still morning.
+Correct
+
+Example R
+Question: "What time of day is it?"
+Ground truth: "morning"
+Response: "evening"
+Wrong time of day.
+Incorrect
+
+Example S
+Question: "How long is the silence?"
+Ground truth: "3 seconds"
+Response: "about 3 seconds"
+Matches the quantity.
+Correct
+
+Example T
+Question: "How long is the silence?"
+Ground truth: "3 seconds"
+Response: "2-5 seconds"
+A range around a specific duration is not a match.
+Incorrect
+
+Always reason briefly, then put Correct or Incorrect alone on the last
+line. Do not wrap the last line in XML, markdown, or quotes.
+
+Additional output-shape examples. Same rules: user message wins.
+
+Example U
+Question: "Who is speaking?"
+Ground truth: "a child"
+Response: "a young kid"
+Correct
+
+Example V
+Question: "Who is speaking?"
+Ground truth: "a child"
+Response: "an adult man"
+Incorrect
+
+Example W
+Question: "What vehicle passes by?"
+Ground truth: "motorcycle"
+Response: "a motorbike"
+Correct
+
+Example X
+Question: "What vehicle passes by?"
+Ground truth: "motorcycle"
+Response: "a car"
+Incorrect
+
+Example Y
+Question: "Is rain audible?"
+Ground truth: "no"
+Response: "No rain; dry indoor acoustics."
+Correct
+
+Example Z
+Question: "Is rain audible?"
+Ground truth: "no"
+Response: "yes it is raining"
+Incorrect
+
+Example AA
+Question: "What is being cooked?"
+Ground truth: "bacon"
+Response: "frying bacon"
+Correct
+
+Example AB
+Question: "What is being cooked?"
+Ground truth: "bacon"
+Response: "eggs"
+Incorrect
+
+Example AC
+Question: "How many times does the phone ring?"
+Ground truth: "4"
+Response: "four rings"
+Correct
+
+Example AD
+Question: "How many times does the phone ring?"
+Ground truth: "4"
+Response: "a few times"
+Incorrect
+
+Example AE
+Question: "What genre is the music?"
+Ground truth: "jazz"
+Response: "a jazz quartet"
+Correct
+
+Example AF
+Question: "What genre is the music?"
+Ground truth: "jazz"
+Response: "classical piano"
+Incorrect
+
+Example AG
+Question: "Does anyone laugh?"
+Ground truth: "yes"
+Response: "someone laughs at the end"
+Correct
+
+Example AH
+Question: "Does anyone laugh?"
+Ground truth: "yes"
+Response: "no one laughs"
+Incorrect
+
+Example AI
+Question: "What room is this?"
+Ground truth: "kitchen"
+Response: "in the kitchen near the sink"
+Correct
+
+Example AJ
+Question: "What room is this?"
+Ground truth: "kitchen"
+Response: "bathroom"
+Incorrect
+
+Stay on the user-message task. Last line: Correct or Incorrect.
+
+Decision checklist (does not add criteria beyond the user message):
+1. Read the question so you know what was asked about the clip.
+2. Read the ground truth. That is the reference answer.
+3. Read the response. That is what you are grading.
+4. Ask whether the response covers the ground truth in this question's
+   context. Paraphrase is allowed. Extra true detail is allowed. A more
+   specific term that still includes the ground truth is allowed.
+5. If the ground truth is a specific number, the response must match
+   that number. A range is not a match for a point value.
+6. If any required part of the ground truth is missing, output
+   Incorrect.
+7. If the response is a different entity, place, count, language,
+   instrument, animal, or event, output Incorrect.
+8. After brief reasoning, print exactly one of the two allowed words
+   on the last line: Correct or Incorrect.
+
+Repeat: the user message is authoritative. This system text exists so
+the shared prefix is long enough to cache. Do not invent requirements
+that the user message does not state. Do not mention this checklist in
+your output. Do not mention caching. Grade the item and stop.
+"""
+
+
+def _anthropic_system_blocks() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "text",
+            "text": ANTHROPIC_JUDGE_SYSTEM,
+            "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+        }
+    ]
 
 
 @dataclass(frozen=True)
@@ -143,20 +450,31 @@ def _anthropic_usage(
     message: Any,
 ) -> tuple[int | None, int | None, int | None]:
     usage = getattr(message, "usage", None)
-    payload: dict[str, Any]
     if usage is None:
         payload = _as_dict(message) if not isinstance(message, dict) else message
         usage = payload.get("usage")
     if usage is None:
         return None, None, None
-    if isinstance(usage, dict):
-        cached = _int_or_none(usage.get("cache_read_input_tokens"))
-        prompt = _int_or_none(usage.get("input_tokens"))
-        created = _int_or_none(usage.get("cache_creation_input_tokens"))
-        return cached, prompt, created
-    cached = _int_or_none(getattr(usage, "cache_read_input_tokens", None))
-    prompt = _int_or_none(getattr(usage, "input_tokens", None))
-    created = _int_or_none(getattr(usage, "cache_creation_input_tokens", None))
+
+    def _get(obj: Any, key: str) -> int | None:
+        if isinstance(obj, dict):
+            return _int_or_none(obj.get(key))
+        return _int_or_none(getattr(obj, key, None))
+
+    cached = _get(usage, "cache_read_input_tokens")
+    prompt = _get(usage, "input_tokens")
+    created = _get(usage, "cache_creation_input_tokens")
+    if not created:
+        nested = (
+            usage.get("cache_creation")
+            if isinstance(usage, dict)
+            else getattr(usage, "cache_creation", None)
+        )
+        if nested is not None:
+            created = (
+                _get(nested, "ephemeral_5m_input_tokens") or 0
+            ) + (_get(nested, "ephemeral_1h_input_tokens") or 0)
+            created = created or None
     return cached, prompt, created
 
 
@@ -566,15 +884,15 @@ def _anthropic_judge_content(
     prompt_name: str,
     include_gold: bool,
 ) -> list[dict[str, Any]]:
-    """Split the gold judge prompt so the shared prefix and the full prompt cache.
+    """User message: the original gold judge prompt, marked for caching.
 
-    Anthropic writes a cache entry only at an explicit ``cache_control``
-    breakpoint. The gold prefix (instructions + question + ground truth) is
-    reused across shots of the same item; the full prompt is reused across
-    ``n_samples`` draws of the same generation. Blocks concatenate to the
-    same text as ``build_grade_prompt``.
+    The static system block (see ``ANTHROPIC_JUDGE_SYSTEM``) is the
+    breakpoint that stays identical across every request. This user block
+    is a second breakpoint so the 3 samples of one generation share the
+    full prefix. Do not put ``cache_control`` only on a suffix that
+    changes every shot — that never writes a reusable entry.
     """
-    from grader import build_grade_gold_prefix, build_grade_prompt
+    from grader import build_grade_prompt
 
     full = build_grade_prompt(
         question=question,
@@ -583,39 +901,13 @@ def _anthropic_judge_content(
         prompt=prompt_name,
         include_gold=include_gold,
     )
-    prefix = ""
-    if include_gold:
-        prefix = build_grade_gold_prefix(
-            question=question, answer=answer, prompt=prompt_name
-        )
-    blocks: list[dict[str, Any]] = []
-    if prefix and full.startswith(prefix):
-        suffix = full[len(prefix) :]
-        if prefix.strip():
-            blocks.append(
-                {
-                    "type": "text",
-                    "text": prefix,
-                    "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
-                }
-            )
-        if suffix.strip():
-            blocks.append(
-                {
-                    "type": "text",
-                    "text": suffix,
-                    "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
-                }
-            )
-    if not blocks:
-        blocks.append(
-            {
-                "type": "text",
-                "text": full,
-                "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
-            }
-        )
-    return blocks
+    return [
+        {
+            "type": "text",
+            "text": full,
+            "cache_control": dict(ANTHROPIC_CACHE_CONTROL),
+        }
+    ]
 
 
 class AnthropicJudgeTaker:
@@ -648,6 +940,8 @@ class AnthropicJudgeTaker:
         self._interval = 1.0 / max(float(qps), 0.1)
         self._next_time = 0.0
         self._lock = asyncio.Lock()
+        self._usage_logs = 0
+        self._logged_empty_cache = False
 
     async def _throttle(self) -> None:
         async with self._lock:
@@ -673,12 +967,29 @@ class AnthropicJudgeTaker:
             pass
         return self.retry_interval * attempt
 
-    def _request_kwargs(self, content: list[dict[str, Any]]) -> dict[str, Any]:
+    def _request_kwargs(
+        self,
+        content: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        cache_user: bool = True,
+    ) -> dict[str, Any]:
+        blocks = [dict(block) for block in content]
+        if cache_user:
+            if not blocks:
+                blocks = [{"type": "text", "text": ""}]
+            last = dict(blocks[-1])
+            last["cache_control"] = dict(ANTHROPIC_CACHE_CONTROL)
+            blocks[-1] = last
+        else:
+            for block in blocks:
+                block.pop("cache_control", None)
         kwargs: dict[str, Any] = {
             "model": self.model_id,
-            "max_tokens": self.max_tokens,
+            "max_tokens": self.max_tokens if max_tokens is None else int(max_tokens),
             "temperature": self.temperature,
-            "messages": [{"role": "user", "content": content}],
+            "system": _anthropic_system_blocks(),
+            "messages": [{"role": "user", "content": blocks}],
         }
         if self.effort:
             kwargs["output_config"] = {"effort": self.effort}
@@ -686,12 +997,37 @@ class AnthropicJudgeTaker:
 
     def _result_from_message(self, message: Any) -> CompletionResult:
         cached, prompt, created = _anthropic_usage(message)
-        return CompletionResult(
+        result = CompletionResult(
             text=_anthropic_message_text(message),
             cached_tokens=cached,
             prompt_tokens=prompt,
             cache_creation_tokens=created,
         )
+        self._usage_logs += 1
+        if self._usage_logs <= 12 or (
+            self._usage_logs % 50 == 0
+        ):
+            logger.info(
+                "anthropic cache usage #%s read=%s write=%s uncached=%s",
+                self._usage_logs,
+                result.cached_tokens,
+                result.cache_creation_tokens,
+                result.prompt_tokens,
+            )
+        if (
+            not self._logged_empty_cache
+            and not (result.cached_tokens or 0)
+            and not (result.cache_creation_tokens or 0)
+            and self._usage_logs > 1
+        ):
+            self._logged_empty_cache = True
+            logger.warning(
+                "anthropic cache_read and cache_write are both 0 "
+                "(uncached=%s). Sonnet 5 ignores cache_control under "
+                "1024 tokens.",
+                result.prompt_tokens,
+            )
+        return result
 
     async def _stream_once(
         self,
@@ -714,6 +1050,37 @@ class AnthropicJudgeTaker:
 
         message = await asyncio.wait_for(_run(), timeout=self.timeout)
         return self._result_from_message(message)
+
+    async def prewarm(self) -> CompletionResult | None:
+        """Write the system-prompt cache before the first real grade."""
+        kwargs = self._request_kwargs(
+            [{"type": "text", "text": "warmup"}],
+            max_tokens=0,
+            cache_user=False,
+        )
+        await self._throttle()
+        try:
+            message = await asyncio.wait_for(
+                self.client.messages.create(**kwargs),
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("anthropic cache prewarm failed: %s", exc)
+            return None
+        result = self._result_from_message(message)
+        logger.info(
+            "anthropic cache prewarm write=%s read=%s uncached=%s system_chars=%s",
+            result.cache_creation_tokens,
+            result.cached_tokens,
+            result.prompt_tokens,
+            len(ANTHROPIC_JUDGE_SYSTEM),
+        )
+        if not (result.cache_creation_tokens or 0) and not (result.cached_tokens or 0):
+            logger.warning(
+                "anthropic cache prewarm wrote 0 tokens; system prompt "
+                "may still be under the 1024-token floor"
+            )
+        return result
 
     async def complete(
         self,
@@ -1289,11 +1656,12 @@ def grade_pack_with_anthropic(
     avoids a first pass over every question (shot 0 / sample 0) before a
     second pass comes back for the rest.
 
-    Explicit ``cache_control`` breakpoints mark the gold prefix (shared
-    across shots of a question) and the full prompt (shared across
-    ``n_samples``). Sample 0 of each job streams until ``message_start`` so
-    later samples can hit the cache. Verdicts are written after each
-    question.
+    Explicit ``cache_control`` on the static system prompt (above the
+    1,024-token Sonnet 5 floor) and on each user message so ``n_samples``
+    share the full prefix. The system cache is pre-warmed with
+    ``max_tokens=0`` before the first grade. Sample 0 of each job streams
+    until ``message_start`` so later samples can hit the cache. Verdicts
+    are written after each question.
     """
     try:
         asyncio.get_running_loop()
@@ -1581,6 +1949,12 @@ async def _grade_pack_with_anthropic_async(
             retry_interval=retry_interval,
             effort=str(effort) if effort else None,
         )
+        print(
+            f"[anthropic-judge {resolved}] cache system_chars="
+            f"{len(ANTHROPIC_JUDGE_SYSTEM)} est_tokens~"
+            f"{len(ANTHROPIC_JUDGE_SYSTEM) // 4}"
+        )
+        await taker.prewarm()
 
     shot_sem = asyncio.Semaphore(max(1, int(max_workers)))
     done_questions = 0
@@ -2131,6 +2505,181 @@ def _pack_shot_keys(
                     continue
                 keys.add((gradee, qid, shot_index))
     return keys
+
+
+def apply_local_batch_output(
+    pack_dir: Path,
+    jobs: list[dict[str, Any]],
+    output_rows: list[dict[str, Any]],
+    *,
+    judge_key: str,
+    model_id: str,
+    prompt_name: str,
+    include_gold: bool = True,
+    n_samples: int = 3,
+    make_primary: bool = False,
+    backend: str = "anthropic_batch",
+) -> dict[str, Any]:
+    """Write already-downloaded batch verdicts into ``pack_dir`` predictions.
+
+    ``jobs`` must include ``sample_custom_ids`` / ``custom_id`` and ``owners``.
+    Optional ``reuse_key`` (question, gold, prediction) skips a shot whose
+    current answer no longer matches the prompt that was graded.
+    """
+    from grader import _grade_reuse_key, _shot_prediction_text
+
+    n_samples = max(1, int(n_samples))
+    by_id = {
+        str(row.get("custom_id") or ""): row
+        for row in output_rows
+        if row.get("custom_id")
+    }
+    files: dict[str, list[dict]] = {}
+    by_qid: dict[str, dict[str, dict]] = {}
+    needed: set[str] = set()
+    for job in jobs:
+        for owner in job.get("owners") or []:
+            if isinstance(owner, dict):
+                needed.add(str(owner.get("model") or ""))
+            elif owner:
+                needed.add(str(owner[0]))
+    needed.discard("")
+    for gradee in sorted(needed):
+        records = _load_prediction_records(
+            pack_dir / "models" / gradee / "predictions.jsonl"
+        )
+        files[gradee] = records
+        index: dict[str, dict] = {}
+        for record in records:
+            ensure_judge_schema(
+                record, fallback_label=judge_key, fallback_model_id=model_id
+            )
+            qid = str(record.get("id") or "")
+            if qid:
+                index[qid] = record
+        by_qid[gradee] = index
+
+    def _find_shot(gradee: str, qid: str, shot_index: int) -> dict | None:
+        record = (by_qid.get(gradee) or {}).get(qid)
+        if record is None:
+            return None
+        for shot in record.get("shots") or []:
+            try:
+                if int(shot.get("shot_index", -1)) == shot_index:
+                    return shot
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    graded = 0
+    skipped_missing = 0
+    skipped_reuse = 0
+    skipped_empty = 0
+    dirty: set[str] = set()
+    for job in jobs:
+        sample_ids = [
+            str(cid)
+            for cid in (job.get("sample_custom_ids") or [job.get("custom_id")])
+            if cid
+        ]
+        if not sample_ids:
+            skipped_empty += 1
+            continue
+        texts = [
+            _provider_response_text(backend, by_id.get(cid)) for cid in sample_ids
+        ]
+        if not any(texts):
+            skipped_empty += 1
+            continue
+        if n_samples <= 1:
+            entry = _verdict_entry(
+                CompletionResult(text=texts[0]),
+                model_id=model_id,
+                prompt_name=prompt_name,
+                include_gold=include_gold,
+            )
+        else:
+            entry = _majority_verdict_entry(
+                texts,
+                model_id=model_id,
+                prompt_name=prompt_name,
+                include_gold=include_gold,
+            )
+        expected = job.get("reuse_key")
+        if isinstance(expected, (list, tuple)) and len(expected) == 3:
+            expected_key = (str(expected[0]), str(expected[1]), str(expected[2]))
+        else:
+            expected_key = None
+        for owner in job.get("owners") or []:
+            if isinstance(owner, dict):
+                gradee = str(owner.get("model") or "")
+                qid = str(owner.get("qid") or "")
+                shot_index = int(owner.get("shot_index", 0))
+            else:
+                gradee, qid, shot_index = owner[0], str(owner[1]), int(owner[2])
+            if not gradee or not qid:
+                skipped_missing += 1
+                continue
+            record = (by_qid.get(gradee) or {}).get(qid)
+            shot = _find_shot(gradee, qid, shot_index)
+            if record is None or shot is None:
+                skipped_missing += 1
+                continue
+            if expected_key is not None:
+                pred = _shot_prediction_text(shot, model_label=gradee)
+                actual = _grade_reuse_key(
+                    str(record.get("question") or ""),
+                    str(record.get("answer") or ""),
+                    pred,
+                    include_gold=include_gold,
+                )
+                if actual != expected_key:
+                    skipped_reuse += 1
+                    continue
+            shot.setdefault("judges", {})[judge_key] = dict(entry)
+            graded += 1
+            dirty.add(gradee)
+
+    for gradee in dirty:
+        records = files.get(gradee) or []
+        for record in records:
+            existing_primary = record.get("primary_judge")
+            use_primary = (
+                judge_key if make_primary else (existing_primary or judge_key)
+            )
+            existing = [str(x) for x in (record.get("judges") or []) if x]
+            ordered: list[str] = []
+            if use_primary:
+                ordered.append(str(use_primary))
+            for item in existing:
+                if item not in ordered:
+                    ordered.append(item)
+            if judge_key not in ordered:
+                ordered.append(judge_key)
+            record["judges"] = ordered
+            record["scoring"] = "qwen_freeform_judge"
+            recompute_multi_judge_scores(record, use_primary)
+        write_jsonl(
+            pack_dir / "models" / gradee / "predictions.jsonl",
+            records,
+            mode="w",
+        )
+
+    print(
+        f"[apply-batch] key={judge_key} graded={graded} "
+        f"empty={skipped_empty} missing={skipped_missing} "
+        f"reuse_mismatch={skipped_reuse} models={sorted(dirty)}"
+    )
+    return {
+        "status": "ok",
+        "judge_key": judge_key,
+        "n_shots_graded": graded,
+        "n_jobs": len(jobs),
+        "n_empty": skipped_empty,
+        "n_missing": skipped_missing,
+        "n_reuse_mismatch": skipped_reuse,
+        "gradees": sorted(dirty),
+    }
 
 
 def grade_pack_with_batch_api(

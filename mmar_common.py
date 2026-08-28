@@ -31,7 +31,7 @@ GEMMA_ANSWER_LINE_RE = re.compile(
 )
 # Music Flamingo sometimes uses an MC-style prefix instead of ``Answer:``.
 MUSIC_FLAMINGO_LETTERED_ANSWER_RE = re.compile(
-    r"^\s*\(\s*A\s*\)\s*[.:]?\s*(.+)\s*$",
+    r"^\s*\(\s*[A-E]\s*\)\s*[.:]?\s*(.+)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
@@ -44,7 +44,6 @@ PREFIX_ASSISTANT_THINK_LABELS = frozenset(
     {
         "af-next-think",
         "music-flamingo",
-        "step-audio-r1.1",
         "mimo-audio-7b",
     }
 )
@@ -244,6 +243,26 @@ def build_mmar_freeform_prompt(
     return prompt
 
 
+DESCRIPTION_PROMPT = (
+    "Listen to the audio. Write a caption describing what you hear "
+    "(speakers, sounds, music, environment), and transcribe any speech verbatim if it exists. "
+    "Be thorough with identifying all events and speech in the audio. "
+    "Pay careful attention to the sequencing in time and the relationships between events in your captioning and transcription output."
+)
+
+
+def build_mmar_description_prompt() -> str:
+    """Caption + transcribe prompt (no MMAR question or choices)."""
+    return DESCRIPTION_PROMPT
+
+
+def parse_description_output(raw_text, choices=None):
+    """Store the full completion as the answer (no think/answer parsing)."""
+    del choices
+    text = (raw_text or "").strip()
+    return "", text
+
+
 def _last_think_close_span(text: str) -> tuple[int, int] | None:
     """Byte span of the last ``</think>`` (case-insensitive), if any."""
     idx = text.lower().rfind(THINK_CLOSE)
@@ -426,9 +445,9 @@ def parse_answer_tagged_output(raw_text, choices=None):
 def parse_music_flamingo_output(raw_text, choices=None, *, fallback=None):
     """Music Flamingo: special answer lines first, then ``<answer>`` tags, then fallback.
 
-    Tries ``**Answer:**`` / ``(A).`` before ``<answer>`` tags. Creators instruct
-    wrapping the final answer in tags, but the model often emits an MC-style
-    ``(A). <answer>`` line instead.
+    Tries ``**Answer:**`` / ``(A).``-``(E).`` before ``<answer>`` tags. Creators
+    instruct wrapping the final answer in tags, but the model often emits an
+    MC-style ``(A). <answer>`` line instead.
     """
     special = _parse_special_answer_output(raw_text, choices)
     if special is not None:
@@ -470,7 +489,7 @@ def _last_answer_line(
 
 
 def split_special_answer_line(text: str) -> tuple[str, str] | None:
-    """Split on ``**Answer:**`` or ``(A).`` before a plain ``Answer:`` line."""
+    """Split on ``**Answer:**`` or ``(A).``-``(E).`` before a plain ``Answer:`` line."""
     return _last_answer_line(
         text,
         (
@@ -481,7 +500,7 @@ def split_special_answer_line(text: str) -> tuple[str, str] | None:
 
 
 def _parse_special_answer_output(raw_text, choices=None) -> tuple[str, str] | None:
-    """``(thinking, answer)`` from ``**Answer:**`` or ``(A).``, if present."""
+    """``(thinking, answer)`` from ``**Answer:**`` or ``(A).``-``(E).``, if present."""
     text = (raw_text or "").strip()
     if not text:
         return None
@@ -516,7 +535,7 @@ def _parse_special_answer_output(raw_text, choices=None) -> tuple[str, str] | No
 def split_answer_line(text: str) -> tuple[str, str] | None:
     """Split on the last non-empty answer line. ``None`` when absent.
 
-    Order: ``**Answer:**``, then ``(A).``, then a plain ``Answer:`` line.
+    Order: ``**Answer:**``, then ``(A).``-``(E).``, then a plain ``Answer:`` line.
     """
     special = split_special_answer_line(text)
     if special is not None:
@@ -528,7 +547,7 @@ def parse_freeform_output(raw_text, choices=None):
     """Split free-form model text into (thinking, answer) without choice matching.
 
     ``choices`` is accepted for API compatibility with choice parsers but ignored.
-    Prefers ``**Answer:**`` / ``(A).``, then a plain ``Answer:`` line, then
+    Prefers ``**Answer:**`` / ``(A).``-``(E).``, then a plain ``Answer:`` line, then
     markers / last-line fallbacks. Answer extraction never includes text
     before the last closing ``</think>``.
     """
@@ -575,7 +594,7 @@ def parse_freeform_output(raw_text, choices=None):
 def extract_freeform_answer(raw_text: str) -> str:
     """Final-answer span for freeform generations and judge replies.
 
-    Order: ``**Answer:**`` / ``(A).``, then last ``Answer:`` line (after last
+    Order: ``**Answer:**`` / ``(A).``-``(E).``, then last ``Answer:`` line (after last
     ``</think>`` when that remainder is non-empty, else the full text), then
     last ``<answer>`` block, then ``parse_freeform_output`` fallbacks.
     """

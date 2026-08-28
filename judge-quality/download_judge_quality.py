@@ -1,8 +1,8 @@
-"""Download judge-quality packs from the ``mmar-judging`` Modal Volume.
+"""Download the LALM-no-GT pack from the ``mmar-judging`` Modal Volume.
 
-Pulls the first-shot LLM-GT and LALM-no-GT packs written by
-``run_llm_judge_gt.py`` and ``run_lalm_judge_no_gt.py`` into
-``outputs/judge-quality/``.
+Pulls ``lalm-judge-no-gt`` (written by ``run_lalm_judge_no_gt.py``) into
+``outputs/judge-quality/``. Does not download ``llm-judge-gt``; that pack
+is graded locally by Claude and a volume pull would overwrite it.
 
 Test-taker generations for those scripts come from the
 ``mmar-freeform-thinking`` volume; download that pack with
@@ -13,7 +13,6 @@ Usage::
 
     uv run modal run judge-quality/download_judge_quality.py
     uv run modal run judge-quality/download_judge_quality.py --list-only
-    uv run modal run judge-quality/download_judge_quality.py --pack llm-judge-gt
     uv run python judge-quality/score_lalm_vs_gt.py
     uv run python judge-quality/view_judge_quality.py
 """
@@ -34,7 +33,7 @@ from modal_cache import JUDGING_VOLUME_NAME, judging_volume
 
 GT_PACK_NAME = "llm-judge-gt"
 LALM_PACK_NAME = "lalm-judge-no-gt"
-DEFAULT_PACKS = (GT_PACK_NAME, LALM_PACK_NAME)
+DEFAULT_PACKS = (LALM_PACK_NAME,)
 DEFAULT_LOCAL_DIR = _REPO_ROOT / "outputs" / "judge-quality"
 
 app = modal.App("download-judge-quality")
@@ -49,6 +48,12 @@ def _normalize_pack(raw: str) -> list[str]:
     out: list[str] = []
     for item in wanted:
         name = known.get(item) or item
+        if name == GT_PACK_NAME or item.replace("_", "-") == GT_PACK_NAME:
+            raise SystemExit(
+                f"Refusing to download {GT_PACK_NAME!r}: that pack is local "
+                "(Claude GT) and a volume pull would overwrite it. "
+                f"This script only downloads {list(DEFAULT_PACKS)}."
+            )
         if name not in DEFAULT_PACKS:
             raise SystemExit(
                 f"Unknown pack {item!r}. Expected one of {list(DEFAULT_PACKS)} or all."
@@ -118,7 +123,7 @@ def main(
     """List or download judge-quality packs from ``mmar-judging``.
 
     Args:
-        pack: ``all``, ``llm-judge-gt``, ``lalm-judge-no-gt``, or a comma list.
+        pack: ``all`` or ``lalm-judge-no-gt``. ``llm-judge-gt`` is refused.
         local_dir: Local parent directory (default: ``outputs/judge-quality``).
         list_only: Only print remote paths; do not download.
         force: Overwrite existing local files.
