@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import random
 import re
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 CHOICE_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 AF3_THINK_SUFFIX = "Please think and reason about the input audio before you respond."
@@ -84,8 +85,9 @@ def write_jsonl(path, records, mode="a"):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, mode, encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.writelines(
+            json.dumps(record, ensure_ascii=False) + "\n" for record in records
+        )
 
 
 def write_json(path: Path, payload: dict) -> Path:
@@ -243,10 +245,10 @@ def build_mmar_freeform_prompt(
 
 
 DESCRIPTION_PROMPT = (
-    "Listen to the audio. Write a caption describing what you hear "
-    "(speakers, sounds, music, environment), and transcribe any speech verbatim if it exists. "
-    "Be thorough with identifying all events and speech in the audio. "
-    "Pay careful attention to the sequencing in time and the relationships between events in your captioning and transcription output."
+    "Listen to the audio closely, then give a detailed description of what you hear. This involves:\n"
+    "- Transcribing any speech verbatim if it exists and attributing the speaker of each utterance, both named and unnamed.\n"
+    "- Captioning the audio in detail, including all auditory foreground events and background noise.\n"
+    "- Being as specific and thorough as possible in describing the properties and sequencing of the speech and events in the audio.\n"
 )
 
 
@@ -716,7 +718,9 @@ def recompute_n_shot_scores(record: dict) -> dict:
     shots = list(record.get("shots") or [])
     n_shots = len(shots)
     n_shot_correct = sum(1 for shot in shots if shot.get("correct"))
-    primary = next((shot for shot in shots if shot.get("correct")), shots[0] if shots else {})
+    primary = next(
+        (shot for shot in shots if shot.get("correct")), shots[0] if shots else {}
+    )
     record["n_shots"] = n_shots
     record["n_shot_correct"] = n_shot_correct
     record["shot_success_rate"] = (n_shot_correct / n_shots) if n_shots else 0.0
@@ -790,16 +794,9 @@ def ensure_judge_schema(
 
         if is_freeform and _shot_has_legacy_judge(shot):
             model_id = (
-                shot.get("grader")
-                or record.get("grader")
-                or fallback_model_id
-                or ""
+                shot.get("grader") or record.get("grader") or fallback_model_id or ""
             )
-            label = (
-                judge_label(model_id)
-                or fallback_label
-                or "qwen2.5-3b-instruct"
-            )
+            label = judge_label(model_id) or fallback_label or "qwen2.5-3b-instruct"
             if shot.get("correct") is not None or shot.get("grader_output") is not None:
                 legacy_out = shot.get("grader_output")
                 judges[label] = {
@@ -820,7 +817,7 @@ def ensure_judge_schema(
     if not record.get("judges"):
         ordered: list[str] = []
         for shot in shots:
-            for label in (shot.get("judges") or {}):
+            for label in shot.get("judges") or {}:
                 if label not in ordered:
                     ordered.append(label)
         if ordered:
@@ -846,7 +843,7 @@ def recompute_multi_judge_scores(
         if label and label not in ordered:
             ordered.append(str(label))
     for shot in shots:
-        for label in (shot.get("judges") or {}):
+        for label in shot.get("judges") or {}:
             if label not in ordered:
                 ordered.append(str(label))
 
@@ -888,7 +885,11 @@ def recompute_multi_judge_scores(
     record["per_judge"] = per_judge
     record["n_shots"] = n_shots
 
-    if primary and primary in per_judge and per_judge[primary]["n_shot_correct"] is not None:
+    if (
+        primary
+        and primary in per_judge
+        and per_judge[primary]["n_shot_correct"] is not None
+    ):
         stats = per_judge[primary]
         record["n_shot_correct"] = stats["n_shot_correct"]
         record["shot_success_rate"] = stats["shot_success_rate"]
@@ -924,7 +925,9 @@ def recompute_multi_judge_scores(
         else:
             record["grader"] = primary
         record.pop("pending_grade", None)
-    elif any(shot.get("pending_grade") for shot in shots) or record.get("pending_grade"):
+    elif any(shot.get("pending_grade") for shot in shots) or record.get(
+        "pending_grade"
+    ):
         # Still awaiting at least the primary judge.
         record["n_shot_correct"] = None
         record["shot_success_rate"] = None
@@ -969,5 +972,4 @@ def load_completed_ids(predictions_path):
 
 
 def make_run_id() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

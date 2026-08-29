@@ -49,6 +49,7 @@ import modal
 
 from mmar_common import (
     aggregate_n_shot_record,
+    build_mmar_description_prompt,
     count_wavs,
     load_jsonl,
     resolve_path,
@@ -184,9 +185,7 @@ def _merge_shot_record(
     start_index: int,
 ) -> dict:
     """Append newly generated shots onto an existing record, or build a new one."""
-    new_record = aggregate_n_shot_record(
-        item, new_outputs, pending_grade=True
-    )
+    new_record = aggregate_n_shot_record(item, new_outputs, pending_grade=True)
     if not existing or start_index <= 0:
         return new_record
 
@@ -342,10 +341,7 @@ def _merge_question_ids(
 
     _write_question_ids(ids_path, merged, seed=seed)
     if existing and len(merged) > len(existing):
-        print(
-            f"Expanded question set {len(existing)} -> {len(merged)} "
-            f"-> {ids_path}"
-        )
+        print(f"Expanded question set {len(existing)} -> {len(merged)} -> {ids_path}")
     else:
         print(f"Wrote {len(merged)} question ids -> {ids_path}")
     return merged
@@ -438,7 +434,9 @@ def _run_model_eval(
         )
     wav_count = count_wavs(audio_dir)
     if wav_count < 100:
-        raise SystemExit(f"MMAR audio missing/incomplete in {audio_dir} ({wav_count} wavs)")
+        raise SystemExit(
+            f"MMAR audio missing/incomplete in {audio_dir} ({wav_count} wavs)"
+        )
 
     if not question_ids:
         raise SystemExit(f"[{model_label}] empty question_ids")
@@ -494,9 +492,7 @@ def _run_model_eval(
         gen_samples: list[dict] = []
         seeds: list[int] = []
         owners: list[tuple[int, int]] = []
-        for item_index, (item, n_have) in enumerate(
-            zip(pending_items, pending_have)
-        ):
+        for item_index, (item, n_have) in enumerate(zip(pending_items, pending_have)):
             for shot_index in range(n_have, n_shots):
                 gen_samples.append(item)
                 seeds.append(_shot_seed(seed, str(item["id"]), shot_index))
@@ -505,9 +501,7 @@ def _run_model_eval(
         n_requests = len(gen_samples)
     else:
         gen_samples = list(pending_items)
-        seeds = [
-            _shot_seed(seed, str(item["id"]), 0) for item in pending_items
-        ]
+        seeds = [_shot_seed(seed, str(item["id"]), 0) for item in pending_items]
         owners = [
             (item_index, shot_index)
             for item_index in range(n_pending)
@@ -540,8 +534,7 @@ def _run_model_eval(
         ) from exc
     if len(outputs) != len(owners):
         raise RuntimeError(
-            f"[{model_label}] expected {len(owners)} shot outputs, "
-            f"got {len(outputs)}"
+            f"[{model_label}] expected {len(owners)} shot outputs, got {len(outputs)}"
         )
     for (item_index, _shot_index), output in zip(owners, outputs):
         shot_outputs_by_index[item_index].append(output)
@@ -633,9 +626,7 @@ def _eval_function(label: str, image: modal.Image, gpu: str):
     name = f"eval_{label.replace('-', '_').replace('.', '_')}"
     run.__name__ = name
     run.__qualname__ = name
-    fn = app.function(image=image, gpu=gpu, name=f"desc-{label}", **_EVAL_KW)(
-        run
-    )
+    fn = app.function(image=image, gpu=gpu, name=f"desc-{label}", **_EVAL_KW)(run)
     globals()[name] = fn
     return fn
 
@@ -719,19 +710,23 @@ def prepare_run(
             and (child / "predictions.jsonl").is_file()
             and child.name in MODEL_SPECS
         ]
-    merged_models = list(
-        dict.fromkeys([*prior_models, *disk_models, *model_labels])
-    )
+    merged_models = list(dict.fromkeys([*prior_models, *disk_models, *model_labels]))
     is_resume = bool(existing.get("created_at")) or bool(disk_models)
+    description_prompt = build_mmar_description_prompt()
+    if is_resume and existing.get("description_prompt") != description_prompt:
+        raise SystemExit(
+            "description prompt changed; captions on this pack are from a "
+            "different prompt. Wipe models/*/predictions.jsonl on the "
+            f"mmar-descriptions volume (pack {pack_dir}) or pass a fresh "
+            "output_dir before re-running."
+        )
 
     # Workload for this run uses the active (possibly limited) id list.
     pack_workload = {
         label: _model_workload(pack_dir, label, active_ids, n_shots)
         for label in merged_models
     }
-    requested_workload = {
-        label: pack_workload[label] for label in model_labels
-    }
+    requested_workload = {label: pack_workload[label] for label in model_labels}
     mmar_descriptions_volume.commit()
 
     override_ns = SimpleNamespace(
@@ -747,6 +742,7 @@ def prepare_run(
     manifest = {
         "experiment": "cascade-descriptions",
         "mode": "description",
+        "description_prompt": description_prompt,
         "enable_thinking": False,
         "models": merged_models,
         "n_shots": n_shots,
@@ -765,9 +761,7 @@ def prepare_run(
         "resumed": is_resume,
         "workload": {
             label: {
-                key: value
-                for key, value in info.items()
-                if key != "predictions_path"
+                key: value for key, value in info.items() if key != "predictions_path"
             }
             for label, info in pack_workload.items()
         },
@@ -1009,7 +1003,9 @@ def main(
             merges the rest.
         labels_csv: Optional path to labels.csv (default ``exports/labels.csv``).
     """
-    labels_path = Path(labels_csv).expanduser() if labels_csv else EXPORTS_DIR / LABELS_CSV_NAME
+    labels_path = (
+        Path(labels_csv).expanduser() if labels_csv else EXPORTS_DIR / LABELS_CSV_NAME
+    )
     if not labels_path.is_file():
         raise SystemExit(
             f"labels.csv not found at {labels_path}. "

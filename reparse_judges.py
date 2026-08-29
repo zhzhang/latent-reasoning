@@ -13,7 +13,7 @@ Usage::
     uv run python reparse_judges.py --dry-run
     uv run python reparse_judges.py
     uv run python reparse_judges.py --unparsed-only
-    uv run python reparse_judges.py --judge qwen2.5-omni-7b --examples 5
+    uv run python reparse_judges.py --judge qwen3-omni --examples 5
 """
 
 from __future__ import annotations

@@ -1,13 +1,15 @@
-"""Drop named models as judges (not as gradees) from the judging pack.
+"""Drop named models as judges (not as gradees) from every judging pack.
 
 Removes ``shots[].judges[<key>]`` where ``key`` is ``{label}`` or
 ``{label}__…``, plus matching ``judge_partials/*.jsonl`` sidecars, manifest
-``judges`` entries, and ``judge_accuracy.json`` tables. Keeps
-``models/<label>/`` so a later ``run_judges.py`` can retry those judges.
-Does not change ``primary_judge`` unless it is one of the dropped keys.
+``judges`` entries, and ``judge_accuracy.json`` tables. Walks nested packs
+under the root (e.g. ``lalm-judge-no-gt/``). Keeps ``models/<label>/`` so a
+later ``run_judges.py`` can retry those judges. Does not change
+``primary_judge`` unless it is one of the dropped keys.
 
-Default labels: ``qwen3-omni-instruct``, ``music-flamingo``. Does not match
-``qwen3-omni`` (the thinking checkpoint).
+Default labels: ``music-flamingo``, ``qwen3-omni-instruct``,
+``qwen3.6-35b-a3b-fp8``. Does not match ``qwen3-omni`` (the thinking
+checkpoint).
 
 Usage::
 
@@ -30,12 +32,17 @@ from typing import Any
 
 import modal
 
-from mmar_common import load_jsonl, recompute_multi_judge_scores, write_json, write_jsonl
+from mmar_common import recompute_multi_judge_scores, write_json
 from modal_cache import JUDGING_MOUNT, JUDGING_VOLUME_NAME, judging_volume
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_PACK = REPO_ROOT / "outputs" / "mmar-judging"
-DEFAULT_JUDGES = ("qwen3-omni-instruct", "music-flamingo")
+DEFAULT_JUDGES = (
+    "music-flamingo",
+    "qwen3-omni-instruct",
+    "qwen3.6-35b-a3b-fp8",
+)
+_SKIP_PACK_DIRS = frozenset({"models", "judge_partials"})
 _ACCURACY_META_KEYS = frozenset(
     {
         "pack",
@@ -72,10 +79,44 @@ def is_dropped_judge(key: str, drop_models: set[str]) -> bool:
     return False
 
 
-def _atomic_write_jsonl(path: Path, rows: list[dict]) -> None:
+def _load_jsonl(path: Path) -> tuple[list[object], int]:
+    """Load JSONL, keeping unreadable lines as raw bytes so a rewrite cannot drop them.
+
+    Judge generations sometimes contain literal control characters; ``strict=False``
+    still parses those. One nested-pack line is binary-corrupt at a 16MiB seam.
+    """
+    rows: list[object] = []
+    n_unparsed = 0
+    for line in path.read_bytes().splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8"), strict=False)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            rows.append(line)
+            n_unparsed += 1
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+        else:
+            rows.append(line)
+            n_unparsed += 1
+    return rows, n_unparsed
+
+
+def _atomic_write_jsonl(path: Path, rows: list[object]) -> None:
     tmp = path.with_name(path.name + ".tmp")
-    write_jsonl(tmp, rows, mode="w")
-    with tmp.open("rb") as handle:
+    with tmp.open("wb") as handle:
+        for row in rows:
+            if isinstance(row, dict):
+                handle.write(
+                    (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+                )
+            elif isinstance(row, bytes):
+                handle.write(row + b"\n")
+            else:
+                handle.write((str(row) + "\n").encode("utf-8"))
+        handle.flush()
         os.fsync(handle.fileno())
     tmp.replace(path)
 
@@ -175,10 +216,13 @@ def scrub_sidecars(
                 if not dry_run:
                     path.unlink()
                 continue
-            rows = [row for row in load_jsonl(path) if isinstance(row, dict)]
-            kept: list[dict] = []
+            rows, _n_unparsed = _load_jsonl(path)
+            kept: list[object] = []
             file_dropped = 0
             for row in rows:
+                if not isinstance(row, dict):
+                    kept.append(row)
+                    continue
                 key = str(row.get("judge_key") or path.stem)
                 if is_dropped_judge(key, drop_models):
                     file_dropped += 1
@@ -311,6 +355,29 @@ def scrub_accuracy_json(
     return n_dropped
 
 
+def _is_judging_pack(path: Path) -> bool:
+    models_root = path / "models"
+    if not models_root.is_dir():
+        return False
+    return any(
+        child.is_file() for child in models_root.glob("*/predictions.jsonl")
+    )
+
+
+def discover_packs(root: Path) -> list[Path]:
+    """Root pack plus nested judging packs (skip ``models/`` trees)."""
+    found: list[Path] = []
+    if _is_judging_pack(root):
+        found.append(root)
+    if not root.is_dir():
+        return found
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name in _SKIP_PACK_DIRS:
+            continue
+        found.extend(discover_packs(child))
+    return found
+
+
 def _discover_labels(pack_dir: Path) -> list[str]:
     models_root = pack_dir / "models"
     labels = sorted(
@@ -347,6 +414,8 @@ def _print_stats(stats: dict[str, Any]) -> None:
     print(f"manifest judges dropped: {stats.get('manifest_judges_dropped')}")
     print(f"accuracy keys dropped: {stats.get('accuracy_keys_dropped')}")
     print(f"primary_judge: {stats.get('primary_judge')}")
+    if stats.get("n_unparsed_lines"):
+        print(f"unparsed jsonl lines kept as-is: {stats.get('n_unparsed_lines')}")
     if stats.get("dry_run"):
         print("dry-run: no files written")
 
@@ -361,9 +430,11 @@ def scrub_pack(
     dropped_by_key: Counter[str] = Counter()
     n_records = 0
     n_verdicts = 0
+    n_unparsed = 0
     for label in labels:
         pred_path = pack_dir / "models" / label / "predictions.jsonl"
-        records = load_jsonl(pred_path)
+        records, file_unparsed = _load_jsonl(pred_path)
+        n_unparsed += file_unparsed
         changed = False
         for record in records:
             if not isinstance(record, dict):
@@ -394,6 +465,7 @@ def scrub_pack(
         "models": labels,
         "n_records": n_records,
         "n_verdicts_dropped": n_verdicts,
+        "n_unparsed_lines": n_unparsed,
         "dropped_by_key": dict(dropped_by_key),
         "sidecar_files_seen": n_sc_files,
         "sidecar_files_removed": n_sc_removed,
@@ -405,6 +477,50 @@ def scrub_pack(
     return stats
 
 
+def _print_tree_summary(stats: dict[str, Any]) -> None:
+    print(
+        f"[scrub-judges] total packs={stats.get('n_packs')} "
+        f"verdicts={stats.get('n_verdicts_dropped')} "
+        f"manifest={stats.get('manifest_judges_dropped')} "
+        f"accuracy={stats.get('accuracy_keys_dropped')}"
+    )
+
+
+def scrub_tree(
+    root: Path,
+    *,
+    drop_models: set[str],
+    dry_run: bool,
+    where_prefix: str = "local",
+) -> dict[str, Any]:
+    """Scrub ``root`` and every nested judging pack under it."""
+    packs = discover_packs(root)
+    if not packs:
+        raise SystemExit(f"no judging packs under {root}")
+    pack_stats: list[dict[str, Any]] = []
+    for pack_dir in packs:
+        stats = scrub_pack(pack_dir, drop_models=drop_models, dry_run=dry_run)
+        rel = "." if pack_dir == root else str(pack_dir.relative_to(root))
+        stats["where"] = f"{where_prefix}:{root} / {rel}"
+        _print_stats(stats)
+        pack_stats.append(stats)
+    summary = {
+        "root": str(root),
+        "where": f"{where_prefix}:{root}",
+        "dry_run": dry_run,
+        "judges": sorted(drop_models),
+        "n_packs": len(pack_stats),
+        "n_verdicts_dropped": sum(s["n_verdicts_dropped"] for s in pack_stats),
+        "manifest_judges_dropped": sum(
+            s["manifest_judges_dropped"] for s in pack_stats
+        ),
+        "accuracy_keys_dropped": sum(s["accuracy_keys_dropped"] for s in pack_stats),
+        "packs": pack_stats,
+    }
+    _print_tree_summary(summary)
+    return summary
+
+
 @app.function(
     image=cpu_image,
     timeout=30 * 60,
@@ -414,14 +530,17 @@ def scrub_volume(
     judges: list[str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Scrub the ``mmar-judging`` Volume pack in place."""
+    """Scrub every judging pack on the ``mmar-judging`` Volume."""
     judging_volume.reload()
     drop_models = set(judges or DEFAULT_JUDGES)
-    stats = scrub_pack(Path(JUDGING_MOUNT), drop_models=drop_models, dry_run=dry_run)
-    stats["where"] = f"volume:{JUDGING_VOLUME_NAME}"
+    stats = scrub_tree(
+        Path(JUDGING_MOUNT),
+        drop_models=drop_models,
+        dry_run=dry_run,
+        where_prefix=f"volume:{JUDGING_VOLUME_NAME}",
+    )
     if not dry_run:
         judging_volume.commit()
-    _print_stats(stats)
     return stats
 
 
@@ -433,13 +552,16 @@ def modal_main(
     judges: str = ",".join(DEFAULT_JUDGES),
     pack: str = str(DEFAULT_PACK),
 ):
-    """Scrub the local pack, then the Modal Volume (unless skipped)."""
+    """Scrub local judging packs, then the Modal Volume (unless skipped)."""
     drop_models = set(_csv_parts(judges) or DEFAULT_JUDGES)
     if not skip_local:
         local_dir = Path(pack).expanduser().resolve()
-        stats = scrub_pack(local_dir, drop_models=drop_models, dry_run=dry_run)
-        stats["where"] = f"local:{local_dir}"
-        _print_stats(stats)
+        scrub_tree(
+            local_dir,
+            drop_models=drop_models,
+            dry_run=dry_run,
+            where_prefix="local",
+        )
     if not skip_modal:
         scrub_volume.remote(judges=sorted(drop_models), dry_run=dry_run)
 
@@ -447,7 +569,8 @@ def modal_main(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Remove qwen3-omni-instruct and music-flamingo judge verdicts "
+            "Remove music-flamingo, qwen3-omni-instruct, and "
+            "qwen3.6-35b-a3b-fp8 judge verdicts (including nested packs) "
             "so a later run_judges.py will re-grade them."
         )
     )
@@ -455,7 +578,10 @@ def main() -> None:
         "--pack",
         type=Path,
         default=DEFAULT_PACK,
-        help="Judging pack directory (default: outputs/mmar-judging).",
+        help=(
+            "Judging pack root (default: outputs/mmar-judging). "
+            "Nested packs such as lalm-judge-no-gt/ are included."
+        ),
     )
     parser.add_argument(
         "--judges",
@@ -469,13 +595,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     drop_models = set(_csv_parts(args.judges) or DEFAULT_JUDGES)
-    stats = scrub_pack(
+    scrub_tree(
         Path(args.pack).expanduser().resolve(),
         drop_models=drop_models,
         dry_run=args.dry_run,
+        where_prefix="local",
     )
-    stats["where"] = f"local:{stats['pack']}"
-    _print_stats(stats)
 
 
 if __name__ == "__main__":

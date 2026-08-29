@@ -12,12 +12,30 @@ MODEL_LABELS = (
     "music-flamingo",
     "qwen3-omni",
     "voxtral-small-24b",
-    "qwen2.5-omni-7b",
     "phi-4-multimodal",
     "gemma-4-e4b",
     "gemma-4-12b",
     "nemotron-3-nano-omni",
 )
+# Dropped from the paper set. exports/ keeps the labeled rows; viewers,
+# Alt-Test, and pack scripts skip these labels (and ``{label}__…`` judge keys).
+DROPPED_MODEL_LABELS = frozenset({"qwen2.5-omni-7b"})
+
+
+def is_dropped_model(
+    key: str, dropped: frozenset[str] | set[str] | None = None
+) -> bool:
+    """True when ``key`` is a dropped gradee label or ``{label}__…`` judge slug."""
+    labels = DROPPED_MODEL_LABELS if dropped is None else dropped
+    text = str(key or "")
+    if not text:
+        return False
+    for label in labels:
+        if text == label or text.startswith(f"{label}__"):
+            return True
+    return False
+
+
 # Preferred display / discovery order; extras append after known labels.
 MODEL_LABEL_ORDER = MODEL_LABELS + (
     "qwen3-omni-instruct",
@@ -64,7 +82,9 @@ def _index_by_id(records: list[dict]) -> dict[str, dict]:
 
 
 def order_model_labels(labels: list[str] | tuple[str, ...]) -> list[str]:
-    found = list(dict.fromkeys(str(x) for x in labels if x))
+    found = list(
+        dict.fromkeys(str(x) for x in labels if x and not is_dropped_model(x))
+    )
     known = [label for label in MODEL_LABEL_ORDER if label in found]
     rest = [label for label in found if label not in MODEL_LABEL_ORDER]
     return known + rest

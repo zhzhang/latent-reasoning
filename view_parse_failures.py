@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from aggregate import order_model_labels
+from aggregate import is_dropped_model, order_model_labels
 from alt_test import scoring_gold
 from grader import (
     accuracy_mode_names,
@@ -195,7 +195,11 @@ def _compact_failure_entry(entry: dict[str, Any]) -> dict[str, Any]:
 def load_bundle(pack_dir_s: str) -> dict[str, Any]:
     pack_dir = Path(pack_dir_s)
     labels_path = pack_dir / LABELS_CSV_NAME
-    label_rows = load_pack_label_rows(labels_path)
+    label_rows = [
+        row
+        for row in load_pack_label_rows(labels_path)
+        if not is_dropped_model(str(row.get("model_label") or ""))
+    ]
     meta = _load_meta(LOCAL_MMAR_META)
 
     pred_cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -217,7 +221,7 @@ def load_bundle(pack_dir_s: str) -> dict[str, Any]:
             judges = {
                 str(key): dict(entry)
                 for key, entry in shot["judges"].items()
-                if key and isinstance(entry, dict)
+                if key and isinstance(entry, dict) and not is_dropped_model(str(key))
             }
             judge_keys.update(judges)
         samples.append((qid, model, row["shot_index"], list(row["ratings"]), judges))
@@ -675,7 +679,6 @@ function shortLabel(label) {
     "interactive-omni-8b": "i-omni",
     "qwen3-omni": "qwen3",
     "qwen3-omni-instruct": "qwen3-i",
-    "qwen2.5-omni-7b": "qwen2.5",
     "voxtral-small-24b": "voxtral",
     "phi-4-multimodal": "phi-4",
     "gemma-4-e4b": "gemma-e4b",

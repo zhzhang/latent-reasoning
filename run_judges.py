@@ -90,7 +90,13 @@ from pathlib import Path
 
 import modal
 
-from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
+from aggregate import (
+    DROPPED_MODEL_LABELS,
+    aggregate_difficulty,
+    discover_model_labels,
+    is_dropped_model,
+    order_model_labels,
+)
 from alt_test import (
     DEFAULT_EPSILON,
     MIN_HUMANS_PER_INSTANCE,
@@ -552,7 +558,11 @@ def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -
     labels_path = _labels_path(pack_dir)
     if not labels_path.is_file():
         raise SystemExit(f"labels.csv not found at {labels_path}")
-    rows = load_pack_label_rows(labels_path)
+    rows = [
+        row
+        for row in load_pack_label_rows(labels_path)
+        if not is_dropped_model(str(row.get("model_label") or ""))
+    ]
     if not rows:
         raise SystemExit(f"No labeled rows in {labels_path}")
 
@@ -572,7 +582,9 @@ def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -
         judges = None
         if shot is not None and isinstance(shot.get("judges"), dict):
             judges = {
-                str(key): dict(entry) for key, entry in shot["judges"].items() if key
+                str(key): dict(entry)
+                for key, entry in shot["judges"].items()
+                if key and not is_dropped_model(str(key))
             }
             judge_keys.update(judges)
         samples.append((_instance_id(row), list(row["ratings"]), judges))
@@ -581,6 +593,8 @@ def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -
 
     key_mode: dict[str, str] = {}
     for key in sorted(judge_keys):
+        if is_dropped_model(key):
+            continue
         sample_entry = next(
             (
                 (judges or {}).get(key)
@@ -603,7 +617,7 @@ def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -
         "labels_path": str(labels_path),
         "n_label_rows": len(rows),
         "n_questions": len(labeled_question_ids(rows)),
-        "skipped_models": [],
+        "skipped_models": sorted(DROPPED_MODEL_LABELS),
         "epsilon": float(epsilon),
         "modes": accuracy_mode_names(stats),
     }
@@ -660,7 +674,7 @@ def _print_accuracy_modes(tables: dict, *, eps_s: str) -> None:
 
     for mode in accuracy_mode_names(tables):
         by_judge = tables.get(mode) or {}
-        if not isinstance(by_judge, dict):
+        if not isinstance(by_judge, dict) or not by_judge:
             continue
         _print_accuracy_table(grade_mode_title(mode), by_judge, eps_s=eps_s)
 
@@ -1033,15 +1047,19 @@ def _select_judges(
 ) -> tuple[list[str], list[dict], list[str], str | None]:
     """MODEL_SPECS labels, dedicated text judges, API labels, and the first requested.
 
-    Empty ``judge_model_id`` means every uncommented ``mmar_models.MODEL_SPECS``
-    label (no API or JUDGE_SPECS text judges).
+    Empty ``judge_model_id`` means every uncommented audio ``MODEL_SPECS``
+    label (skips ``text_only``; no API or JUDGE_SPECS text judges).
     """
     from grader import resolve_judge_model_id
     from mmar_api import expand_api_judge_token
 
     requested = _csv_parts(judge_model_id)
     if not requested:
-        suite = list(ALL_MODEL_LABELS)
+        suite = [
+            label
+            for label, spec in MODEL_SPECS.items()
+            if not spec.get("text_only")
+        ]
         return suite, [], [], suite[0] if suite else None
 
     suite: list[str] = []
@@ -1459,10 +1477,12 @@ def _suite_grade_fn(label: str):
 
 def _peek_sidecar_meta(path: Path) -> dict:
     """First-row judge_key / model_id from a sidecar, else filename stem."""
-    from grader import parse_judge_key
+    from grader import JUDGE_FORMATS, JUDGE_SPECS, judge_mode_bucket, parse_judge_key
+    from mmar_models import MODEL_SPECS
 
     key = path.stem
     model_id = ""
+    sample_entry: dict | None = None
     if path.is_file():
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -1473,19 +1493,14 @@ def _peek_sidecar_meta(path: Path) -> dict:
                 key = str(row.get("judge_key") or key)
                 entry = row.get("entry") or {}
                 if isinstance(entry, dict):
+                    sample_entry = entry
                     model_id = str(entry.get("model_id") or "")
                 break
     parsed = parse_judge_key(key)
-    gold_tag = str(parsed.get("gold_tag") or "").lower()
-    include_gold = None
-    if gold_tag == "gold":
-        include_gold = True
-    elif gold_tag == "nongold":
-        include_gold = False
+    prompt = judge_mode_bucket(key, sample_entry)
+    fmt = JUDGE_FORMATS.get(prompt) if prompt else None
+    include_gold = None if fmt is None else bool(fmt.include_gold)
     if not model_id:
-        from grader import JUDGE_SPECS
-        from mmar_models import MODEL_SPECS
-
         spec = (
             MODEL_SPECS.get(parsed["model"]) or JUDGE_SPECS.get(parsed["model"]) or {}
         )
@@ -1493,7 +1508,7 @@ def _peek_sidecar_meta(path: Path) -> dict:
     return {
         "judge_key": key,
         "model_id": model_id,
-        "prompt": parsed.get("prompt") or None,
+        "prompt": prompt or parsed.get("prompt") or None,
         "include_gold": include_gold,
     }
 

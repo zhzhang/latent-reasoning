@@ -64,6 +64,9 @@ JUDGE_MODEL_ALIASES: dict[str, str] = {
     "qwen3.6-35b-a3b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B-FP8",
     "qwen3.6": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "qwen3.5-122b-a10b-fp8": "Qwen/Qwen3.5-122B-A10B-FP8",
+    "qwen3.5-122b-a10b": "Qwen/Qwen3.5-122B-A10B-FP8",
+    "qwen3.5-122b": "Qwen/Qwen3.5-122B-A10B-FP8",
 }
 
 # Per-judge vLLM engine + SamplingParams (mirrors MODEL_SPECS for test takers).
@@ -449,72 +452,74 @@ def resolve_grade_judge_key(
     return compose_judge_key(label, prompt=prompt, include_gold=include_gold)
 
 
+def _canonical_format_name(value: str) -> str | None:
+    """Return ``value`` if it is a ``JUDGE_FORMATS`` key (after aliases)."""
+    name = GRADE_PROMPT_ALIASES.get(str(value or "").strip().lower(), "")
+    if not name:
+        name = str(value or "").strip().lower()
+    return name if name in JUDGE_FORMATS else None
+
+
 def parse_judge_key(key: str) -> dict[str, str]:
-    """Split ``{label}__{prompt}__{gold|nongold}`` (prompt may contain ``_``)."""
+    """Split ``{label}__{format}`` or ``{label}__{format}__{gold|nongold}``."""
     parts = [p for p in str(key or "").split("__") if p]
-    if len(parts) >= 3:
-        gold_tag = parts[-1]
+    if len(parts) >= 3 and parts[-1].lower() in {"gold", "nongold"}:
+        tag = parts[-1]
         prompt = parts[-2]
         model = "__".join(parts[:-2])
+    elif len(parts) >= 2:
+        tag = ""
+        prompt = parts[-1]
+        model = "__".join(parts[:-1])
+        fmt_name = _canonical_format_name(prompt)
+        if fmt_name:
+            prompt = fmt_name
+            tag = gold_tag(JUDGE_FORMATS[fmt_name].include_gold)
+    else:
         return {
-            "label": str(key),
-            "model": model,
-            "prompt": prompt,
-            "gold_tag": gold_tag,
+            "label": str(key or ""),
+            "model": str(key or ""),
+            "prompt": "",
+            "gold_tag": "",
         }
+    fmt_name = _canonical_format_name(prompt)
+    if fmt_name:
+        prompt = fmt_name
     return {
-        "label": str(key or ""),
-        "model": str(key or ""),
-        "prompt": "",
-        "gold_tag": "",
+        "label": str(key),
+        "model": model,
+        "prompt": prompt,
+        "gold_tag": tag,
     }
 
 
 def judge_mode_bucket(judge_key: str, entry: dict | None = None) -> str | None:
-    """Map a verdict to a ``JUDGE_FORMATS`` key.
+    """Map a verdict to a ``JUDGE_FORMATS`` key, or ``None``.
 
-    Prefer the stored ``prompt`` / key slot so named gold recipes are not
-    folded into ``with_gt`` just because gold is shown.
+    Only the stored ``prompt`` / key format slot counts. Gold/nongold
+    suffixes are not a fallback — unknown recipes stay unbucketed.
     """
-    prompt = ""
     if isinstance(entry, dict):
-        prompt = str(entry.get("prompt") or "").strip().lower()
-        prompt = GRADE_PROMPT_ALIASES.get(prompt, prompt)
-        if prompt in JUDGE_FORMATS:
-            return prompt
+        found = _canonical_format_name(str(entry.get("prompt") or ""))
+        if found:
+            return found
     parsed = parse_judge_key(judge_key)
-    slot = GRADE_PROMPT_ALIASES.get(parsed["prompt"].lower(), parsed["prompt"].lower())
-    if slot in JUDGE_FORMATS:
-        return slot
-    if isinstance(entry, dict):
-        if entry.get("include_gold") is True:
-            return "with_gt"
-        if entry.get("include_gold") is False:
-            return "free"
-    gold_tag = parsed["gold_tag"].lower()
-    if gold_tag == "nongold":
-        return "free"
-    if gold_tag == "gold":
-        return "with_gt"
-    key = str(judge_key or "")
-    if key.endswith("__nongold"):
-        return "free"
-    if key.endswith("__gold"):
-        return "with_gt"
-    return None
+    found = _canonical_format_name(parsed["prompt"])
+    if found:
+        return found
+    return _canonical_format_name(str(judge_key or ""))
 
 
 def accuracy_mode_names(payload: dict | None = None) -> list[str]:
-    """Ordered accuracy buckets: ``JUDGE_FORMATS`` keys, then any extra tables."""
+    """``JUDGE_FORMATS`` keys, optionally only those with a non-empty table."""
     names = list(grade_prompt_names())
     if not isinstance(payload, dict):
         return names
-    for key, value in payload.items():
-        if key in ACCURACY_META_KEYS or key in names:
-            continue
-        if isinstance(value, dict):
-            names.append(str(key))
-    return names
+    return [
+        name
+        for name in names
+        if isinstance(payload.get(name), dict) and payload[name]
+    ]
 
 
 def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
@@ -643,77 +648,7 @@ class JudgeFormat:
 
 # Named formats. Edit this table — not the builders.
 JUDGE_FORMATS: dict[str, JudgeFormat] = {
-    "answer_match_no_audio": JudgeFormat(
-        prompt=(
-            "Your task is to judge whether the given response to an audio question "
-            "matches a given ground truth answer or not. You are provided with a "
-            "question about an audio clip, a ground truth response, and the candidate response "
-            "you need to judge.\n"
-            'For a response to "match", it must have at least as much information '
-            "as the ground-truth. \n"
-            "The response can have more information than the ground-truth. It can "
-            'be more specific (for example, "Labrador" is more specific than "dog"), '
-            "or have additional possible correct answers. But it must cover everything "
-            "mentioned in the ground-truth. It is okay if it covers it in different "
-            "words, i.e. paraphrased. \n"
-            "For numeric answers, the relative error, defined as |response - ground "
-            "truth| / mean(response, ground truth), must be less than 1% for the "
-            "response to be judged as a correct match. Here, if the ground truth is "
-            "a specific numeric quantity but the response is a range, then they don't "
-            "match (even if the range contains the ground truth).\n"
-            "\n"
-            "Possible judgments:\n"
-            "\n"
-            '"Correct": The response does not match the ground-truth answer.\n'
-            '"Incorrect": The response matches the ground-truth.'
-        ),
-        closer=(
-            "Your job is to ONLY check whether the given response matches the ground "
-            "truth answer or not in the context of the question. You DO NOT NEED to "
-            "assess the correctness of the response. This is part of an automated "
-            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
-            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
-            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
-        ),
-        audio_included=False,
-        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
-    ),
-    "answer_match_with_audio": JudgeFormat(
-        prompt=(
-            "Your task is to judge whether the given response to an audio question "
-            "matches a given ground truth answer or not. You are provided with an audio clip, a "
-            "question about an audio clip, a ground truth response, and the candidate response "
-            "you need to judge.\n"
-            'For a response to "match", it must have at least as much information '
-            "as the ground-truth. \n"
-            "The response can have more information than the ground-truth. It can "
-            'be more specific (for example, "Labrador" is more specific than "dog"), '
-            "or have additional possible correct answers. But it must cover everything "
-            "mentioned in the ground-truth. It is okay if it covers it in different "
-            "words, i.e. paraphrased. \n"
-            "For numeric answers, the relative error, defined as |response - ground "
-            "truth| / mean(response, ground truth), must be less than 1% for the "
-            "response to be judged as a correct match. Here, if the ground truth is "
-            "a specific numeric quantity but the response is a range, then they don't "
-            "match (even if the range contains the ground truth).\n"
-            "\n"
-            "Possible judgments:\n"
-            "\n"
-            '"Correct": The response does not match the ground-truth answer.\n'
-            '"Incorrect": The response matches the ground-truth.'
-        ),
-        closer=(
-            "Your job is to ONLY check whether the given response matches the ground "
-            "truth answer or not in the context of the question. You DO NOT NEED to "
-            "assess the correctness of the response. This is part of an automated "
-            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
-            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
-            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
-        ),
-        audio_included=True,
-        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
-    ),
-    "pure_judge": JudgeFormat(
+    "judge_no_gt": JudgeFormat(
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
@@ -740,32 +675,59 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
     ),
-    "free": JudgeFormat(
+    "judge_with_gt": JudgeFormat(
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
-            "clip, and the response you are judging.\n"
+            "clip, and the candidate response you are judging.\n"
             "Possible judgments:\n"
-            '"0": The response is incorrect. \n'
-            '"1": The response is correct.'
+            "\n"
+            '"Correct": The response does not match the ground-truth answer.\n'
+            '"Incorrect": The response matches the ground-truth.'
         ),
         closer=(
-            "The response should fully answer the question and must not be vague.\n"
-            "For numeric answers, the relative error, defined as |response - ground "
-            "truth| / mean(response, ground truth), must be less than 1% for the "
-            "response to be judged as a correct match. Here, if the ground truth is "
-            "a specific numeric quantity but the response is a range, then they don't "
-            "match (even if the range contains the ground truth).\n"
+            "The response can have more information than what you believe is a sufficient answer. It can "
+            'be more specific (for example, "Labrador" is more specific than "dog"), '
+            "or have additional possible correct answers. But it must cover everything "
+            "you believe is needed to satisfy what the question is asking. It is okay if it covers it in different "
+            "words, i.e. paraphrased, but it is not ok if you think the answer is too vague, incomplete, or indecisive.\n"
+            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for."
             "\n"
             "To the best of your knowledge: Does the provided response answer the "
             "question correctly, given the audio? This is part of an automated "
-            'evaluation process, therefore you MUST OUTPUT your final answer as "0" '
-            'or "1" in <answer> </answer> tags.\n'
-            "Think step by step and end your response with <answer>0</answer> OR "
-            "<answer>1</answer> TAGS."
+            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
+            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
         ),
         audio_included=True,
-        field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
+    ),
+    "judge_with_gt_no_audio": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "is correct or not. You are given an audio clip, a question about that "
+            "clip, and the candidate response you are judging.\n"
+            "Possible judgments:\n"
+            "\n"
+            '"Correct": The response does not match the ground-truth answer.\n'
+            '"Incorrect": The response matches the ground-truth.'
+        ),
+        closer=(
+            "The response can have more information than what you believe is a sufficient answer. It can "
+            'be more specific (for example, "Labrador" is more specific than "dog"), '
+            "or have additional possible correct answers. But it must cover everything "
+            "you believe is needed to satisfy what the question is asking. It is okay if it covers it in different "
+            "words, i.e. paraphrased, but it is not ok if you think the answer is too vague, incomplete, or indecisive.\n"
+            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for."
+            "\n"
+            "To the best of your knowledge: Does the provided response answer the "
+            "question correctly, given the audio? This is part of an automated "
+            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
+            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+        ),
+        audio_included=False,
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
     "with_gt": JudgeFormat(
         prompt=(
@@ -801,6 +763,42 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "<answer>1</answer> TAGS."
         ),
         audio_included=False,
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
+    ),
+    "with_gt_with_audio": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "matches a given ground truth answer or not. You are provided with a "
+            "question about an audio clip, a ground truth response, and the response "
+            "you need to judge.\n"
+            'For a response to "match", it must have at least as much information '
+            "as the ground-truth. \n"
+            "The response can have more information than the ground-truth. It can "
+            'be more specific (for example, "Labrador" is more specific than "dog"), '
+            "or have additional possible correct answers. But it must cover everything "
+            "mentioned in the ground-truth. It is okay if it covers it in different "
+            "words, i.e. paraphrased. \n"
+            "For numeric answers, the relative error, defined as |response - ground "
+            "truth| / mean(response, ground truth), must be less than 1% for the "
+            "response to be judged as a correct match. Here, if the ground truth is "
+            "a specific numeric quantity but the response is a range, then they don't "
+            "match (even if the range contains the ground truth).\n"
+            "\n"
+            "Possible judgments:\n"
+            "\n"
+            '"0": The response does not match the ground-truth answer.\n'
+            '"1": The response matches the ground-truth.'
+        ),
+        closer=(
+            "Your job is to ONLY check whether the given response matches the ground "
+            "truth answer or not in the context of the question. You DO NOT NEED to "
+            "assess the correctness of the response. This is part of an automated "
+            'evaluation process, therefore you MUST OUTPUT your final answer as "0" '
+            'or "1" in <answer> </answer> tags.\n'
+            "Think step by step and end your response with <answer>0</answer> OR "
+            "<answer>1</answer> TAGS."
+        ),
+        audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
     "free": JudgeFormat(
@@ -962,6 +960,9 @@ def build_grade_gold_prefix(
 # keyword fallbacks. Soft whole-region fallback stays narrow so prose like
 # "correct in meaning" does not count as a verdict. After that, the last
 # non-empty line is scanned for exclusive ``correct`` / ``incorrect``.
+# af-next-think last resort: last post-think line exactly ``<t>0</t>`` / ``<t>1</t>``.
+AF_NEXT_T_PASS = "<t>1</t>"
+AF_NEXT_T_FAIL = "<t>0</t>"
 ANSWER_TAG_RE = re.compile(
     r"<answer>\s*(0|1|correct|incorrect|pass|fail|yes|no|true|false|wrong)\s*</answer>",
     re.IGNORECASE,
@@ -1078,6 +1079,23 @@ def _verdict_from_text(snippet: str) -> bool | None:
     return None
 
 
+def _af_next_t_tag_last_line_verdict(region: str) -> bool | None:
+    """Exact ``<t>0</t>`` / ``<t>1</t>`` on the last post-think line only.
+
+    af-next-think sometimes writes timestamp tags instead of ``<answer>``.
+    Any other last-line text (including near-misses) is a miss.
+    """
+    lines = [line.strip() for line in (region or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    last = lines[-1]
+    if last == AF_NEXT_T_PASS:
+        return True
+    if last == AF_NEXT_T_FAIL:
+        return False
+    return None
+
+
 def majority_grade_verdict(verdicts: list[bool | None]) -> bool | None:
     """Strict majority over ``len(verdicts)`` slots. Unparsed shots do not vote."""
     n = len(verdicts)
@@ -1101,7 +1119,9 @@ def parse_grade_verdict(text: str) -> bool | None:
     ``incorrect`` is matched before ``correct`` so a last-line ``Incorrect``
     is never read as ``Correct``. If every earlier parser fails, the last
     non-empty line is scanned for ``correct`` / ``incorrect`` (case
-    insensitive); both tokens on that line is a parse failure.
+    insensitive); both tokens on that line is a parse failure. Last of all,
+    af-next-think ``<t>0</t>`` / ``<t>1</t>`` is accepted only when that is
+    the entire last post-think line.
     """
     text = (text or "").strip()
     if not text:
@@ -1112,7 +1132,7 @@ def parse_grade_verdict(text: str) -> bool | None:
         verdict = _verdict_from_text(snippet)
         if verdict is not None:
             return verdict
-    return None
+    return _af_next_t_tag_last_line_verdict(region)
 
 
 def format_grade_output(verdict: bool | None) -> str | None:
@@ -1410,13 +1430,23 @@ def _suite_label_for(model_id: str) -> str | None:
     return None
 
 
+def _suite_hears_audio(label: str | None) -> bool:
+    """True when a MODEL_SPECS label is an audio model (not text_only)."""
+    if not label:
+        return False
+    from mmar_models import MODEL_SPECS
+
+    spec = MODEL_SPECS.get(label) or {}
+    return not spec.get("text_only")
+
+
 def judge_is_audio_model(
     model_id: str | None = None,
     handle: dict[str, Any] | None = None,
 ) -> bool:
     """True when this judge can hear MMAR audio (MODEL_SPECS or API)."""
     if handle and handle.get("suite_label"):
-        return True
+        return _suite_hears_audio(str(handle.get("suite_label") or ""))
     if handle and handle.get("backend") in {"openai", "gemini"}:
         return True
     keys = [
@@ -1425,7 +1455,7 @@ def judge_is_audio_model(
         (handle or {}).get("model_id"),
         model_id,
     ]
-    if any(_suite_label_for(str(key or "")) is not None for key in keys):
+    if any(_suite_hears_audio(_suite_label_for(str(key or ""))) for key in keys):
         return True
     from mmar_api import is_api_judge
 
@@ -1795,12 +1825,6 @@ _QWEN3_NONGOLD_AUDIO_TEMPLATE = (
 NONGOLD_AUDIO_PROMPT_TEMPLATES: dict[str, str] = {
     "qwen3-omni": _QWEN3_NONGOLD_AUDIO_TEMPLATE,
     "qwen3-omni-instruct": _QWEN3_NONGOLD_AUDIO_TEMPLATE,
-    "qwen2.5-omni-7b": (
-        "<|im_start|>system\n{system}\n{instructions}<|im_end|>\n"
-        "<|im_start|>user\n"
-        "<|audio_bos|><|AUDIO|><|audio_eos|>{fields}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    ),
     "phi-4-multimodal": (
         "<|user|>{instructions}<|audio_1|>{fields}<|end|><|assistant|>"
     ),
@@ -1858,10 +1882,6 @@ def _adapt_judge_instructions(label: str, instructions: str) -> str:
 
 def _nongold_audio_system_text(label: str) -> str:
     """Model system prompt interpolated into templates that have ``{system}``."""
-    if label == "qwen2.5-omni-7b":
-        from mmar_models import QWEN25_OMNI_SYSTEM
-
-        return QWEN25_OMNI_SYSTEM
     if label == "af-next-think":
         from mmar_models import AF_NEXT_SYSTEM
 

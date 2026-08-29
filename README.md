@@ -25,7 +25,6 @@ GPU type still comes from each `MODEL_SPECS` entry.
 | `music-flamingo` | `nvidia/music-flamingo-think-2601-hf` | vLLM 0.28 MusicFlamingo (HF fallback); `T=0.7, top_p=0.9, max_tokens=2048` |
 | `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.28 thinker-only (B200); `T=0.6, top_p=0.95, top_k=20, max_tokens=16384` |
 | `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.28 Mistral audio (B200); `T=0.2, top_p=0.95, max_tokens=2048` |
-| `qwen2.5-omni-7b` | `Qwen/Qwen2.5-Omni-7B` | vLLM 0.28 (L40S) |
 | `phi-4-multimodal` | `microsoft/Phi-4-multimodal-instruct` | vLLM 0.28 + speech LoRA (L40S) |
 | `gemma-4-e4b` | `google/gemma-4-E4B-it` | vLLM 0.28 chat (B200) |
 | `gemma-4-12b` | `google/gemma-4-12B-it` | vLLM 0.28 chat (B200) |

@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from aggregate import order_model_labels
+from aggregate import order_model_labels, is_dropped_model
 from grader import (
     accuracy_mode_names,
     grade_mode_title,
@@ -260,6 +260,8 @@ def load_pack_predictions(pack_dir: Path) -> dict[str, dict[str, dict[str, Any]]
     if not models_root.is_dir():
         return predictions
     for child in sorted(models_root.iterdir()):
+        if is_dropped_model(child.name):
+            continue
         pred_path = child / "predictions.jsonl"
         if not child.is_dir() or not pred_path.is_file():
             continue
@@ -283,7 +285,7 @@ def _collect_judge_keys(
     seen: set[str] = set()
 
     def _add(key: str) -> None:
-        if key and key not in seen:
+        if key and key not in seen and not is_dropped_model(key):
             seen.add(key)
             ordered.append(key)
 
@@ -387,8 +389,16 @@ def load_bundle(
         labels_path = pack_dir / LABELS_CSV_NAME
     generations_path = exports_dir / GENERATIONS_CSV_NAME
 
-    label_rows = load_label_rows(labels_path)
-    gen_rows = load_generation_rows(generations_path)
+    label_rows = [
+        row
+        for row in load_label_rows(labels_path)
+        if not is_dropped_model(str(row.get("model_label") or ""))
+    ]
+    gen_rows = [
+        row
+        for row in load_generation_rows(generations_path)
+        if not is_dropped_model(str(row.get("model_label") or ""))
+    ]
     gens: dict[tuple[str, str, int], dict[str, Any]] = {}
     gens_by_id: dict[str, dict[str, Any]] = {}
     for row in gen_rows:
@@ -1004,7 +1014,6 @@ function shortLabel(label) {
     "interactive-omni-8b": "i-omni",
     "qwen3-omni": "qwen3",
     "qwen3-omni-instruct": "qwen3-i",
-    "qwen2.5-omni-7b": "qwen2.5",
     "voxtral-small-24b": "voxtral",
     "phi-4-multimodal": "phi-4",
     "gemma-4-e4b": "gemma-e4b",

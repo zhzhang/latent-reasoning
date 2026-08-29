@@ -166,35 +166,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
-    # CONFIRMED non-thinking model.
-    # Dense 7B thinker-only. Card generate() passes no sampler (greedy);
-    # generation_config.json has none either. T=0.2 keeps n-shot variance.
-    # https://huggingface.co/Qwen/Qwen2.5-Omni-7B
-    "qwen2.5-omni-7b": {
-        "model_id": "Qwen/Qwen2.5-Omni-7B",
-        "gpu": "L40S",
-        "backend": "vllm",
-        "engine": {
-            "dtype": "bfloat16",
-            "max_model_len": 8192,
-            "max_num_seqs": 64,
-            "max_num_batched_tokens": 8192,
-            "limit_mm_per_prompt": {"audio": 1},
-            "enforce_eager": False,
-            "trust_remote_code": True,
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",
-            "async_scheduling": True,
-        },
-        "sampling": {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.05,
-        },
-    },
     # CONFIRMED non-thinking
     # 5.6B; speech LoRA lives next to the checkpoint. Card uses
     # GenerationConfig.from_pretrained + max_new_tokens=1000 (greedy).
@@ -381,6 +352,49 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "repetition_penalty": 1.0,
         },
     },
+    # Text-only VL MoE (122B / 10B active), native block-wise FP8. No audio
+    # encoder; language_model_only skips the vision tower so a single B200
+    # (~180 GiB) can hold the ~122 GiB weights plus KV.
+    # https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8
+    # Card thinking/general: T=1.0, top_p=0.95, top_k=20, presence_penalty=1.5.
+    # generation_config.json is T=0.6 (coding); we use the general recipe.
+    # "qwen3.5-122b-a10b-fp8": {
+    #     "model_id": "Qwen/Qwen3.5-122B-A10B-FP8",
+    #     "gpu": "B200",
+    #     "backend": "vllm_chat",
+    #     "text_only": True,
+    #     "engine": {
+    #         "dtype": "auto",
+    #         "max_model_len": 16384,
+    #         # 12 full-attn layers × 2 kv × 256 × 2 × 2B ≈ 24 KiB/tok. B200
+    #         # 180×0.90 − ~122 GiB FP8 weights ⇒ ~40 GiB KV ≈ 1.6M tokens.
+    #         # 64 seqs × 16k sits under that; 16k batched tokens for prefill.
+    #         "max_num_seqs": 64,
+    #         "max_num_batched_tokens": 16384,
+    #         "enforce_eager": False,
+    #         "trust_remote_code": True,
+    #         "enable_prefix_caching": True,
+    #         "gpu_memory_utilization": 0.90,
+    #         "disable_log_stats": False,
+    #         "attention_backend": "flashinfer",
+    #         # FlashInfer fp8_gemm autotune segfaults on B200 (cuBLAS bmm_fp8;
+    #         # vllm#39814). CUTLASS SM100 default is used instead.
+    #         "enable_flashinfer_autotune": False,
+    #         "async_scheduling": True,
+    #         "language_model_only": True,
+    #     },
+    #     "native_thinking": True,
+    #     "enable_thinking": True,
+    #     "reasoning_parser": "qwen3",
+    #     "sampling": {
+    #         "temperature": 1.0,
+    #         "top_p": 0.95,
+    #         "top_k": 20,
+    #         "presence_penalty": 1.5,
+    #         "max_tokens": 8192,
+    #         "repetition_penalty": 1.0,
+    #     },
+    # },
 }
 
 ALL_MODEL_LABELS = tuple(MODEL_SPECS.keys())
@@ -663,7 +677,6 @@ def _vllm_prompt_fn(label: str, args: SimpleNamespace) -> Callable[[dict], str]:
         "music-flamingo": _music_flamingo_prompt,
         "qwen3-omni": _qwen3_omni_prompt,
         "qwen3-omni-instruct": _qwen3_omni_prompt,
-        "qwen2.5-omni-7b": _qwen25_omni_prompt,
         "phi-4-multimodal": _phi4_prompt,
     }
     builder = builders.get(label, _build_prompt)
@@ -727,7 +740,7 @@ def render_prompt(
     backend = str(MODEL_SPECS[label].get("backend") or "")
 
     if backend == "vllm_chat":
-        return _format_chat_messages(_audio_text_messages(sample, ns))
+        return _format_chat_messages(_chat_messages_for(label, sample, ns))
     if backend == "vllm_voxtral":
         return _build_prompt(sample, ns)
 
@@ -813,23 +826,6 @@ def _qwen3_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str
     )
 
 
-QWEN25_OMNI_SYSTEM = (
-    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
-    "capable of perceiving auditory and visual inputs, as well as generating "
-    "text and speech."
-)
-
-
-def _qwen25_omni_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
-    question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
-    return (
-        f"<|im_start|>system\n{QWEN25_OMNI_SYSTEM}<|im_end|>\n"
-        "<|im_start|>user\n"
-        f"<|audio_bos|><|AUDIO|><|audio_eos|>{question}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-
-
 def _phi4_prompt(sample: dict, args: SimpleNamespace | None = None) -> str:
     question = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
     return f"<|user|><|audio_1|>{question}<|end|><|assistant|>"
@@ -851,6 +847,19 @@ def _audio_text_messages(
             ],
         }
     ]
+
+
+def _chat_messages_for(
+    label: str,
+    sample: dict,
+    args: SimpleNamespace | None = None,
+) -> list[dict]:
+    """Chat messages for ``vllm_chat``: audio+text, or text only."""
+    spec = MODEL_SPECS.get(label) or {}
+    if spec.get("text_only"):
+        prompt = _build_prompt(sample, args or SimpleNamespace(prompt_mode="mc"))
+        return [{"role": "user", "content": prompt}]
+    return _audio_text_messages(sample, args)
 
 
 # ---------------------------------------------------------------------------
@@ -1066,21 +1075,6 @@ def _load_qwen3_family(args: SimpleNamespace, *, label: str, parse_fn: Callable)
     }
 
 
-def load_qwen25_omni(args: SimpleNamespace):
-    from vllm import LLM
-
-    spec = MODEL_SPECS["qwen2.5-omni-7b"]
-    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
-    engine = _apply_engine_overrides(spec["engine"], args)
-    llm = LLM(model=local_id, **engine)
-    print(f"Qwen2.5-Omni vLLM thinker ready from {local_id} engine={engine}")
-    return {
-        "backend": "vllm",
-        "llm": llm,
-        "parse_fn": parse_choice_output,
-    }
-
-
 def load_phi4_multimodal(args: SimpleNamespace):
     from vllm import LLM
     from vllm.lora.request import LoRARequest
@@ -1136,6 +1130,31 @@ def load_nemotron_omni(args: SimpleNamespace):
         "llm": llm,
         "parse_fn": parse_think_tagged_output,
         "chat_kwargs": chat_kwargs_for("nemotron-3-nano-omni"),
+    }
+
+
+def load_qwen35_122b(args: SimpleNamespace):
+    """Qwen3.5-122B-A10B-FP8 text-only (skip vision tower)."""
+    from vllm import LLM
+
+    label = "qwen3.5-122b-a10b-fp8"
+    local_id = resolve_model_dir(args.model_id, getattr(args, "local_model_dir", None))
+    engine = engine_kwargs_for(label, args)
+    llm_kwargs = dict(engine)
+    try:
+        llm = LLM(model=local_id, **llm_kwargs)
+    except TypeError as exc:
+        if not llm_kwargs.get("language_model_only"):
+            raise
+        print(f"[{label}] language_model_only unsupported ({exc}); retrying without it")
+        llm_kwargs.pop("language_model_only", None)
+        llm = LLM(model=local_id, **llm_kwargs)
+    print(f"{label} vLLM chat ready from {local_id} engine={llm_kwargs}")
+    return {
+        "backend": "vllm_chat",
+        "llm": llm,
+        "parse_fn": parse_think_tagged_output,
+        "chat_kwargs": chat_kwargs_for(label),
     }
 
 
@@ -1352,7 +1371,7 @@ def generate_batch(
         return results
 
     if backend == "vllm_chat":
-        messages = [_audio_text_messages(sample, args) for sample in samples]
+        messages = [_chat_messages_for(label, sample, args) for sample in samples]
         sampling = [
             _sampling_params_for_request(label, args, seed, n=n_completions)
             for seed in seeds
@@ -1432,12 +1451,12 @@ _LOADERS = {
     "music-flamingo": load_music_flamingo,
     "qwen3-omni": load_qwen3_omni,
     "qwen3-omni-instruct": load_qwen3_omni_instruct,
-    "qwen2.5-omni-7b": load_qwen25_omni,
     "phi-4-multimodal": load_phi4_multimodal,
     "gemma-4-e4b": load_gemma_4_e4b,
     "gemma-4-12b": load_gemma_4_12b,
     "nemotron-3-nano-omni": load_nemotron_omni,
     "voxtral-small-24b": load_voxtral,
+    "qwen3.5-122b-a10b-fp8": load_qwen35_122b,
 }
 
 
@@ -1631,7 +1650,7 @@ def generate_raw_trace(
             prompt_fallback = str(outputs[0].prompt)
 
     elif backend == "vllm_chat":
-        messages = [_audio_text_messages(sample, args)]
+        messages = [_chat_messages_for(label, sample, args)]
         sampling = [_sampling_params_for_request(label, args, seed, n=1)]
         chat_kwargs = dict(chat_kwargs_for(label, args))
         outputs = handle["llm"].chat(messages, sampling_params=sampling, **chat_kwargs)

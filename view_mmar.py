@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from aggregate import MODEL_LABEL_ORDER
+from aggregate import MODEL_LABEL_ORDER, is_dropped_model
 from collate_mmar_freeform import ALL_API_LABELS
 from mmar_common import (
     ASSISTANT_THINK_OPEN,
@@ -136,14 +136,6 @@ SAMPLING_SOURCES: dict[str, dict[str, str]] = {
         "url": "https://huggingface.co/mistralai/Voxtral-Small-24B-2507",
         "label": "Hugging Face model card",
         "note": "Card recommends temperature=0.2 and top_p=0.95 for audio-understanding chat.",
-    },
-    "qwen2.5-omni-7b": {
-        "url": "https://huggingface.co/Qwen/Qwen2.5-Omni-7B",
-        "label": "Hugging Face model card",
-        "note": (
-            "Official eval is greedy (generation_config has no sampler). "
-            "T=0.2 added for n-shot variance."
-        ),
     },
     "phi-4-multimodal": {
         "url": "https://huggingface.co/microsoft/Phi-4-multimodal-instruct",
@@ -277,20 +269,6 @@ BENCHMARK_SCORES: dict[str, dict[str, dict[str, Any]]] = {
             "score": 77.5,
             "split": "v05.15.25",
             "url": "https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "label": "Hugging Face model card",
-        },
-    },
-    "qwen2.5-omni-7b": {
-        "mmar": {
-            "score": 56.7,
-            "split": "overall",
-            "url": "https://github.com/ddlBoJack/MMAR",
-            "label": "MMAR leaderboard",
-        },
-        "mmau": {
-            "score": 65.60,
-            "split": "avg",
-            "url": "https://huggingface.co/Qwen/Qwen2.5-Omni-7B",
             "label": "Hugging Face model card",
         },
     },
@@ -505,7 +483,8 @@ def discover_model_labels(pack_dir: Path, manifest: dict[str, Any] | None = None
         for child in sorted(models_root.iterdir()):
             pred = child / "predictions.jsonl"
             if child.is_dir() and pred.is_file() and pred.stat().st_size > 0:
-                found.append(child.name)
+                if not is_dropped_model(child.name):
+                    found.append(child.name)
     if not found and manifest:
         found = [str(label) for label in (manifest.get("models") or []) if label]
     return order_model_labels(found)
@@ -1090,11 +1069,6 @@ def build_model_prompts(item: dict[str, Any]) -> dict[str, str]:
             "<|im_start|>assistant\n"
         ),
         "qwen3-omni-instruct": (
-            "<|im_start|>user\n"
-            f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        ),
-        "qwen2.5-omni-7b": (
             "<|im_start|>user\n"
             f"<|audio_start|><|audio_pad|><|audio_end|>{base}<|im_end|>\n"
             "<|im_start|>assistant\n"
@@ -2126,7 +2100,6 @@ function shortLabel(label) {
     "interactive-omni-8b": "i-omni",
     "qwen3-omni": "qwen3",
     "qwen3-omni-instruct": "qwen3-i",
-    "qwen2.5-omni-7b": "qwen2.5",
     "voxtral-small-24b": "voxtral",
     "phi-4-multimodal": "phi-4",
     "gemma-4-e4b": "gemma-e4b",
