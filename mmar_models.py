@@ -73,8 +73,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "enforce_eager": False,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (B200): 155.51 GiB
-            "kv_cache_memory_bytes": 166977664512,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
@@ -89,44 +87,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "top_p": 1.0,
             "max_tokens": 2048,
             "repetition_penalty": 1.2,
-        },
-    },
-    # CONFIRMED
-    # https://huggingface.co/nvidia/music-flamingo-think-2601-hf
-    "music-flamingo": {
-        "model_id": "nvidia/music-flamingo-think-2601-hf",
-        "gpu": "B200",
-        "backend": "vllm",
-        "engine": {
-            "dtype": "bfloat16",
-            "max_model_len": 8192,
-            # Same architecture-name remap as af-next-think (see that comment).
-            "hf_overrides": {
-                "architectures": ["AudioFlamingo3ForConditionalGeneration"],
-            },
-            # Same Qwen2.5-7B backbone as af-next-think; see that KV math.
-            "max_num_seqs": 512,
-            "max_num_batched_tokens": 32768,
-            "limit_mm_per_prompt": {"audio": 1},
-            "enforce_eager": False,
-            "enable_prefix_caching": True,
-            "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (B200): 155.8 GiB
-            "kv_cache_memory_bytes": 167293785600,
-            "disable_log_stats": False,
-            "attention_backend": "flashinfer",
-            "async_scheduling": True,
-        },
-        # Native CoT when the assistant turn is prefilled with ``<think>``.
-        # generation_config.json is greedy (max_new_tokens=2048). T=0.2 is for
-        # n-shot variance; the card's optional example uses T=0.7, top_p=0.9.
-        "native_thinking": True,
-        "enable_thinking": True,
-        "sampling": {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "max_tokens": 2048,
-            "repetition_penalty": 1.0,
         },
     },
     # CONFIRMED
@@ -152,8 +112,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "trust_remote_code": True,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (B200): 113.15 GiB
-            "kv_cache_memory_bytes": 121496548352,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
@@ -196,8 +154,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "enforce_eager": False,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (B200): 123.62 GiB
-            "kv_cache_memory_bytes": 132736788992,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",  # best for throughput
             "async_scheduling": True,  # usually faster, but not all features supported
@@ -228,8 +184,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "trust_remote_code": True,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (L40S): 25.22 GiB
-            "kv_cache_memory_bytes": 27081391104,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",
             "async_scheduling": True,
@@ -263,8 +217,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "max_loras": 1,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (L40S): 32.34 GiB
-            "kv_cache_memory_bytes": 34720343040,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",
             "async_scheduling": True,
@@ -295,8 +247,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "enforce_eager": False,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (B200): 156.66 GiB
-            "kv_cache_memory_bytes": 168208160256,
             "disable_log_stats": False,
             # Gemma-4 head_size is unsupported by FLASH_ATTN. FlashInfer JIT
             # targets sm100+ (B200); keep Triton — hybrid k_eq_v / global
@@ -338,8 +288,6 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "enforce_eager": False,
             "enable_prefix_caching": True,
             "gpu_memory_utilization": 0.95,
-            # compile-cache fully-utilize rec (B200): 151.48 GiB
-            "kv_cache_memory_bytes": 162650778624,
             "disable_log_stats": False,
             # Gemma-4 head_size is unsupported by FLASH_ATTN. FlashInfer JIT
             # targets sm100+ (B200); keep Triton — hybrid k_eq_v / global
@@ -414,6 +362,9 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "gpu_memory_utilization": 0.95,
             "disable_log_stats": False,
             "attention_backend": "flashinfer",
+            # FlashInfer fp8_gemm autotune segfaults on B200 (cuBLAS bmm_fp8;
+            # vllm#39814). CUTLASS SM100 default is used instead.
+            "enable_flashinfer_autotune": False,
             "async_scheduling": True,
             "allowed_local_media_path": "/",
         },
@@ -1042,8 +993,6 @@ def _apply_engine_overrides(engine: dict, args: SimpleNamespace) -> dict:
         out["max_num_seqs"] = int(args.max_num_seqs)
     if getattr(args, "gpu_memory_utilization", None):
         out["gpu_memory_utilization"] = float(args.gpu_memory_utilization)
-        # Fraction override must win over a pinned KV-cache byte budget.
-        out.pop("kv_cache_memory_bytes", None)
     if getattr(args, "max_model_len", None):
         out["max_model_len"] = int(args.max_model_len)
     if getattr(args, "enforce_eager", None) is not None:

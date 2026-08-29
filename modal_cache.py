@@ -53,6 +53,11 @@ VLLM_WHEEL_INDEX = f"https://wheels.vllm.ai/{VLLM_GIT_SHA}"
 # importing torch / vLLM / triton.
 COMPILE_CACHE_ROOT = VOLUME_MOUNT / "vllm"
 
+# FlashInfer TRT-LLM cubins are version-keyed (one tree per flashinfer-python),
+# not per model. Baked into eval_image at /opt/flashinfer/cubins so every GPU
+# container skips the NVIDIA CDN fetch that otherwise hits /root/.cache.
+FLASHINFER_IMAGE_CUBIN_DIR = Path("/opt/flashinfer/cubins")
+
 
 def compile_cache_dir(model_label: str) -> Path:
     return COMPILE_CACHE_ROOT / model_label
@@ -90,6 +95,10 @@ def configure_compile_cache(model_label: str) -> Path | None:
     os.environ["TORCH_EXTENSIONS_DIR"] = str(subdirs["torch_extensions"])
     os.environ["FLASHINFER_CACHE_DIR"] = str(subdirs["flashinfer"])
     os.environ["FLASHINFER_WORKSPACE_DIR"] = str(subdirs["flashinfer"])
+    # Cubins are shared across models and live on the image. FLASHINFER_CUBIN_DIR
+    # is resolved at flashinfer import; keep it off the per-model volume.
+    if FLASHINFER_IMAGE_CUBIN_DIR.is_dir():
+        os.environ["FLASHINFER_CUBIN_DIR"] = str(FLASHINFER_IMAGE_CUBIN_DIR)
     print(f"[{model_label}] compile cache -> {root}")
     return root
 

@@ -8,34 +8,40 @@ Prompts are question-only (no multiple-choice options). Generation is
 `run_experiment.py`; grading is a separate pipeline (`run_judges.py`).
 The first judge is **primary** and drives difficulty ranking.
 
-Inference uses **offline** vLLM (`LLM.generate` / Omni) with continuous
+Inference uses **offline** vLLM (`LLM.generate`) with continuous
 batching — not an OpenAI-compatible server. `n_shots` means independent
 temperature **samples** of the same zero-shot prompt (not few-shot ICL).
 Plain vLLM forks those samples with `SamplingParams(n=...)` so they share
-one prefill; Omni/HF duplicate the prompt per shot and rely on prefix caching.
+one prefill; HF fallbacks duplicate the prompt per shot and rely on prefix caching.
+
+All eval workers share one vLLM 0.28.0 container (`modal_images.eval_image`).
+GPU type still comes from each `MODEL_SPECS` entry.
 
 ## Models
 
 | Label | Checkpoint | Backend |
 |-------|------------|---------|
-| `af-next-think` | `nvidia/audio-flamingo-next-think-hf` | vLLM 0.24 MusicFlamingo (HF fallback); `T=0.2, max_tokens=2048, rep=1.2` |
-| `mimo-audio-7b` | `XiaomiMiMo/MiMo-Audio-7B-Instruct` (+ tokenizer) | vLLM-Omni; `T=0.3, top_p=0.95, max_tokens=512, rep=1.1` |
-| `interactive-omni-8b` | `sensenova/InteractiveOmni-8B` | HF `.chat` (vLLM transformers backend incompatible); `T=1.0, max_tokens=1024` |
-| `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.28 thinker-only (A100-80GB); `T=0.6, top_p=0.95, top_k=20, max_tokens=2048` |
-| `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.28 Mistral audio (A100-80GB); `T=0.2, top_p=0.95, max_tokens=512` |
+| `af-next-think` | `nvidia/audio-flamingo-next-think-hf` | vLLM 0.28 MusicFlamingo (HF fallback); `T=0.2, max_tokens=2048, rep=1.2` |
+| `music-flamingo` | `nvidia/music-flamingo-think-2601-hf` | vLLM 0.28 MusicFlamingo (HF fallback); `T=0.7, top_p=0.9, max_tokens=2048` |
+| `qwen3-omni` | `Qwen/Qwen3-Omni-30B-A3B-Thinking` | vLLM 0.28 thinker-only (B200); `T=0.6, top_p=0.95, top_k=20, max_tokens=16384` |
+| `voxtral-small-24b` | `mistralai/Voxtral-Small-24B-2507` | vLLM 0.28 Mistral audio (B200); `T=0.2, top_p=0.95, max_tokens=2048` |
+| `qwen2.5-omni-7b` | `Qwen/Qwen2.5-Omni-7B` | vLLM 0.28 (L40S) |
+| `phi-4-multimodal` | `microsoft/Phi-4-multimodal-instruct` | vLLM 0.28 + speech LoRA (L40S) |
+| `gemma-4-e4b` | `google/gemma-4-E4B-it` | vLLM 0.28 chat (B200) |
+| `gemma-4-12b` | `google/gemma-4-12B-it` | vLLM 0.28 chat (B200) |
+| `nemotron-3-nano-omni` | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8` | vLLM 0.28 chat (B200) |
 
 ## Seed
 
 ```bash
 uv run modal run seed_volume.py --datasets mmar \
-  --models af-next-think,mimo-audio-7b,interactive-omni-8b,qwen3-omni,voxtral-small-24b
+  --models af-next-think,qwen3-omni,voxtral-small-24b
 
 # Freeform judge weights (add more aliases as needed)
 uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
 uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 ```
 
-`mimo-audio-7b` also seeds `XiaomiMiMo/MiMo-Audio-Tokenizer` automatically.
 Judge aliases: `qwen2.5-3b`, `qwen3.6-35b-a3b-fp8` (→ `Qwen/Qwen3.6-35B-A3B-FP8`).
 
 ## Run
@@ -73,11 +79,12 @@ writes `models/<label>/predictions.jsonl`. Grade those predictions with
 
 - All pending questions for a model go in **one** offline `generate()` call;
   vLLM continuous-batches internally (no app-level `--batch-size`).
-- Plain vLLM (`af-next`, `qwen3-omni`, `voxtral`, InteractiveOmni-vLLM): one
+- Plain vLLM (`af-next`, `qwen3-omni`, `voxtral`, Gemma, Nemotron): one
   prompt per question with `SamplingParams(n=n_shots)` so N samples share
   prefill. Seed is per question (not per shot).
-- Omni / HF: duplicate the prompt per shot; Omni regroups by shot inside the
-  adapter. Prefix caching reuses identical audio/prompt prefixes where enabled.
+- HF fallback (AF-Next / Music Flamingo if vLLM load fails): duplicate the
+  prompt per shot. Prefix caching reuses identical audio/prompt prefixes
+  where enabled.
 - **`max_num_seqs`**: set from measured average sequence length against the
   reported `GPU KV cache size`, not from `max_model_len`. PagedAttention
   allocates on demand, so this is a concurrency *cap*, not a reservation.
@@ -87,15 +94,20 @@ writes `models/<label>/predictions.jsonl`. Grade those predictions with
   Keep it close to real prompt+output length — an inflated value deflates
   vLLM's reported max concurrency and tempts a too-low `max_num_seqs`.
 - **`enforce_eager: False`**: enables torch.compile + CUDA graphs where the
-  model supports it (`af-next`, `qwen3-omni`, `voxtral`, InteractiveOmni).
+  model supports it (`af-next`, `qwen3-omni`, `voxtral`).
   vLLM 0.28 fixed Qwen3-Omni's Dynamo meta/cuda `profile_run` crash; graphs
   are on for the thinker-only path. Keep `VLLM_ENABLE_V1_MULTIPROCESSING=0`
   (in-process EngineCore) — multiprocess `profile_run` was the other
   meta/cuda failure mode.
-- **Compile cache**: `compile_cache.py` warms torch.compile / Triton / nvcc
-  artifacts per model onto `/cache/vllm/<label>/`. Later eval / smoke / judge
-  containers load that tree (`VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`,
-  `TRITON_CACHE_DIR`). CUDA graphs still recapture on each boot.
+- **Compile cache**: `compile_cache.py` attaches the existing
+  `/cache/vllm/<label>/` tree, loads the model, and runs a warmup generate
+  only on a cache miss (new or rewritten artifacts). Later eval / smoke /
+  judge containers load that tree (`VLLM_CACHE_ROOT`,
+  `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`). CUDA graphs still
+  recapture on each boot. FlashInfer TRT-LLM cubins are version-keyed (one
+  tree for the whole image, not per model) and are downloaded into
+  `/opt/flashinfer/cubins` at image build (`FLASHINFER_CUBIN_DIR`); they
+  are not stored on the compile-cache volume.
 
     ```bash
     uv run modal run --detach compile_cache.py
@@ -106,14 +118,6 @@ writes `models/<label>/predictions.jsonl`. Grade those predictions with
   and `enable_prefix_caching`. Qwen3 Thinking is decode-heavy
   (`max_tokens=2048`; measured outputs peak ~870).
 - `--max-num-seqs` / `--gpu-memory-utilization`: optional CLI escape hatches.
-- MiMo Omni YAML: Omni 0.24 still boots Token2Wav, so stage 1 stays loaded
-  (`gpu_memory_utilization: 0.25`); stage 0 gets `max_num_seqs: 16`,
-  `gpu_memory_utilization: 0.55`, and prefix caching. `enforce_eager` stays
-  true — graph capture copies a CPU tensor onto CUDA in `mimo_audio_llm.forward`.
-  Official Omni pins `max_num_seqs: 1` to mask a TTS code-batching bug;
-  text-only MMAR does not hit that path. `load_mimo_audio` sets Omni
-  `init_timeout=1800` because two-stage encoder dummy profiling exceeds
-  the 600s default.
 - Judge engines are tuned with `tune_judge.py` (see below). For the
   `qwen3.6-35b-a3b-fp8` MoE judge, `enforce_eager: False` was worth 332 →
   4,824 output tok/s on an H100; only 3B params are active per token, so
@@ -121,10 +125,10 @@ writes `models/<label>/predictions.jsonl`. Grade those predictions with
 - Watch logs for `Avg generation throughput`, `Running: N reqs`, and
   `GPU KV cache usage` (`disable_log_stats: False`). Confirm loaders print
   `vLLM ready` rather than `falling back to` HF.
-- Qwen3 fused-MoE: image build installs an `E=128,N=768` config under both
-  `NVIDIA_A100_80GB_PCIe` and `NVIDIA_A100-SXM4-80GB` names (copied from the
-  H200 bf16 stand-in; vLLM ships no A100 tune for this shape).
-- AF-Next / Qwen3 / Voxtral images keep `VLLM_ENABLE_V1_MULTIPROCESSING=0`
+- Qwen3 fused-MoE: image build installs an `E=128,N=768` config under
+  `NVIDIA_B200` (copied from the H200 bf16 stand-in when the wheel has no
+  native B200 file).
+- The shared eval image keeps `VLLM_ENABLE_V1_MULTIPROCESSING=0`
   (in-process EngineCore).
 
 ## Download + view
@@ -160,15 +164,15 @@ Open http://127.0.0.1:7862 for judge outcomes vs the human labels in
 `exports/generations.csv`, joining question text, gold answers, and audio
 from MMAR-meta. Verdicts are written to `outputs/mmar-judging` (Modal
 volume `mmar-judging`). With no `--judge-model-id`, every suite model
-grades every other pack model's shots. Pass ids to run only those judges.
-Shots that already have a verdict for the same judge key are skipped. Pass
-`--force` to replace existing verdicts.
+grades every pack model's shots, including its own. Pass ids to run only
+those judges. Shots that already have a verdict for the same judge key are
+skipped. Pass `--force` to replace existing verdicts.
 
 vLLM suite / dedicated judges run on Modal (this script starts a detached
 App). API judges (`gemini-3.7-flash`; aliases
 `gemini-3.7-mini`, `gemini`, or `api`) run locally against the
 same pack and do not start Modal. Empty `--judge-model-id` stays
-suite-only so a bare run does not spend API quota. API judges skip their own pack label (round-robin).
+suite-only so a bare run does not spend API quota.
 Default runs both `with_gt` (text, sees gold) and `free` (audio, no gold).
 `--grade-prompt` selects any key in `JUDGE_FORMATS` (comma-separated, or
 `all`). Audio is attached when that format sets `audio_included`.

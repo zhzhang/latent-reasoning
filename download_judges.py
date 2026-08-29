@@ -1,8 +1,8 @@
 """Download the judging pack from the ``mmar-judging`` Modal Volume.
 
-Writes ``outputs/mmar-judging/`` (predictions, sidecars, manifest, copied
-``labels.csv``). Human ratings and generation text for the viewer also live
-in ``exports/``.
+Fetches what ``run_judges.py --accuracy-only`` reads: ``labels.csv``,
+``manifest.json``, and each ``models/<label>/predictions.jsonl``. Sidecars
+under ``judge_partials/`` are not downloaded.
 
 Usage::
 
@@ -13,6 +13,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -42,14 +43,8 @@ def list_judges(remote_path: str = "/") -> list[str]:
     return paths
 
 
-def download_judges(
-    local_dir: str | Path = DEFAULT_LOCAL_DIR,
-    force: bool = True,
-) -> Path:
-    """Download the judging Volume root into ``local_dir``."""
-    dest = Path(local_dir).expanduser().resolve()
+def _volume_get(remote: str, dest: Path, force: bool) -> None:
     dest.mkdir(parents=True, exist_ok=True)
-
     cmd = [
         sys.executable,
         "-m",
@@ -57,14 +52,38 @@ def download_judges(
         "volume",
         "get",
         JUDGING_VOLUME_NAME,
-        "/",
+        remote,
         str(dest),
     ]
     if force:
         cmd.append("--force")
-
-    print(f"Downloading volume:{JUDGING_VOLUME_NAME}/ -> {dest}")
+    print(f"Downloading volume:{JUDGING_VOLUME_NAME}/{remote} -> {dest}")
     subprocess.run(cmd, check=True)
+
+
+def download_judges(
+    local_dir: str | Path = DEFAULT_LOCAL_DIR,
+    force: bool = True,
+) -> Path:
+    """Download ``labels.csv``, ``manifest.json``, and merged predictions."""
+    dest = Path(local_dir).expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    _volume_get("labels.csv", dest, force)
+    _volume_get("manifest.json", dest, force)
+
+    manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+    labels = [str(x) for x in (manifest.get("models") or []) if x]
+    if not labels:
+        raise SystemExit(f"No models listed in {dest / 'manifest.json'}")
+
+    for label in labels:
+        _volume_get(
+            f"models/{label}/predictions.jsonl",
+            dest / "models" / label,
+            force,
+        )
+
     print(f"Saved to {dest}")
     return dest
 

@@ -5,9 +5,10 @@ question / gold / audio from MMAR-meta, and writes the judged pack to
 ``outputs/mmar-judging`` (Modal volume ``mmar-judging``). Grades
 only questions present in ``labels.csv``. Default is both with-GT and
 no-GT recipes (one GPU load per judge). Shots that already have a
-verdict for the same judge key are skipped. Regenerates
-``difficulty.jsonl`` / ``scores.json`` after grading, then writes
-``judge_accuracy.json`` (Alt-Test Average Advantage Probability).
+verdict for the same judge key are skipped. GPU grading is
+fire-and-forget: the CPU orchestrator prepares the pack, spawns one
+GPU worker per judge, and returns. After those jobs finish, fold
+sidecars with ``--merge-only`` and score with ``--accuracy-only``.
 
 vLLM MODEL_SPECS / dedicated judges start Modal from this script. API judges
 (gemini-3.7-flash) run locally and never open an App. Batch API judges
@@ -43,11 +44,9 @@ on shots in ``exports/labels.csv`` that have all three reviewer ratings.
     # Every format in JUDGE_FORMATS
     uv run run_judges.py --grade-prompt all
 
-    # Recompute Alt-Test scores from existing local verdicts
-    uv run run_judges.py --accuracy-only
-
-    # Fold judge_partials into predictions.jsonl on the volume (no grading)
+    # After GPU jobs finish: fold sidecars, then score locally
     uv run run_judges.py --merge-only
+    uv run run_judges.py --accuracy-only
 
 Local API judges::
 
@@ -86,21 +85,26 @@ import json
 import logging
 import shutil
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import modal
 
 from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
-from alt_test import DEFAULT_EPSILON, MIN_HUMANS_PER_INSTANCE, score_binary_judge
+from alt_test import (
+    DEFAULT_EPSILON,
+    MIN_HUMANS_PER_INSTANCE,
+    llm_annotation_from_entry,
+    score_binary_judge,
+)
 from mmar_common import judge_label, load_jsonl, resolve_path, write_json, write_jsonl
 from mmar_models import ALL_MODEL_LABELS, MODEL_SPECS
 from modal_cache import (
     DEFAULT_MMAR_DATA_ROOT,
     DEFAULT_MMAR_META,
     JUDGING_MOUNT,
-    VOLUME_MOUNT,
     VLLM_WHEEL_INDEX,
+    VOLUME_MOUNT,
     hf_secret,
     judging_volume,
     volume,
@@ -117,8 +121,6 @@ INGEST_DIR_NAME = "_local_ingest"
 LABELS_CSV_NAME = "labels.csv"
 GENERATIONS_CSV_NAME = "generations.csv"
 ACCURACY_JSON_NAME = "judge_accuracy.json"
-# Temporary: drop these generation models from Alt-Test scoring.
-ACCURACY_SKIP_MODELS = frozenset({"af-next-think"})
 LOCAL_MMAR_DATA_ROOT = REPO_ROOT / "data" / "mmar"
 LOCAL_MMAR_META = LOCAL_MMAR_DATA_ROOT / "MMAR-meta.jsonl"
 
@@ -180,9 +182,7 @@ def labeled_question_ids(rows: list[dict]) -> list[str]:
 def triple_labeled_rows(rows: list[dict]) -> list[dict]:
     """Rows with at least three reviewer ratings (Alt-Test sample)."""
     return [
-        row
-        for row in rows
-        if len(row.get("ratings") or []) >= MIN_HUMANS_PER_INSTANCE
+        row for row in rows if len(row.get("ratings") or []) >= MIN_HUMANS_PER_INSTANCE
     ]
 
 
@@ -194,8 +194,7 @@ def _require_labeled_question_ids(pack_dir: Path) -> list[str]:
     path = _labels_path(pack_dir)
     if not path.is_file():
         raise SystemExit(
-            f"labels.csv not found at {path}. "
-            f"Expected {EXPORTS_DIR / LABELS_CSV_NAME}."
+            f"labels.csv not found at {path}. Expected {EXPORTS_DIR / LABELS_CSV_NAME}."
         )
     ids = labeled_question_ids(load_pack_label_rows(path))
     if not ids:
@@ -294,9 +293,7 @@ def _question_record(meta: dict, *, qid: str, data_root: Path) -> dict:
     question = str(meta.get("question") or "").strip()
     answer = str(meta.get("answer") or "").strip()
     if not question or not answer:
-        raise SystemExit(
-            f"MMAR-meta row {qid!r} is missing question or answer"
-        )
+        raise SystemExit(f"MMAR-meta row {qid!r} is missing question or answer")
     record = dict(meta)
     record["id"] = qid
     record["question"] = question
@@ -410,7 +407,7 @@ def materialize_exports_pack(
         ),
         default=0,
     )
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with tempfile.TemporaryDirectory(prefix="mmar-judging-") as tmp:
         src = Path(tmp)
         for label in labels:
@@ -489,10 +486,38 @@ def _instance_id(row: dict) -> str:
     return f"{row['question_id']}\t{row['model_label']}\t{row['shot_index']}"
 
 
-def _entry_correct(entry: object) -> bool | None:
-    if isinstance(entry, dict) and entry.get("correct") is not None:
-        return bool(entry.get("correct"))
-    return None
+def _entry_correct(entry: object) -> object:
+    """Parsed bool, ``UNPARSED`` disagreement, or ``None`` if the slot is missing."""
+    return llm_annotation_from_entry(entry)
+
+
+def _entry_parsed(entry: object) -> bool:
+    """True when the stored judge answer has a pass/fail verdict."""
+    if not isinstance(entry, dict):
+        return False
+    return str(entry.get("verdict") or "").strip().lower() in {"pass", "fail"}
+
+
+def _parse_stats(
+    samples: list[tuple[str, list[bool], dict[str, dict] | None]],
+    key: str,
+) -> dict[str, int | float | None]:
+    n_present = 0
+    n_parsed = 0
+    for _instance_id, _ratings, judges in samples:
+        entry = (judges or {}).get(key)
+        if not isinstance(entry, dict):
+            continue
+        n_present += 1
+        if _entry_parsed(entry):
+            n_parsed += 1
+    n_unparsed = n_present - n_parsed
+    return {
+        "n_judge_answers": n_present,
+        "n_parsed": n_parsed,
+        "n_unparsed": n_unparsed,
+        "parse_rate": (n_parsed / n_present) if n_present else None,
+    }
 
 
 def _sort_judge_keys(by_judge: dict) -> list[str]:
@@ -513,15 +538,13 @@ def _score_judge_tables(
             (instance_id, ratings, _entry_correct((judges or {}).get(key)))
             for instance_id, ratings, judges in samples
         ]
-        stats.setdefault(mode, {})[key] = score_binary_judge(
-            instances, epsilon=epsilon
-        )
+        row = score_binary_judge(instances, epsilon=epsilon)
+        row.update(_parse_stats(samples, key))
+        stats.setdefault(mode, {})[key] = row
     return stats
 
 
-def report_judge_accuracy(
-    pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON
-) -> dict:
+def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -> dict:
     """Alt-Test scores vs human ratings (Average Advantage Probability).
 
     Tables are keyed by grade-prompt mode.
@@ -530,13 +553,6 @@ def report_judge_accuracy(
     if not labels_path.is_file():
         raise SystemExit(f"labels.csv not found at {labels_path}")
     rows = load_pack_label_rows(labels_path)
-    skipped = [row for row in rows if row["model_label"] in ACCURACY_SKIP_MODELS]
-    if ACCURACY_SKIP_MODELS:
-        rows = [row for row in rows if row["model_label"] not in ACCURACY_SKIP_MODELS]
-        print(
-            f"[run-judges] accuracy skip models={sorted(ACCURACY_SKIP_MODELS)} "
-            f"dropped_rows={len(skipped)}"
-        )
     if not rows:
         raise SystemExit(f"No labeled rows in {labels_path}")
 
@@ -556,9 +572,7 @@ def report_judge_accuracy(
         judges = None
         if shot is not None and isinstance(shot.get("judges"), dict):
             judges = {
-                str(key): dict(entry)
-                for key, entry in shot["judges"].items()
-                if key
+                str(key): dict(entry) for key, entry in shot["judges"].items() if key
             }
             judge_keys.update(judges)
         samples.append((_instance_id(row), list(row["ratings"]), judges))
@@ -589,7 +603,7 @@ def report_judge_accuracy(
         "labels_path": str(labels_path),
         "n_label_rows": len(rows),
         "n_questions": len(labeled_question_ids(rows)),
-        "skipped_models": sorted(ACCURACY_SKIP_MODELS),
+        "skipped_models": [],
         "epsilon": float(epsilon),
         "modes": accuracy_mode_names(stats),
     }
@@ -612,8 +626,9 @@ def _print_accuracy_table(heading: str, by_judge: dict, *, eps_s: str) -> None:
     print(f"\n=== judge Alt-Test ({heading}, ε={eps_s}) ===")
     print("llm = judge agreement with the other two labelers (leave-one-out ACC)")
     print("hum = excluded labeler's agreement with those same two")
+    print("parse = share of stored judge answers with a pass/fail verdict")
     print(
-        f"{'judge':<52} {'n':>6} {'miss':>6} {'<3':>6} "
+        f"{'judge':<52} {'n':>6} {'miss':>6} {'unp':>6} {'parse':>8} {'<3':>6} "
         f"{'ρ':>8} {'llm':>8} {'hum':>8} {'ω':>8} {'pass':>5}"
     )
     if not by_judge:
@@ -630,6 +645,8 @@ def _print_accuracy_table(heading: str, by_judge: dict, *, eps_s: str) -> None:
             pass_s = "—"
         print(
             f"{key:<52} {row.get('n', 0):>6} {row.get('n_missing', 0):>6} "
+            f"{row.get('n_unparsed', 0):>6} "
+            f"{_fmt_rate(row.get('parse_rate')):>8} "
             f"{row.get('n_skipped_lt3', 0):>6} "
             f"{_fmt_rate(row.get('advantage_prob')):>8} "
             f"{_fmt_rate(row.get('loo_agree_judge')):>8} "
@@ -733,9 +750,11 @@ def _pack_dir() -> Path:
 
 
 def _shot_answer(shot: dict) -> str:
-    return str(
-        shot.get("answer_prediction") or shot.get("model_output") or ""
-    ).strip().lower()
+    return (
+        str(shot.get("answer_prediction") or shot.get("model_output") or "")
+        .strip()
+        .lower()
+    )
 
 
 def _merge_record_judges(local: dict, prior: dict) -> dict:
@@ -747,7 +766,11 @@ def _merge_record_judges(local: dict, prior: dict) -> dict:
     for shot in local.get("shots") or []:
         prev = prior_shots.get(int(shot.get("shot_index", 0)))
         prev_judges = (prev or {}).get("judges") or {}
-        if prev is not None and prev_judges and _shot_answer(shot) == _shot_answer(prev):
+        if (
+            prev is not None
+            and prev_judges
+            and _shot_answer(shot) == _shot_answer(prev)
+        ):
             shot = dict(shot)
             judges = dict(shot.get("judges") or {})
             for key, entry in prev_judges.items():
@@ -823,9 +846,7 @@ def _merge_manifest_file(src: Path, dest: Path) -> None:
         for source in (local_judges, prior_judges):
             for entry in source:
                 label = (
-                    str(entry.get("label"))
-                    if isinstance(entry, dict)
-                    else str(entry)
+                    str(entry.get("label")) if isinstance(entry, dict) else str(entry)
                 )
                 if label and label not in seen and label in by_label:
                     ordered.append(by_label[label])
@@ -873,9 +894,7 @@ def _merge_pack_from(src: Path, dest: Path) -> None:
                 elif child.is_file():
                     shutil.copy2(child, dest_model / child.name)
                 elif child.is_dir():
-                    shutil.copytree(
-                        child, dest_model / child.name, dirs_exist_ok=True
-                    )
+                    shutil.copytree(child, dest_model / child.name, dirs_exist_ok=True)
 
 
 def _bootstrap_pack() -> dict:
@@ -989,7 +1008,7 @@ def _merge_judge_manifest(
         primary_entry = next((e for e in ordered if e.get("label") == primary), None)
         manifest["grader_model_id"] = (primary_entry or {}).get("model_id") or model_id
     manifest["scoring"] = manifest.get("scoring") or "qwen_freeform_judge"
-    manifest["graded_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["graded_at"] = datetime.now(UTC).isoformat()
     return manifest
 
 
@@ -998,7 +1017,7 @@ def _csv_parts(raw: str) -> list[str]:
 
 
 def _as_suite_judge(raw: str) -> str | None:
-    from grader import resolve_judge_model_id, _suite_label_for
+    from grader import _suite_label_for, resolve_judge_model_id
 
     for candidate in (raw.strip(), resolve_judge_model_id(raw)):
         if not candidate:
@@ -1093,7 +1112,9 @@ def prepare_judges(
         if not existing_primary and manifest.get("grader_model_id"):
             existing_primary = judge_label(manifest["grader_model_id"])
 
-    labels = list(built.get("models") or discover_model_labels(pack_dir, manifest=manifest))
+    labels = list(
+        built.get("models") or discover_model_labels(pack_dir, manifest=manifest)
+    )
     if models and models.strip().lower() != "all":
         requested = _csv_parts(models)
         missing = [label for label in requested if label not in labels]
@@ -1190,9 +1211,7 @@ def grade_with_judge(
     last_key = None
     last_prompt = DEFAULT_GRADE_PROMPT
     last_gold: bool | None = include_gold
-    progress_label = str(
-        handle.get("judge_label") or judge_label(judge_model_id)
-    )
+    progress_label = str(handle.get("judge_label") or judge_label(judge_model_id))
     mode_pairs: list[tuple[str, bool]] = []
     for prompt_name, gold_flag in iter_grade_modes(
         prompt=prompt, include_gold=include_gold
@@ -1408,9 +1427,9 @@ def _suite_grade_function(label: str, image: modal.Image, gpu: str):
     name = f"grade_{label.replace('-', '_').replace('.', '_')}"
     run.__name__ = name
     run.__qualname__ = name
-    fn = app.function(
-        image=image, gpu=gpu, name=f"grade-{label}", **_SUITE_GRADE_KW
-    )(run)
+    fn = app.function(image=image, gpu=gpu, name=f"grade-{label}", **_SUITE_GRADE_KW)(
+        run
+    )
     globals()[name] = fn
     return fn
 
@@ -1467,7 +1486,9 @@ def _peek_sidecar_meta(path: Path) -> dict:
         from grader import JUDGE_SPECS
         from mmar_models import MODEL_SPECS
 
-        spec = MODEL_SPECS.get(parsed["model"]) or JUDGE_SPECS.get(parsed["model"]) or {}
+        spec = (
+            MODEL_SPECS.get(parsed["model"]) or JUDGE_SPECS.get(parsed["model"]) or {}
+        )
         model_id = str(spec.get("model_id") or parsed["model"] or "")
     return {
         "judge_key": key,
@@ -1477,9 +1498,7 @@ def _peek_sidecar_meta(path: Path) -> dict:
     }
 
 
-def _judge_entries_from_partials(
-    pack_dir: Path, model_labels: list[str]
-) -> list[dict]:
+def _judge_entries_from_partials(pack_dir: Path, model_labels: list[str]) -> list[dict]:
     """One manifest entry per sidecar key found under the given gradees."""
     by_key: dict[str, dict] = {}
     for label in model_labels:
@@ -1757,116 +1776,26 @@ def _spawn_remote_judges(
     for i, entry in enumerate(dedicated):
         this_primary = bool(dedicated_make_primary) and i == 0
         print(f"[run-judges] spawning dedicated judge {entry['label']}")
-        dedicated_handles.append(
-            (
-                entry,
-                grade_with_judge.spawn(
-                    judge_model_id=entry["model_id"],
-                    primary_judge=primary_judge,
-                    model_labels=gradees,
-                    batch_size=batch_size,
-                    force=force,
-                    include_gold=include_gold,
-                    prompt=prompt,
-                    make_primary=this_primary,
-                    n_questions=n_questions,
-                    question_ids=question_ids,
-                ),
-            )
-        )
-    return suite_handles, dedicated_handles
-
-
-def _collect_remote_judges(
-    suite_handles: list[tuple[str, object]],
-    dedicated_handles: list[tuple[dict, object]],
-) -> tuple[list[dict], list[dict], list[dict]]:
-    from grader import compose_judge_key, gold_mode_flags, grade_prompt_name
-
-    grade_results: list[dict] = []
-    judge_entries: list[dict] = []
-    for label, handle in suite_handles:
-        result = handle.get()
-        grade_results.append(result)
-        print(f"Judge {label}:", result)
-        model_id = result.get("model_id") or label
-        modes = list(result.get("modes") or [])
-        if not modes:
-            include_gold = result.get("include_gold")
-            for gold_flag in gold_mode_flags(
-                None if include_gold is None else bool(include_gold)
-            ):
-                prompt_name = grade_prompt_name(gold_flag)
-                modes.append(
-                    {
-                        "prompt": prompt_name,
-                        "include_gold": gold_flag,
-                        "judge_key": compose_judge_key(
-                            label, prompt=prompt_name, include_gold=gold_flag
-                        ),
-                    }
-                )
-        for mode in modes:
-            judge_entries.append(
-                {
-                    "judge_key": mode.get("judge_key")
-                    or compose_judge_key(
-                        label,
-                        prompt=mode.get("prompt"),
-                        include_gold=bool(mode.get("include_gold")),
-                    ),
-                    "model_id": model_id,
-                    "prompt": mode.get("prompt"),
-                    "include_gold": mode.get("include_gold"),
-                }
-            )
-
-    dedicated_grades: list[dict] = []
-    for _entry, handle in dedicated_handles:
-        grade = handle.get()
-        print("Graded:", grade)
-        dedicated_grades.append(grade)
-    return grade_results, dedicated_grades, judge_entries
-
-
-def _finish_remote_pack(
-    *,
-    suite: list[str],
-    gradees: list[str],
-    judge_entries: list[dict],
-    suite_make_primary: bool,
-    primary_judge: str | None,
-    skip_aggregate: bool,
-    ingest: bool,
-    epsilon: float = DEFAULT_EPSILON,
-) -> tuple[dict | None, dict | None, dict | None, dict | None]:
-    ingest_result = None
-    if ingest:
-        ingest_result = ingest_local_pack.remote()
-        print("Ingested local API pack:", ingest_result)
-
-    merge = None
-    if suite:
-        merge = merge_round_robin.remote(
-            model_labels=gradees,
-            judge_entries=judge_entries,
-            make_primary=suite_make_primary,
+        call = grade_with_judge.spawn(
+            judge_model_id=entry["model_id"],
             primary_judge=primary_judge,
+            model_labels=gradees,
+            batch_size=batch_size,
+            force=force,
+            include_gold=include_gold,
+            prompt=prompt,
+            make_primary=this_primary,
+            n_questions=n_questions,
+            question_ids=question_ids,
         )
-        print("Merged:", merge)
-
-    agg = None
-    if not skip_aggregate:
-        agg = run_aggregate.remote()
-        print("Aggregated:", agg)
-    accuracy = run_accuracy.remote(epsilon=epsilon)
-    print("Judge Alt-Test:", accuracy)
-    return ingest_result, merge, agg, accuracy
+        print(f"Spawned {entry['label']} call_id={call.object_id}")
+        dedicated_handles.append((entry, call))
+    return suite_handles, dedicated_handles
 
 
 @app.function(
     image=cpu_image,
-    timeout=24 * 60 * 60,
+    timeout=30 * 60,
     volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def run_judges_pipeline(
@@ -1875,14 +1804,17 @@ def run_judges_pipeline(
     make_primary: bool = False,
     force: bool = False,
     batch_size: int | None = None,
-    skip_aggregate: bool = False,
     include_gold: bool | None = None,
     prompt: str | None = None,
     n_questions: int | None = None,
-    ingest_local: bool = False,
-    epsilon: float = DEFAULT_EPSILON,
 ) -> dict:
-    """Remote orchestrator so a detached App stays alive across GPU phases."""
+    """Remote orchestrator: prepare the pack, spawn GPU judges, return.
+
+    Does not wait on grading. GPU FunctionCalls keep a ``--detach`` app
+    alive; waiting here would pin a preemptible CPU container for hours
+    and re-spawn workers if that container is redelivered. After the GPU
+    jobs finish, fold sidecars with ``--merge-only``.
+    """
     from grader import parse_grade_prompt_list
 
     if n_questions is not None and int(n_questions) < 0:
@@ -1919,29 +1851,30 @@ def run_judges_pipeline(
         dedicated_make_primary=bool(make_primary)
         and any(first_new == entry["label"] for entry in dedicated),
     )
-    n_remote = len(suite_handles) + len(dedicated_handles)
+    suite_spawned = [
+        {"label": label, "call_id": call.object_id, "status": "spawned"}
+        for label, call in suite_handles
+    ]
+    dedicated_spawned = [
+        {
+            "label": entry["label"],
+            "call_id": call.object_id,
+            "status": "spawned",
+        }
+        for entry, call in dedicated_handles
+    ]
+    n_remote = len(suite_spawned) + len(dedicated_spawned)
     if n_remote:
-        print(f"[run-judges] {n_remote} remote judge(s) running")
-    grade_results, dedicated_grades, judge_entries = _collect_remote_judges(
-        suite_handles, dedicated_handles
-    )
-    _ingest, merge, agg, accuracy = _finish_remote_pack(
-        suite=suite,
-        gradees=gradees,
-        judge_entries=judge_entries,
-        suite_make_primary=bool(make_primary) and first_new in suite,
-        primary_judge=prep.get("primary_judge"),
-        skip_aggregate=skip_aggregate,
-        ingest=ingest_local,
-        epsilon=epsilon,
-    )
+        print(
+            f"[run-judges] spawned {n_remote} GPU judge(s); "
+            "CPU orchestrator returning"
+        )
+    else:
+        print("[run-judges] no GPU judges to spawn")
     return {
         "prepare": prep,
-        "grade": grade_results,
-        "dedicated": dedicated_grades,
-        "merge": merge,
-        "aggregate": agg,
-        "accuracy": accuracy,
+        "suite": suite_spawned,
+        "dedicated": dedicated_spawned,
         "prompts": prompts,
     }
 
@@ -2070,7 +2003,8 @@ def _run_judges(
                         force=force,
                         n_questions=n_questions,
                         question_ids=labeled,
-                        make_primary=set_primary and (prompt_name, gold_flag) == modes[0],
+                        make_primary=set_primary
+                        and (prompt_name, gold_flag) == modes[0],
                         primary_judge=first_api_key if set_primary else primary,
                         qps=qps,
                         max_workers=max_workers,
@@ -2106,9 +2040,7 @@ def _run_judges(
                 "reviewer ratings"
             )
         qids = labeled_question_ids(rows)
-        allowed = resolve_grade_allowed_ids(
-            qids, n_questions=n_questions
-        )
+        allowed = resolve_grade_allowed_ids(qids, n_questions=n_questions)
         if allowed is not None:
             rows = [row for row in rows if row["question_id"] in allowed]
         if not rows:
@@ -2191,24 +2123,37 @@ def _run_judges(
             "accuracy": accuracy,
         }
 
-    run_judges_pipeline.spawn(
+    # Remote prepare+spawn so ``app.run(detach=True)`` keeps GPU
+    # FunctionCalls after this process exits. Do not wait on workers here.
+    out = run_judges_pipeline.spawn(
         judge_model_id=(judge_model_id or "").strip(),
         models=models,
         make_primary=make_primary,
         force=force,
         batch_size=batch_size,
-        skip_aggregate=skip_aggregate,
         include_gold=include_gold,
         prompt=prompt,
         n_questions=n_questions,
-        ingest_local=local_api,
-        epsilon=epsilon,
-    )
+    ).get()
     dashboard = app.get_dashboard_url()
+    suite_spawned = list(out.get("suite") or [])
+    dedicated_spawned = list(out.get("dedicated") or [])
+    n_remote = len(suite_spawned) + len(dedicated_spawned)
     if dashboard:
         print(f"[run-judges] Modal GPU pipeline started (detached): {dashboard}")
     else:
         print("[run-judges] Modal GPU pipeline started (detached)")
+    if n_remote:
+        spawned_labels = [item["label"] for item in suite_spawned] + [
+            item["label"] for item in dedicated_spawned
+        ]
+        print(f"Spawned {n_remote} GPU worker(s): {spawned_labels}")
+        print(
+            "GPU FunctionCalls keep this detached app alive. After they "
+            "finish, fold sidecars with:\n"
+            "  uv run run_judges.py --merge-only"
+        )
+    print("Orchestrator:", out)
 
     _run_api()
     _run_batch()
@@ -2216,16 +2161,13 @@ def _run_judges(
         _upload_local_ingest(pack_dir)
         ingest = ingest_local_pack.remote()
         print("Ingested local API pack:", ingest)
-        if not skip_aggregate:
-            agg = run_aggregate.remote()
-            print("Aggregated:", agg)
 
     return {
         "detached": True,
         "dashboard": dashboard,
-        "prepare": None,
-        "grade": [],
-        "dedicated": [],
+        "prepare": out.get("prepare"),
+        "grade": suite_spawned,
+        "dedicated": dedicated_spawned,
         "api": api_results,
         "merge": None,
         "aggregate": None,
@@ -2279,7 +2221,7 @@ def parse_args() -> argparse.Namespace:
         "--merge-only",
         action="store_true",
         help="Fold judge_partials sidecars into predictions.jsonl on the "
-        "judging volume; do not grade.",
+        "judging volume; do not grade. Run this after GPU judges finish.",
     )
     parser.add_argument(
         "--epsilon",
@@ -2360,17 +2302,13 @@ if __name__ == "__main__":
     if args.accuracy_only:
         _run_judges_from_args(args)
     elif args.merge_only:
-        with modal.enable_output():
-            with app.run():
-                _run_judges_from_args(args)
+        with modal.enable_output(), app.run():
+            _run_judges_from_args(args)
     else:
         suite, dedicated, _api, _first = _select_judges(args.judge_model_id)
         if suite or dedicated:
             # Show image-build / mount progress; otherwise App.run() is silent.
-            with modal.enable_output():
-                with app.run(detach=True):
-                    _run_judges_from_args(args)
+            with modal.enable_output(), app.run(detach=True):
+                _run_judges_from_args(args)
         else:
             _run_judges_from_args(args)
-
-

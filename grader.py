@@ -3779,8 +3779,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--prompt",
-        default="",
-        help="Comma-separated JUDGE_FORMATS keys, or 'all'. Default: every format.",
+        nargs="*",
+        choices=[*JUDGE_FORMATS, "all"],
+        default=None,
+        metavar="NAME",
+        help=(
+            "JUDGE_FORMATS keys to render, or 'all'. "
+            f"Formats: {', '.join(JUDGE_FORMATS)}. "
+            "Default: every format."
+        ),
     )
     parser.add_argument(
         "--no-audio-wraps",
@@ -3788,10 +3795,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip model-specific nongold audio wrappers.",
     )
     args = parser.parse_args(argv)
+    prompt = ",".join(args.prompt) if args.prompt else None
     print(
         format_grade_prompt_inspection(
             include_gold=args.include_gold,
-            prompt=(args.prompt or "").strip() or None,
+            prompt=prompt,
             audio_wraps=not args.no_audio_wraps,
         ),
         end="",

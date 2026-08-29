@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import modal
 
-from modal_cache import VLLM_WHEEL_INDEX
+from modal_cache import FLASHINFER_IMAGE_CUBIN_DIR, VLLM_WHEEL_INDEX
 
 # Modal rule: after any ``add_local_*``, no further build steps (apt/pip/run/env).
 # Put installs + env first; mount local sources last.
@@ -38,6 +38,7 @@ _EVAL_ENV = {
     "HF_XET_HIGH_PERFORMANCE": "1",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+    "FLASHINFER_CUBIN_DIR": str(FLASHINFER_IMAGE_CUBIN_DIR),
 }
 
 
@@ -65,6 +66,23 @@ _FUSED_MOE_CONFIG_CMD = (
     "fi"
 )
 
+# Prefetch FlashInfer TRT-LLM cubins (FMHA / batched GEMM / DeepGEMM / CuteDSL)
+# into the image. Same tree for every model: keyed by flashinfer-python, not
+# weights. CPU-only HTTP; no GPU needed. Runtime then hits FLASHINFER_CUBIN_DIR
+# instead of NVIDIA's CDN on every cold start.
+_FLASHINFER_CUBIN_CMD = (
+    "python -c \""
+    "from pathlib import Path; "
+    "from flashinfer.artifacts import download_artifacts; "
+    "from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; "
+    "download_artifacts(); "
+    "p = Path(FLASHINFER_CUBIN_DIR); "
+    "files = [x for x in p.rglob('*') if x.is_file()]; "
+    "n, b = len(files), sum(x.stat().st_size for x in files); "
+    "print(f'flashinfer cubins baked: files={n} size_mib={b / 1024 / 1024:.1f} dir={p}')"
+    "\""
+)
+
 eval_image = mount_local_sources(
     cuda_base_image()
     .uv_pip_install(
@@ -86,6 +104,13 @@ eval_image = mount_local_sources(
         extra_index_url=VLLM_WHEEL_INDEX,
     )
     .run_commands(_FUSED_MOE_CONFIG_CMD)
+    .run_commands(
+        _FLASHINFER_CUBIN_CMD,
+        env={
+            "FLASHINFER_CUBIN_DIR": str(FLASHINFER_IMAGE_CUBIN_DIR),
+            "FLASHINFER_CUBIN_DOWNLOAD_THREADS": "8",
+        },
+    )
     .env(_EVAL_ENV)
 )
 

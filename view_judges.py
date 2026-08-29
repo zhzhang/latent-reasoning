@@ -43,7 +43,12 @@ from grader import (
     judge_mode_bucket,
     parse_judge_key,
 )
-from alt_test import DEFAULT_EPSILON, score_binary_judge, scoring_gold
+from alt_test import (
+    DEFAULT_EPSILON,
+    llm_annotation_from_entry,
+    score_binary_judge,
+    scoring_gold,
+)
 from mmar_common import load_jsonl
 from view_mmar import (
     CONFIG as MMAR_CONFIG,
@@ -327,10 +332,7 @@ def compute_accuracy(
         instances = []
         for instance_id, ratings, judges in samples:
             entry = (judges or {}).get(key) if judges else None
-            correct = None
-            if isinstance(entry, dict) and entry.get("correct") is not None:
-                correct = bool(entry.get("correct"))
-            instances.append((instance_id, ratings, correct))
+            instances.append((instance_id, ratings, llm_annotation_from_entry(entry)))
         scored = score_binary_judge(instances, epsilon=epsilon)
         parsed = parse_judge_key(key)
         stats.setdefault(mode, {})[key] = {

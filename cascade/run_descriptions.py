@@ -1,53 +1,30 @@
-"""MMAR freeform generation on Modal (vLLM 0.28).
+"""Cascade step 1: audio → caption (thinking off) on Modal.
 
-Runs every MMAR question that has three human ratings in
-``exports/labels.csv`` (and audio on the data volume), ``n_shots``
-temperature samples per model (per-model SamplingParams). Writes to the
-root of the ``mmar-freeform-thinking`` Modal Volume. Subsequent runs read
-existing generations and fill in missing models, questions, and shots
-for that labeled set only. Grading is a separate pipeline
-(``run_judges.py``).
+For every question with ≥3 human ratings in ``exports/labels.csv``, each
+uncommented ``MODEL_SPECS`` model generates ``n_shots`` captions of the
+clip (no MMAR question text). Thinking is forced off for all models.
+Writes to the root of the ``mmar-descriptions`` Modal Volume.
 
-All eval workers share ``modal_images.eval_image`` (vLLM 0.28.0 audio,
-FlashInfer cubins baked at image build). Each model flattens remaining
-questions (and leftover shots) into one ``generate()`` / ``chat()``.
-Inference backends:
-  - af-next-think: native MusicFlamingo (HF fallback)
-  - music-flamingo: native MusicFlamingo (HF fallback)
-  - qwen3-omni: thinker-only (Qwen3-Omni-30B-A3B-Thinking)
-  - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
-    gemma-4-12b / nemotron-3-nano-omni: vLLM audio / chat
-  - voxtral-small-24b: Mistral-format audio
+Each model flattens remaining questions (and leftover shots) into one
+``generate()`` / ``chat()`` so vLLM continuous-batches the run.
 
-Results layout on ``mmar-freeform-thinking`` (volume root):
+Layout on ``mmar-descriptions`` (volume root)::
 
     question_ids.json
     manifest.json
     models/<label>/predictions.jsonl
-    difficulty.jsonl
-    scores.json
 
-Prereqs:
+Usage::
 
-    uv run modal run seed_volume.py --datasets mmar \\
-      --models af-next-think,qwen3-omni,voxtral-small-24b
+    # Smoke
+    uv run modal run --detach cascade/run_descriptions.py \\
+      --models af-next-think --limit 5
 
-Usage:
+    # Full (all uncommented models, all triple-labeled questions)
+    uv run modal run --detach cascade/run_descriptions.py
 
-    uv run modal run --detach run_experiment.py
-    uv run modal run --detach run_experiment.py \\
-      --models af-next-think --n-shots 2
-    uv run modal run --detach seed_volume.py --datasets none --models music-flamingo
-    uv run modal run --detach run_experiment.py \\
-      --models music-flamingo --n-shots 5 --seed 42
-    uv run modal run --detach seed_volume.py --datasets none \\
-      --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni
-    uv run modal run --detach run_experiment.py \\
-      --models qwen2.5-omni-7b,phi-4-multimodal,gemma-4-e4b,qwen3-omni-instruct,nemotron-3-nano-omni \\
-      --n-shots 3
-    # Fill missing models / questions / shots (skip GPU workers with no work):
-    uv run modal run --detach run_experiment.py --n-shots 5
-    uv run modal run run_experiment.py --aggregate-only
+    # Download
+    uv run modal run download_results.py --volume-name mmar-descriptions
 """
 
 from __future__ import annotations
@@ -56,14 +33,28 @@ import csv
 import hashlib
 import json
 import os
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+# Repo root on sys.path so ``modal run cascade/run_descriptions.py`` resolves
+# sibling packages (mmar_models, modal_cache, …).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import modal
 
-from aggregate import aggregate_difficulty
+from mmar_common import (
+    aggregate_n_shot_record,
+    count_wavs,
+    load_jsonl,
+    resolve_path,
+    write_json,
+    write_jsonl,
+)
 from mmar_models import (
     ALL_MODEL_LABELS,
     MODEL_SPECS,
@@ -73,37 +64,28 @@ from mmar_models import (
     parse_model_list,
     resolve_sampling,
 )
-from mmar_common import (
-    aggregate_n_shot_record,
-    count_wavs,
-    load_jsonl,
-    resolve_path,
-    write_json,
-    write_jsonl,
-)
 from modal_cache import (
     DEFAULT_MMAR_DATA_ROOT,
     DEFAULT_MMAR_META,
-    MMAR_FREEFORM_THINKING_MOUNT,
+    MMAR_DESCRIPTIONS_MOUNT,
     VOLUME_MOUNT,
     hf_secret,
-    mmar_freeform_thinking_volume,
+    mmar_descriptions_volume,
     volume,
 )
 from modal_images import eval_image, mount_local_sources
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = _REPO_ROOT
 EXPORTS_DIR = REPO_ROOT / "exports"
 LABELS_CSV_NAME = "labels.csv"
-DEFAULT_OUTPUT_DIR = MMAR_FREEFORM_THINKING_MOUNT
+DEFAULT_OUTPUT_DIR = MMAR_DESCRIPTIONS_MOUNT
 DEFAULT_N_SHOTS = 5
 DEFAULT_SEED = 42
 # Match alt_test.MIN_HUMANS_PER_INSTANCE (avoid importing alt_test in GPU workers).
 MIN_HUMANS_PER_INSTANCE = 3
 
-app = modal.App("exp-mmar-question-difficulty")
+app = modal.App("cascade-descriptions")
 
-# Same source mount as eval_image, last image step (no apt/pip after add_local_*).
 cpu_image = mount_local_sources(
     modal.Image.debian_slim(python_version="3.12").uv_pip_install(
         "numpy", "tqdm>=4.67.0"
@@ -307,15 +289,13 @@ def _write_question_ids(ids_path: Path, ids: list[str], *, seed: int) -> None:
         "seed": seed,
         "n": len(ids),
         "ids": ids,
-        "source": "exports/labels.csv",
-        "min_humans": MIN_HUMANS_PER_INSTANCE,
         "created_at": datetime.now(UTC).isoformat(),
     }
     write_json(ids_path, payload)
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
 
 
-def _ensure_question_ids(
+def _merge_question_ids(
     pack_dir: Path,
     *,
     requested: list[str],
@@ -323,19 +303,13 @@ def _ensure_question_ids(
     data_root: Path,
     seed: int,
 ) -> list[str]:
-    """Restrict the pack to ``requested`` ids that have audio.
+    """Union requested ids with existing pack ids; keep only those with audio.
 
-    Drops unlabeled ids so a resume of a former full-MMAR pack only fills
-    triple-labeled questions. Newly labeled ids are appended.
+    Never shrinks ``question_ids.json``: a ``--limit`` smoke run adds its
+    slice; a later full run merges the rest.
     """
-    if not requested:
-        raise SystemExit(
-            "run_experiment requires question_ids from exports/labels.csv "
-            f"(rows with ≥{MIN_HUMANS_PER_INSTANCE} human ratings)."
-        )
-
     ids_path = pack_dir / "question_ids.json"
-    audio_ok: set[str] = set()
+    audio_ok = set()
     for item in load_jsonl(meta_path):
         audio_path = resolve_path(data_root, item["audio_path"])
         if os.path.exists(audio_path):
@@ -349,34 +323,31 @@ def _ensure_question_ids(
         except json.JSONDecodeError:
             existing = []
 
-    requested_audio = [qid for qid in requested if qid in audio_ok]
+    merged = [qid for qid in existing if qid in audio_ok]
     for qid in requested:
-        if qid not in audio_ok:
+        if qid in audio_ok and qid not in merged:
+            merged.append(qid)
+        elif qid not in audio_ok:
             print(f"Skipping {qid}: missing audio under {data_root}")
-    if not requested_audio:
+
+    if not merged:
         raise SystemExit(
             f"No requested questions with audio under {data_root} "
             f"(requested={len(requested)})"
         )
 
-    requested_set = set(requested_audio)
-    merged = [qid for qid in existing if qid in requested_set]
-    merged = list(dict.fromkeys([*merged, *requested_audio]))
     if merged == existing and existing and ids_path.exists():
         print(f"Reusing {len(existing)} question ids from {ids_path}")
         return existing
 
     _write_question_ids(ids_path, merged, seed=seed)
-    if existing and merged != existing:
+    if existing and len(merged) > len(existing):
         print(
-            f"Updated question set {len(existing)} -> {len(merged)} "
-            f"(triple-labeled with audio) -> {ids_path}"
+            f"Expanded question set {len(existing)} -> {len(merged)} "
+            f"-> {ids_path}"
         )
     else:
-        print(
-            f"Wrote {len(merged)} question ids "
-            f"(triple-labeled with audio) -> {ids_path}"
-        )
+        print(f"Wrote {len(merged)} question ids -> {ids_path}")
     return merged
 
 
@@ -413,15 +384,14 @@ def _run_model_eval(
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
-    greedy_non_thinking: bool = False,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
     model_id: str | None = None,
     tokenizer_id: str | None = None,
 ) -> dict:
-    """Load one model and write n-shot freeform predictions for ``question_ids``."""
+    """Load one model and write n-shot description captions for ``question_ids``."""
     volume.reload()
-    mmar_freeform_thinking_volume.reload()
+    mmar_descriptions_volume.reload()
 
     spec = MODEL_SPECS[model_label]
     args = SimpleNamespace(
@@ -433,20 +403,19 @@ def _run_model_eval(
         data_root=data_root,
         output_dir=output_dir,
         n_shots=n_shots,
-        # Optional CLI overrides (None → use MODEL_SPECS[label].sampling).
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
-        greedy_non_thinking=greedy_non_thinking,
+        greedy_non_thinking=False,
         seed=seed,
         torch_dtype="bfloat16",
         print_every=print_every,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
-        prompt_mode="freeform",
+        prompt_mode="description",
+        enable_thinking=False,
     )
     sampling = resolve_sampling(model_label, args)
-    # Materialize effective sampling for HF fallbacks / logging.
     args.temperature = float(sampling["temperature"])
     args.top_p = float(sampling.get("top_p", 1.0))
     args.max_new_tokens = int(sampling["max_tokens"])
@@ -476,8 +445,7 @@ def _run_model_eval(
 
     items = _load_selected_items(meta_path, data_root_path, question_ids)
     existing_records = _load_prediction_records(predictions_path)
-    # Commit after a possible corrupt-line repair inside the loader.
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
     pending_items: list[dict] = []
     pending_have: list[int] = []
     n_done = 0
@@ -489,9 +457,10 @@ def _run_model_eval(
         pending_items.append(item)
         pending_have.append(n_have)
     print(
-        f"[{model_label}] backend={spec.get('backend')} mode=freeform "
-        f"{len(items)} selected, {n_done} done (>= {n_shots} shots), "
-        f"{len(pending_items)} pending (n_shots={n_shots}, sampling={sampling})"
+        f"[{model_label}] backend={spec.get('backend')} mode=description "
+        f"enable_thinking=False {len(items)} selected, {n_done} done "
+        f"(>= {n_shots} shots), {len(pending_items)} pending "
+        f"(n_shots={n_shots}, sampling={sampling})"
     )
 
     if not pending_items:
@@ -500,7 +469,7 @@ def _run_model_eval(
             "model_label": model_label,
             "n_predictions": n_done,
             "predictions_path": str(predictions_path),
-            "mode": "freeform",
+            "mode": "description",
         }
 
     handle = load_model(model_label, args)
@@ -510,10 +479,10 @@ def _run_model_eval(
         print(f"[{model_label}] volume.commit after load failed: {exc}")
     active_backend = handle.get("backend", spec.get("backend"))
     # Flatten every remaining question×shot into one generate() so vLLM
-    # continuous-batches the whole run (same as run_judges flattening modes ×
-    # gradees × shots). HF cannot fork SamplingParams(n>1); those backends
-    # always expand to one row per shot. Plain vLLM on an all-fresh pending
-    # set keeps n=n_shots so samples of one prompt share prefill.
+    # continuous-batches the whole run. HF cannot fork SamplingParams(n>1);
+    # those backends always expand to one row per shot. Plain vLLM on an
+    # all-fresh pending set keeps n=n_shots so samples of one prompt share
+    # prefill.
     duplicate_shots = backend_duplicates_shots(str(active_backend))
 
     start_time = time.time()
@@ -564,7 +533,6 @@ def _run_model_eval(
             n_completions=n_completions,
         )
     except Exception as exc:
-        # Offline generate is all-or-nothing; resume retries the same pending set.
         raise RuntimeError(
             f"[{model_label}] generate failed "
             f"n_questions={n_pending} "
@@ -588,15 +556,25 @@ def _run_model_eval(
             new_outputs,
             start_index=n_have,
         )
-    _rewrite_predictions_file(predictions_path, existing_records, question_ids)
+    # Order by the pack's full id list when present so resumes stay stable.
+    order_ids = list(question_ids)
+    ids_path = pack_dir / "question_ids.json"
+    if ids_path.exists():
+        try:
+            payload = json.loads(ids_path.read_text(encoding="utf-8"))
+            packed = [str(x) for x in payload.get("ids", [])]
+            if packed:
+                order_ids = packed
+        except json.JSONDecodeError:
+            pass
+    _rewrite_predictions_file(predictions_path, existing_records, order_ids)
     with open(predictions_path, "rb") as pred_file:
         os.fsync(pred_file.fileno())
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
 
     written = n_pending
     elapsed = time.time() - start_time
     try:
-        # Persist any Triton JIT / inductor caches written during generate.
         volume.commit()
     except Exception as exc:  # noqa: BLE001
         print(f"[{model_label}] volume.commit after generate failed: {exc}")
@@ -606,7 +584,7 @@ def _run_model_eval(
                 record = existing_records[str(item["id"])]
                 print(
                     f"[{model_label}] {idx}/{written} "
-                    f"id={record['id']} pending_grade ({elapsed:.0f}s)"
+                    f"id={record['id']} captioned ({elapsed:.0f}s)"
                 )
 
     total = sum(
@@ -626,18 +604,17 @@ def _run_model_eval(
         "n_predictions": total,
         "predictions_path": str(predictions_path),
         "backend": active_backend,
-        "mode": "freeform",
+        "mode": "description",
     }
 
 
 # ---------------------------------------------------------------------------
 # Modal eval workers (one GPU function per model_label)
 # ---------------------------------------------------------------------------
-# single_use_containers keeps a GPU from being reused after that model returns.
 
 _PACK_VOLUMES = {
     VOLUME_MOUNT: volume,
-    MMAR_FREEFORM_THINKING_MOUNT: mmar_freeform_thinking_volume,
+    MMAR_DESCRIPTIONS_MOUNT: mmar_descriptions_volume,
 }
 
 _EVAL_KW = dict(
@@ -648,18 +625,15 @@ _EVAL_KW = dict(
     single_use_containers=True,
 )
 
+
 def _eval_function(label: str, image: modal.Image, gpu: str):
     def run(**kwargs) -> dict:
         return _run_model_eval(model_label=label, **kwargs)
 
-    # Modal rejects nested @app.function unless serialized=True (cloudpickle
-    # from this process into the CUDA image). Give the worker a global
-    # __qualname__ and bind it on the module so FILE load works. Dots must
-    # go too: a dotted __qualname__ looks like a class method.
     name = f"eval_{label.replace('-', '_').replace('.', '_')}"
     run.__name__ = name
     run.__qualname__ = name
-    fn = app.function(image=image, gpu=gpu, name=f"eval-{label}", **_EVAL_KW)(
+    fn = app.function(image=image, gpu=gpu, name=f"desc-{label}", **_EVAL_KW)(
         run
     )
     globals()[name] = fn
@@ -686,39 +660,44 @@ if _missing_eval:
 def prepare_run(
     output_dir: str,
     model_labels: list[str],
+    question_ids: list[str],
     n_shots: int,
     seed: int,
     meta: str,
     data_root: str,
-    question_ids: list[str],
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
-    greedy_non_thinking: bool = False,
 ) -> dict:
-    """Create question_ids + manifest and compute missing-shot workload.
+    """Merge question ids into the pack and compute missing-shot workload.
 
-    The active set is questions with ≥3 human ratings in
-    ``exports/labels.csv`` that also have audio. Re-running shrinks a
-    former full-MMAR id list to that labeled subset, merges models into
-    the existing manifest, and reports per-model missing shots so the
-    pipeline can skip GPU workers that already have ``n_shots``
-    generations for every labeled question.
+    ``question_ids`` is the active set for this run (may be a ``--limit``
+    smoke slice). The on-disk ``question_ids.json`` only grows.
     """
     volume.reload()
-    mmar_freeform_thinking_volume.reload()
+    mmar_descriptions_volume.reload()
 
     pack_dir = _pack_dir(output_dir)
     pack_dir.mkdir(parents=True, exist_ok=True)
     meta_path = Path(meta).expanduser().resolve()
     data_root_path = Path(data_root).expanduser().resolve()
-    question_ids = _ensure_question_ids(
+
+    packed_ids = _merge_question_ids(
         pack_dir,
         requested=question_ids,
         meta_path=meta_path,
         data_root=data_root_path,
         seed=seed,
     )
+    # Active set for this run: requested ids that survived the audio filter,
+    # preserving request order (limit smoke stays small).
+    packed_set = set(packed_ids)
+    active_ids = [qid for qid in question_ids if qid in packed_set]
+    if not active_ids:
+        raise SystemExit(
+            "No active question ids after audio filter "
+            f"(requested={len(question_ids)}, packed={len(packed_ids)})"
+        )
 
     now = datetime.now(UTC).isoformat()
     manifest_path = pack_dir / "manifest.json"
@@ -745,42 +724,42 @@ def prepare_run(
     )
     is_resume = bool(existing.get("created_at")) or bool(disk_models)
 
+    # Workload for this run uses the active (possibly limited) id list.
     pack_workload = {
-        label: _model_workload(pack_dir, label, question_ids, n_shots)
+        label: _model_workload(pack_dir, label, active_ids, n_shots)
         for label in merged_models
     }
     requested_workload = {
         label: pack_workload[label] for label in model_labels
     }
-    # Commit after a possible corrupt-line repair inside the loaders.
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
 
     override_ns = SimpleNamespace(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
-        greedy_non_thinking=greedy_non_thinking,
+        enable_thinking=False,
     )
     model_sampling = {
         label: resolve_sampling(label, override_ns) for label in merged_models
     }
 
     manifest = {
-        "experiment": "mmar-freeform-thinking",
-        "mode": "freeform",
+        "experiment": "cascade-descriptions",
+        "mode": "description",
+        "enable_thinking": False,
         "models": merged_models,
         "n_shots": n_shots,
         "seed": existing.get("seed", seed),
-        # Per-model SamplingParams (no global temperature / top_p / max_tokens).
         "model_sampling": model_sampling,
         "sampling_overrides": {
             "temperature": temperature,
             "top_p": top_p,
             "max_new_tokens": max_new_tokens,
-            "greedy_non_thinking": greedy_non_thinking,
         },
         "inference": "vllm",
-        "n_questions": len(question_ids),
+        "n_questions": len(packed_ids),
+        "n_active_questions": len(active_ids),
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
         "resumed": is_resume,
@@ -803,55 +782,16 @@ def prepare_run(
             for label in ALL_MODEL_LABELS
         },
     }
-    # Preserve judge metadata written by other pathways.
-    for key in ("scoring", "grader_model_id", "judges", "primary_judge"):
-        if key in existing:
-            manifest[key] = existing[key]
     write_json(manifest_path, manifest)
-    mmar_freeform_thinking_volume.commit()
+    mmar_descriptions_volume.commit()
     return {
         "manifest": manifest,
         "workload": requested_workload,
-        "question_ids": question_ids,
+        "question_ids": active_ids,
+        "packed_question_ids": packed_ids,
         "resumed": is_resume,
-        "mode": "freeform",
+        "mode": "description",
     }
-
-
-@app.function(
-    image=cpu_image,
-    timeout=30 * 60,
-    volumes=_PACK_VOLUMES,
-)
-def run_aggregate(output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> dict:
-    mmar_freeform_thinking_volume.reload()
-    pack_dir = _pack_dir(output_dir)
-    if not pack_dir.exists():
-        raise SystemExit(f"Pack dir not found: {pack_dir}")
-    result = aggregate_difficulty(pack_dir)
-    # Stamp scoring mode from manifest when present.
-    manifest_path = pack_dir / "manifest.json"
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            scores = result.get("scores") or {}
-            if manifest.get("scoring"):
-                scores["scoring"] = manifest["scoring"]
-            if manifest.get("mode"):
-                scores["mode"] = manifest["mode"]
-            if manifest.get("grader_model_id"):
-                scores["grader_model_id"] = manifest["grader_model_id"]
-            if manifest.get("judges") is not None:
-                scores["judges"] = manifest["judges"]
-            if manifest.get("primary_judge"):
-                scores["primary_judge"] = manifest["primary_judge"]
-            write_json(pack_dir / "scores.json", scores)
-            result["scores"] = scores
-        except json.JSONDecodeError:
-            pass
-    mmar_freeform_thinking_volume.commit()
-    print("Aggregated:", result.get("scores"))
-    return result
 
 
 def _spawn_model_eval(label: str, **common):
@@ -902,11 +842,11 @@ def _print_workload(model_labels: list[str], workload: dict, n_shots: int) -> No
 )
 def run_pipeline(
     models: str = "all",
+    question_ids: list[str] | None = None,
     n_shots: int = DEFAULT_N_SHOTS,
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
-    greedy_non_thinking: bool = False,
     seed: int = DEFAULT_SEED,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
@@ -914,31 +854,13 @@ def run_pipeline(
     data_root: str = str(DEFAULT_MMAR_DATA_ROOT),
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     print_every: int = 5,
-    aggregate_only: bool = False,
-    question_ids: list[str] | None = None,
 ) -> dict:
     """Remote orchestrator: prepare workload, spawn GPU workers, return.
 
     Does not wait on inference. GPU FunctionCalls keep a ``--detach`` app
-    alive; waiting here would pin a preemptible CPU container for hours
-    and re-spawn workers if that container is redelivered.
-
-    Workload is computed on CPU before any GPU container starts. Each
-    pending model is spawned on its own GPU container; a multi-model run
-    launches those containers in parallel. Grading is a separate pipeline
-    (``run_judges.py``).
+    alive; waiting here would pin a preemptible CPU container for hours.
     """
     model_labels = parse_model_list(models)
-
-    if aggregate_only:
-        result = run_aggregate.remote(output_dir=output_dir)
-        print("Done (aggregate-only):", result)
-        return {
-            "mode": "freeform",
-            "aggregate_only": True,
-            "aggregate": result,
-        }
-
     ids = list(question_ids or [])
     if not ids:
         raise SystemExit(
@@ -954,7 +876,6 @@ def run_pipeline(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
-        greedy_non_thinking=greedy_non_thinking,
         seed=seed,
         print_every=print_every,
         max_num_seqs=max_num_seqs,
@@ -962,12 +883,12 @@ def run_pipeline(
     )
 
     print(
-        f"Experiment pack={output_dir} mode=freeform "
-        f"models={model_labels} n_shots={n_shots} "
+        f"Cascade descriptions pack={output_dir} mode=description "
+        f"enable_thinking=False models={model_labels} n_shots={n_shots} "
         f"n_questions={len(ids)} "
         f"gpu_containers=per-model parallel_launch=True inference=vllm "
         f"sampling_overrides={{temperature={temperature}, top_p={top_p}, "
-        f"max_new_tokens={max_new_tokens}, greedy_non_thinking={greedy_non_thinking}}}"
+        f"max_new_tokens={max_new_tokens}}}"
     )
 
     prep = prepare_run.remote(
@@ -981,7 +902,6 @@ def run_pipeline(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
-        greedy_non_thinking=greedy_non_thinking,
     )
 
     active_ids = list(prep.get("question_ids") or ids)
@@ -1024,14 +944,15 @@ def run_pipeline(
                 }
             )
         print(
-            f"[run-experiment] spawned {len(pending_labels)} GPU worker(s); "
+            f"[cascade-descriptions] spawned {len(pending_labels)} GPU worker(s); "
             "CPU orchestrator returning"
         )
     else:
         print("All requested models already complete; skipping inference.")
 
     return {
-        "mode": "freeform",
+        "mode": "description",
+        "enable_thinking": False,
         "models": results,
         "pending_labels": pending_labels,
         "skipped_labels": skipped_labels,
@@ -1058,7 +979,6 @@ def main(
     temperature: float | None = None,
     top_p: float | None = None,
     max_new_tokens: int | None = None,
-    greedy_non_thinking: bool = False,
     seed: int = DEFAULT_SEED,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
@@ -1066,64 +986,52 @@ def main(
     data_root: str = str(DEFAULT_MMAR_DATA_ROOT),
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
     print_every: int = 5,
-    aggregate_only: bool = False,
+    limit: int = 0,
     labels_csv: str = "",
 ):
-    """Launch MMAR freeform generation.
+    """Launch cascade audio→caption generation (thinking off).
 
     Args:
-        models: Comma-separated labels or ``all``.
-        n_shots: Independent temperature samples per question (default 5).
-            Existing generations on the ``mmar-freeform-thinking`` volume
-            are kept; only missing models, questions, and shots are
-            generated, and only for questions with ≥3 human ratings in
-            ``exports/labels.csv``. Plain vLLM uses SamplingParams(n=...)
-            shared prefill when every pending question is starting from
-            zero; HF (and partial fills) duplicate prompts per shot. All
-            pending questions (and leftover shots) flatten into one
-            generate() so vLLM continuous-batches. Models with no
-            remaining shots on the labeled set are not spawned on a GPU.
+        models: Comma-separated labels or ``all`` (uncommented MODEL_SPECS).
+        n_shots: Independent temperature captions per question (default 5).
         temperature: Optional override of each model's sampling temperature.
         top_p: Optional override of each model's top_p.
         max_new_tokens: Optional override of each model's max_tokens.
-        greedy_non_thinking: Force temperature=0 on models without native
-            ``<think>`` / reasoning mode. Thinking models keep card sampling
-            unless ``temperature`` is also set.
         seed: RNG seed for per-question sample seeds.
-        max_num_seqs: Optional vLLM override (escape hatch; prefer defaults).
+        max_num_seqs: Optional vLLM override.
         gpu_memory_utilization: Optional vLLM GPU memory fraction override.
         meta: Path to MMAR-meta.jsonl on the data volume.
         data_root: MMAR root used to resolve audio paths.
-        output_dir: Pack directory on the ``mmar-freeform-thinking`` volume
-            (default: volume root).
+        output_dir: Pack directory on the ``mmar-descriptions`` volume.
         print_every: Progress print interval per model.
-        aggregate_only: Skip inference; only build difficulty.jsonl /
-            scores.json from existing predictions (after grading via
-            ``run_judges.py``).
+        limit: If >0, only the first N triple-labeled question ids (smoke).
+            Does not shrink ``question_ids.json``; a later unlimited run
+            merges the rest.
         labels_csv: Optional path to labels.csv (default ``exports/labels.csv``).
     """
-    question_ids: list[str] = []
-    if not aggregate_only:
-        labels_path = (
-            Path(labels_csv).expanduser() if labels_csv else EXPORTS_DIR / LABELS_CSV_NAME
+    labels_path = Path(labels_csv).expanduser() if labels_csv else EXPORTS_DIR / LABELS_CSV_NAME
+    if not labels_path.is_file():
+        raise SystemExit(
+            f"labels.csv not found at {labels_path}. "
+            f"Expected {EXPORTS_DIR / LABELS_CSV_NAME}."
         )
-        if not labels_path.is_file():
-            raise SystemExit(
-                f"labels.csv not found at {labels_path}. "
-                f"Expected {EXPORTS_DIR / LABELS_CSV_NAME}."
-            )
-        question_ids = triple_labeled_question_ids(labels_path)
-        if not question_ids:
-            raise SystemExit(
-                f"No questions with ≥{MIN_HUMANS_PER_INSTANCE} ratings in {labels_path}"
-            )
+    question_ids = triple_labeled_question_ids(labels_path)
+    if not question_ids:
+        raise SystemExit(
+            f"No questions with ≥{MIN_HUMANS_PER_INSTANCE} ratings in {labels_path}"
+        )
+    if limit and int(limit) > 0:
+        question_ids = question_ids[: int(limit)]
         print(
-            f"[run-experiment] {len(question_ids)} triple-labeled "
+            f"[cascade-descriptions] --limit {limit}: "
+            f"using {len(question_ids)} triple-labeled question(s)"
+        )
+    else:
+        print(
+            f"[cascade-descriptions] {len(question_ids)} triple-labeled "
             f"question(s) from {labels_path}"
         )
 
-    # Remote prepare+spawn so ``--detach`` keeps GPU FunctionCalls after
-    # this process exits. Do not wait on workers here.
     out = run_pipeline.spawn(
         models=models,
         question_ids=question_ids,
@@ -1131,7 +1039,6 @@ def main(
         temperature=temperature,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
-        greedy_non_thinking=greedy_non_thinking,
         seed=seed,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
@@ -1139,7 +1046,6 @@ def main(
         data_root=data_root,
         output_dir=output_dir,
         print_every=print_every,
-        aggregate_only=aggregate_only,
     ).get()
 
     pending = out.get("pending_labels") or []
@@ -1153,10 +1059,10 @@ def main(
     print("Orchestrator:", out)
     print(
         "Download with:\n"
-        "  uv run modal run download_results.py"
+        "  uv run modal run download_results.py --volume-name mmar-descriptions"
     )
     if pending or out.get("skipped_labels"):
         print(
-            "To fill remaining generations later:\n"
-            "  uv run modal run --detach run_experiment.py"
+            "To fill remaining captions later:\n"
+            "  uv run modal run --detach cascade/run_descriptions.py"
         )
