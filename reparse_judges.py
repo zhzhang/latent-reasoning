@@ -81,9 +81,10 @@ def _verdict_snapshot(entry: dict) -> tuple:
     return (entry.get("correct"), entry.get("verdict"), entry.get("output"), sample_t)
 
 
-def reparse_entry(entry: dict) -> bool:
+def reparse_entry(entry: dict, *, model: str | None = None) -> bool:
     """Restamp verdict fields from stored text. True when any field changed."""
     before = _verdict_snapshot(entry)
+    hint = model or str(entry.get("model_id") or entry.get("grader") or "")
     samples = entry.get("samples")
     if isinstance(samples, list) and samples:
         verdicts: list[bool | None] = []
@@ -91,7 +92,7 @@ def reparse_entry(entry: dict) -> bool:
             if not isinstance(sample, dict):
                 verdicts.append(None)
                 continue
-            fields = _verdict_fields(_generation_text(sample))
+            fields = _verdict_fields(_generation_text(sample), model=hint)
             _stamp_verdict(sample, fields["grader_verdict_raw"])
             verdicts.append(fields["grader_verdict_raw"])
         _stamp_verdict(entry, majority_grade_verdict(verdicts))
@@ -99,7 +100,7 @@ def reparse_entry(entry: dict) -> bool:
         text = _generation_text(entry)
         if not text.strip():
             return False
-        fields = _verdict_fields(text)
+        fields = _verdict_fields(text, model=hint)
         _stamp_verdict(entry, fields["grader_verdict_raw"])
     return _verdict_snapshot(entry) != before
 
@@ -153,7 +154,7 @@ def reparse_record(
                     n_unparsed_after += 1
                 continue
             generation = _generation_text(entry)
-            changed = reparse_entry(entry)
+            changed = reparse_entry(entry, model=str(key))
             now_parsed = _stored_parsed(entry)
             if not now_parsed:
                 n_unparsed_after += 1
@@ -245,7 +246,7 @@ def reparse_sidecars(
                     if not was_parsed:
                         n_unparsed_after += 1
                     continue
-                if reparse_entry(entry):
+                if reparse_entry(entry, model=key):
                     file_changed += 1
                 if not _stored_parsed(entry):
                     n_unparsed_after += 1

@@ -68,8 +68,7 @@ def judge_entry(label, backend, condition, n_samples=N_SAMPLES):
 
     grader.JUDGE_FORMATS has no include_gold=False + audio_included=False entry, so
     every arm borrows neutral_no_gt for the prompt slot and records the truth in
-    audio_included. All are include_gold=False, so judge_mode_bucket buckets them
-    as "free" either way.
+    audio_included. judge_mode_bucket keys on that format name.
     """
     cond = CONDITIONS[condition]
     temp = BACKENDS[backend]["temperature"]

@@ -573,7 +573,7 @@ def _majority_entry_from_texts(
 
     if not any(texts):
         return None
-    sample_fields = [_verdict_fields(text) for text in texts]
+    sample_fields = [_verdict_fields(text, model=model_id) for text in texts]
     raw = [item["grader_verdict_raw"] for item in sample_fields]
     majority = majority_grade_verdict(raw)
     generation = ""

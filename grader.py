@@ -32,6 +32,7 @@ from mmar_common import (
     join_vllm_reasoning,
     judge_label,
     parse_freeform_output,
+    split_answer_line,
     recompute_multi_judge_scores,
     select_grade_question_ids,
     write_jsonl,
@@ -516,9 +517,7 @@ def accuracy_mode_names(payload: dict | None = None) -> list[str]:
     if not isinstance(payload, dict):
         return names
     return [
-        name
-        for name in names
-        if isinstance(payload.get(name), dict) and payload[name]
+        name for name in names if isinstance(payload.get(name), dict) and payload[name]
     ]
 
 
@@ -648,7 +647,8 @@ class JudgeFormat:
 
 # Named formats. Edit this table — not the builders.
 JUDGE_FORMATS: dict[str, JudgeFormat] = {
-    "judge_no_gt": JudgeFormat(
+    # All no GT formats must have audio included.
+    "judge_no_gt": JudgeFormat(  #  Discretionary, No GT
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
@@ -675,7 +675,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
     ),
-    "judge_with_gt": JudgeFormat(
+    "judge_with_gt": JudgeFormat(  # Discretionary, With GT
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
@@ -702,7 +702,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
-    "judge_with_gt_no_audio": JudgeFormat(
+    "judge_with_gt_no_audio": JudgeFormat(  # Discretionary, With GT, No Audio
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
@@ -729,7 +729,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         audio_included=False,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
-    "with_gt": JudgeFormat(
+    "with_gt": JudgeFormat(  # Strict, With GT
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "matches a given ground truth answer or not. You are provided with a "
@@ -765,7 +765,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         audio_included=False,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
-    "with_gt_with_audio": JudgeFormat(
+    "with_gt_with_audio": JudgeFormat(  # Strict, With GT, With Audio
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "matches a given ground truth answer or not. You are provided with a "
@@ -961,10 +961,17 @@ def build_grade_gold_prefix(
 # "correct in meaning" does not count as a verdict. After that, the last
 # non-empty line is scanned for exclusive ``correct`` / ``incorrect``.
 # af-next-think last resort: last post-think line exactly ``<t>0</t>`` / ``<t>1</t>``.
+# Phi-4 last resort (that judge only): last ``[Answer]<label>`` anywhere in
+# the raw generation (including think blocks and mid-prose).
 AF_NEXT_T_PASS = "<t>1</t>"
 AF_NEXT_T_FAIL = "<t>0</t>"
 ANSWER_TAG_RE = re.compile(
     r"<answer>\s*(0|1|correct|incorrect|pass|fail|yes|no|true|false|wrong)\s*</answer>",
+    re.IGNORECASE,
+)
+# Phi-4-multimodal-instruct writes ``[Answer]Correct`` instead of ``Answer:``.
+PHI4_BRACKET_ANSWER_RE = re.compile(
+    r"\[Answer\]\s*(incorrect|correct|pass|fail|yes|no|true|false|wrong|[01])\b",
     re.IGNORECASE,
 )
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}", re.IGNORECASE)
@@ -1096,6 +1103,32 @@ def _af_next_t_tag_last_line_verdict(region: str) -> bool | None:
     return None
 
 
+def _phi4_judge_slug(model: str | None) -> str:
+    raw = str(model or "").strip().lower()
+    if not raw:
+        return ""
+    if "__" in raw:
+        raw = parse_judge_key(raw).get("model") or raw
+    return raw.rstrip("/").split("/")[-1]
+
+
+def allows_phi4_bracket_answer(model: str | None) -> bool:
+    """True for Phi-4-multimodal-instruct and its suite aliases / judge keys."""
+    return _phi4_judge_slug(model).startswith("phi-4")
+
+
+def _phi4_bracket_answer_verdict(generation: str) -> bool | None:
+    """Last ``[Answer]<label>`` anywhere in the raw generation.
+
+    Phi-4's stand-in for ``Answer: <label>``. Not limited to the extracted
+    answer span, the post-think region, or the last line.
+    """
+    matches = list(PHI4_BRACKET_ANSWER_RE.finditer(generation or ""))
+    if not matches:
+        return None
+    return _label_verdict(matches[-1].group(1))
+
+
 def majority_grade_verdict(verdicts: list[bool | None]) -> bool | None:
     """Strict majority over ``len(verdicts)`` slots. Unparsed shots do not vote."""
     n = len(verdicts)
@@ -1111,7 +1144,7 @@ def majority_grade_verdict(verdicts: list[bool | None]) -> bool | None:
     return None
 
 
-def parse_grade_verdict(text: str) -> bool | None:
+def parse_grade_verdict(text: str, *, model: str | None = None) -> bool | None:
     """Parse a 0/1 tag, Correct/Incorrect, or legacy Pass/Fail reply.
 
     Uses the same answer extractor as test-takers (``Answer:`` line, then
@@ -1119,15 +1152,28 @@ def parse_grade_verdict(text: str) -> bool | None:
     ``incorrect`` is matched before ``correct`` so a last-line ``Incorrect``
     is never read as ``Correct``. If every earlier parser fails, the last
     non-empty line is scanned for ``correct`` / ``incorrect`` (case
-    insensitive); both tokens on that line is a parse failure. Last of all,
+    insensitive); both tokens on that line is a parse failure. Then
     af-next-think ``<t>0</t>`` / ``<t>1</t>`` is accepted only when that is
-    the entire last post-think line.
+    the entire last post-think line. For a Phi-4 judge only, if those miss
+    (or the requested ``Answer:`` line is absent), ``[Answer]<label>`` is
+    taken from anywhere in the raw generation.
     """
     text = (text or "").strip()
     if not text:
         return None
     extracted = extract_freeform_answer(text)
     region = after_last_think_close(text) or text
+    if allows_phi4_bracket_answer(model):
+        # Requested ``Answer:`` line still wins when it parses. Otherwise
+        # ``[Answer]`` may sit in thinking, mid-prose, or before the last line.
+        explicit = split_answer_line(region)
+        if explicit is not None:
+            verdict = _verdict_from_text(explicit[1])
+            if verdict is not None:
+                return verdict
+        verdict = _phi4_bracket_answer_verdict(text)
+        if verdict is not None:
+            return verdict
     for snippet in (extracted, region):
         verdict = _verdict_from_text(snippet)
         if verdict is not None:
@@ -2220,8 +2266,8 @@ def _completion_text(out: Any) -> str:
     return _completion_texts(out, n=1)[0]
 
 
-def _verdict_fields(text: str) -> dict[str, Any]:
-    verdict = parse_grade_verdict(text)
+def _verdict_fields(text: str, *, model: str | None = None) -> dict[str, Any]:
+    verdict = parse_grade_verdict(text, model=model)
     reasoning, _answer = parse_freeform_output(text)
     return {
         "correct": bool(verdict) if verdict is not None else False,
@@ -2248,7 +2294,7 @@ def _grade_results_from_texts(
         prompt_name, gold, _ = _job_grade_spec(
             job, prompt=prompt, include_gold=include_gold
         )
-        fields = _verdict_fields(text)
+        fields = _verdict_fields(text, model=model_id)
         results.append(
             {
                 **fields,
@@ -2278,7 +2324,7 @@ def _grade_results_from_sample_groups(
         prompt_name, gold, _ = _job_grade_spec(
             job, prompt=prompt, include_gold=fallback_gold
         )
-        sample_fields = [_verdict_fields(text) for text in texts]
+        sample_fields = [_verdict_fields(text, model=model_id) for text in texts]
         raw = [item["grader_verdict_raw"] for item in sample_fields]
         majority = majority_grade_verdict(raw)
         generation = ""

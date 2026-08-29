@@ -45,12 +45,13 @@ def _judge_wanted(key: str, prefixes: list[str]) -> bool:
     return any(key == prefix or key.startswith(prefix) for prefix in prefixes)
 
 
-def parsed_judge_verdict(entry: dict) -> bool | None:
+def parsed_judge_verdict(entry: dict, *, model: str | None = None) -> bool | None:
     """Re-run the grade extractor on stored judge text. None = unparsed."""
+    hint = model or str(entry.get("model_id") or entry.get("grader") or "")
     samples = entry.get("samples")
     if isinstance(samples, list) and samples:
         verdicts = [
-            parse_grade_verdict(str(sample.get("generation") or ""))
+            parse_grade_verdict(str(sample.get("generation") or ""), model=hint)
             for sample in samples
             if isinstance(sample, dict)
         ]
@@ -58,7 +59,7 @@ def parsed_judge_verdict(entry: dict) -> bool | None:
             return majority_grade_verdict(verdicts)
     generation = str(entry.get("generation") or "")
     if generation.strip():
-        return parse_grade_verdict(generation)
+        return parse_grade_verdict(generation, model=hint)
     stored = entry.get("verdict")
     if stored == "pass":
         return True
@@ -75,7 +76,7 @@ def parsed_judge_verdict(entry: dict) -> bool | None:
 def is_unparsed_judge_entry(label: str, entry: object) -> bool:
     if label == STRING_MATCH_JUDGE_LABEL or not isinstance(entry, dict):
         return False
-    return parsed_judge_verdict(entry) is None
+    return parsed_judge_verdict(entry, model=label) is None
 
 
 def _clear_stale_legacy(record: dict) -> None:

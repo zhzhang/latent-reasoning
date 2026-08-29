@@ -1169,7 +1169,7 @@ def _verdict_entry(
     from grader import format_grade_output, parse_grade_verdict
     from mmar_common import parse_freeform_output
 
-    verdict = parse_grade_verdict(result.text)
+    verdict = parse_grade_verdict(result.text, model=model_id)
     reasoning, _answer = parse_freeform_output(result.text)
     entry: dict[str, Any] = {
         "correct": bool(verdict) if verdict is not None else False,
@@ -1200,7 +1200,7 @@ def _majority_verdict_entry(
     """Match ``grade_predictions_file`` majority-vote shot entries."""
     from grader import _verdict_fields, format_grade_output, majority_grade_verdict
 
-    sample_fields = [_verdict_fields(text) for text in texts]
+    sample_fields = [_verdict_fields(text, model=model_id) for text in texts]
     raw = [item["grader_verdict_raw"] for item in sample_fields]
     majority = majority_grade_verdict(raw)
     generation = ""
