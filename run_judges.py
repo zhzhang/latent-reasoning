@@ -497,42 +497,6 @@ def _sort_judge_keys(by_judge: dict) -> list[str]:
     return sorted(by_judge, key=_key)
 
 
-# Official MMAR top-level category / modality buckets (evaluation.py).
-MMAR_TOP_CATEGORIES = (
-    "Signal Layer",
-    "Perception Layer",
-    "Semantic Layer",
-    "Cultural Layer",
-)
-MMAR_MODALITIES = (
-    "sound",
-    "music",
-    "speech",
-    "mix-sound-music",
-    "mix-sound-speech",
-    "mix-music-speech",
-    "mix-sound-music-speech",
-)
-
-
-def _slice_label(value: object) -> str:
-    text = str(value or "").strip()
-    return text or "unknown"
-
-
-def _ordered_slice_names(seen: set[str], canonical: tuple[str, ...]) -> list[str]:
-    extras = sorted(name for name in seen if name not in canonical)
-    return [name for name in canonical if name in seen] + extras
-
-
-def _optional_mmar_meta() -> dict[str, dict]:
-    if DEFAULT_MMAR_META.is_file():
-        return _load_mmar_meta(DEFAULT_MMAR_META)
-    if LOCAL_MMAR_META.is_file():
-        return _load_mmar_meta(LOCAL_MMAR_META)
-    return {}
-
-
 def _score_judge_tables(
     samples: list[tuple[str, list[bool], dict[str, dict] | None]],
     key_mode: dict[str, str],
@@ -553,29 +517,12 @@ def _score_judge_tables(
     return stats
 
 
-def _score_slice_tables(
-    labeled: list[tuple[str, list[bool], dict[str, dict] | None, str]],
-    key_mode: dict[str, str],
-    *,
-    epsilon: float,
-    canonical: tuple[str, ...],
-) -> dict[str, dict[str, dict[str, dict]]]:
-    grouped: dict[str, list[tuple[str, list[bool], dict[str, dict] | None]]] = {}
-    for instance_id, ratings, judges, slice_name in labeled:
-        grouped.setdefault(slice_name, []).append((instance_id, ratings, judges))
-    return {
-        name: _score_judge_tables(grouped[name], key_mode, epsilon=epsilon)
-        for name in _ordered_slice_names(set(grouped), canonical)
-    }
-
-
 def report_judge_accuracy(
     pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON
 ) -> dict:
     """Alt-Test scores vs human ratings (Average Advantage Probability).
 
-    Overall tables are keyed by grade-prompt mode. The same metrics are also
-    written under ``by_category`` (MMAR top-level layer) and ``by_modality``.
+    Tables are keyed by grade-prompt mode.
     """
     labels_path = _labels_path(pack_dir)
     if not labels_path.is_file():
@@ -586,10 +533,7 @@ def report_judge_accuracy(
 
     pred_cache: dict[str, dict[str, dict]] = {}
     samples: list[tuple[str, list[bool], dict[str, dict] | None]] = []
-    sample_slices: list[tuple[str, str]] = []
     judge_keys: set[str] = set()
-    qid_slice: dict[str, tuple[str, str]] = {}
-    mmar_meta = _optional_mmar_meta()
 
     for row in rows:
         model = row["model_label"]
@@ -599,13 +543,6 @@ def report_judge_accuracy(
                 pack_dir / "models" / model / "predictions.jsonl"
             )
         record = pred_cache[model].get(qid)
-        if qid not in qid_slice:
-            meta_row = mmar_meta.get(qid) or {}
-            src = record or {}
-            qid_slice[qid] = (
-                _slice_label(src.get("category") or meta_row.get("category")),
-                _slice_label(src.get("modality") or meta_row.get("modality")),
-            )
         shot = _shot_for_index(record, row["shot_index"]) if record else None
         judges = None
         if shot is not None and isinstance(shot.get("judges"), dict):
@@ -616,7 +553,6 @@ def report_judge_accuracy(
             }
             judge_keys.update(judges)
         samples.append((_instance_id(row), list(row["ratings"]), judges))
-        sample_slices.append(qid_slice[qid])
 
     from grader import accuracy_mode_names
 
@@ -638,28 +574,6 @@ def report_judge_accuracy(
         key_mode[key] = mode
 
     stats = _score_judge_tables(samples, key_mode, epsilon=epsilon)
-    by_category = _score_slice_tables(
-        [
-            (iid, ratings, judges, category)
-            for (iid, ratings, judges), (category, _modality) in zip(
-                samples, sample_slices
-            )
-        ],
-        key_mode,
-        epsilon=epsilon,
-        canonical=MMAR_TOP_CATEGORIES,
-    )
-    by_modality = _score_slice_tables(
-        [
-            (iid, ratings, judges, modality)
-            for (iid, ratings, judges), (_category, modality) in zip(
-                samples, sample_slices
-            )
-        ],
-        key_mode,
-        epsilon=epsilon,
-        canonical=MMAR_MODALITIES,
-    )
 
     payload = {
         "pack": PACK_NAME,
@@ -668,8 +582,6 @@ def report_judge_accuracy(
         "n_questions": len(labeled_question_ids(rows)),
         "epsilon": float(epsilon),
         "modes": accuracy_mode_names(stats),
-        "by_category": by_category,
-        "by_modality": by_modality,
     }
     for mode in payload["modes"]:
         payload[mode] = stats.get(mode) or {}
@@ -716,42 +628,20 @@ def _print_accuracy_table(heading: str, by_judge: dict, *, eps_s: str) -> None:
         )
 
 
-def _print_accuracy_modes(
-    tables: dict, *, eps_s: str, slice_label: str = "", skip_empty: bool = False
-) -> None:
+def _print_accuracy_modes(tables: dict, *, eps_s: str) -> None:
     from grader import accuracy_mode_names, grade_mode_title
 
-    prefix = f"{slice_label}, " if slice_label else ""
     for mode in accuracy_mode_names(tables):
         by_judge = tables.get(mode) or {}
         if not isinstance(by_judge, dict):
             continue
-        if skip_empty and not by_judge:
-            continue
-        heading = f"{prefix}{grade_mode_title(mode)}"
-        _print_accuracy_table(heading, by_judge, eps_s=eps_s)
+        _print_accuracy_table(grade_mode_title(mode), by_judge, eps_s=eps_s)
 
 
 def _print_judge_accuracy(payload: dict) -> None:
     epsilon = payload.get("epsilon")
     eps_s = _fmt_rate(epsilon)
     _print_accuracy_modes(payload, eps_s=eps_s)
-    by_category = payload.get("by_category") or {}
-    if isinstance(by_category, dict) and by_category:
-        print("\n--- by MMAR category (top-level) ---")
-        for name, tables in by_category.items():
-            if isinstance(tables, dict):
-                _print_accuracy_modes(
-                    tables, eps_s=eps_s, slice_label=str(name), skip_empty=True
-                )
-    by_modality = payload.get("by_modality") or {}
-    if isinstance(by_modality, dict) and by_modality:
-        print("\n--- by MMAR modality ---")
-        for name, tables in by_modality.items():
-            if isinstance(tables, dict):
-                _print_accuracy_modes(
-                    tables, eps_s=eps_s, slice_label=str(name), skip_empty=True
-                )
     print()
 
 
