@@ -99,19 +99,24 @@ def compile_cache_stats(model_label: str) -> dict[str, object]:
     root = compile_cache_dir(model_label)
     n_files = 0
     n_bytes = 0
+    newest_mtime = 0.0
     if root.is_dir():
         for dirpath, _dirnames, filenames in os.walk(root):
             for name in filenames:
                 n_files += 1
                 try:
-                    n_bytes += (Path(dirpath) / name).stat().st_size
+                    st = (Path(dirpath) / name).stat()
                 except OSError:
-                    pass
+                    continue
+                n_bytes += st.st_size
+                if st.st_mtime > newest_mtime:
+                    newest_mtime = st.st_mtime
     return {
         "path": str(root),
         "n_files": n_files,
         "n_bytes": n_bytes,
         "n_mib": round(n_bytes / (1024 * 1024), 1),
+        "newest_mtime": newest_mtime,
     }
 
 

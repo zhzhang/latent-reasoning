@@ -1297,7 +1297,7 @@ async def grade_pack_with_api_judge(
     )
     use_gold_prefix = include_gold and not fmt.audio_included
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
-    gradees = [item for item in model_labels if item != resolved]
+    gradees = list(model_labels)
     files: dict[str, list[dict]] = {}
     all_ids: list[str] = []
     for gradee in gradees:
@@ -1749,7 +1749,7 @@ async def _grade_pack_with_anthropic_async(
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
 
-    gradees = [item for item in model_labels if item != resolved]
+    gradees = list(model_labels)
     files: dict[str, list[dict]] = {}
     for gradee in gradees:
         records = _load_prediction_records(
@@ -2735,7 +2735,7 @@ def grade_pack_with_batch_api(
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
 
-    gradees = [item for item in model_labels if item != resolved]
+    gradees = list(model_labels)
     files: dict[str, list[dict]] = {}
     for gradee in gradees:
         records = _load_prediction_records(

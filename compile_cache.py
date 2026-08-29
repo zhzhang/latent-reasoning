@@ -10,13 +10,13 @@ Or spawn one or more from the local entrypoint::
     uv run modal run --detach compile_cache.py
     uv run modal run --detach compile_cache.py --models gemma-4-e4b,qwen3-omni
 
-The worker loads the model with the production engine config (so
-``profile_run`` compiles the same graphs as eval), including spec-level
-knobs such as ``reasoning_parser``. Warmup sampling keeps
-``thinking_token_budget`` (``reasoning_budget`` + ``grace_period``) and
-only caps ``max_tokens``. Artifacts land under ``/cache/vllm/<label>/``
-on the ``latent-reasoning`` volume. Later GPU containers call
-``configure_compile_cache`` from ``load_model`` and reuse them.
+The worker points inductor / Triton / vLLM at the existing
+``/cache/vllm/<label>/`` tree, then loads the model. A warmup generate
+runs only when that load is a cache miss (new or rewritten artifacts).
+A hit skips generate. Warmup sampling keeps ``thinking_token_budget``
+(``reasoning_budget`` + ``grace_period``) and only caps ``max_tokens``.
+Later GPU containers call ``configure_compile_cache`` from ``load_model``
+and reuse the tree.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from modal_cache import (
     VOLUME_MOUNT,
     commit_compile_cache,
     compile_cache_stats,
+    configure_compile_cache,
     hf_secret,
     volume,
 )
@@ -48,11 +49,21 @@ from mmar_models import (
     parse_model_list,
     resolve_sampling,
 )
-from modal_images import EVAL_IMAGES
+from modal_images import eval_image
 
 DEFAULT_QUESTION_ID = "GJ6r_T6ckc4_00-00-00_00-00-06"
 # Long enough to compile decode kernels; short enough not to wait on CoT.
 WARMUP_MAX_TOKENS = 16
+
+
+def _cache_missed(before: dict[str, object], after: dict[str, object]) -> bool:
+    """True when load/generate wrote or replaced files in the cache tree."""
+    return (
+        int(after["n_files"]) > int(before["n_files"])
+        or int(after["n_bytes"]) > int(before["n_bytes"])
+        or float(after.get("newest_mtime") or 0)
+        > float(before.get("newest_mtime") or 0)
+    )
 
 app = modal.App("compile-cache")
 
@@ -123,20 +134,34 @@ def _compile_one(
         f"chat_kwargs={chat_kwargs} sampling={sampling} "
         f"warmup_max_tokens={WARMUP_MAX_TOKENS}"
     )
+    configure_compile_cache(model_label)
+    before = compile_cache_stats(model_label)
+    print(
+        f"[compile {model_label}] existing cache files={before['n_files']} "
+        f"size={before['n_mib']} MiB"
+    )
     started = time.time()
     handle = load_model(model_label, args)
     load_secs = time.time() - started
-    commit_compile_cache(model_label)
+    after_load = compile_cache_stats(model_label)
+    cache_miss = _cache_missed(before, after_load)
     print(
         f"[compile {model_label}] loaded backend={handle.get('backend')} "
-        f"in {load_secs:.1f}s"
+        f"in {load_secs:.1f}s cache={'miss' if cache_miss else 'hit'} "
+        f"files={after_load['n_files']} size={after_load['n_mib']} MiB"
     )
 
-    item = _pick_warmup_item(question_id)
+    item = _pick_warmup_item(question_id) if cache_miss else None
     generate_secs = 0.0
     generate_error: str | None = None
     output_preview = ""
-    if item is not None:
+    if not cache_miss:
+        print(f"[compile {model_label}] cache hit; skipping warmup generate")
+    elif item is None:
+        commit_compile_cache(model_label)
+        print(f"[compile {model_label}] cache miss; no wav, load-only")
+    else:
+        commit_compile_cache(model_label)
         gen_started = time.time()
         try:
             parsed = generate_one(model_label, handle, item, args)
@@ -162,8 +187,14 @@ def _compile_one(
         f"files={stats['n_files']} size={stats['n_mib']} MiB "
         f"load={load_secs:.1f}s generate={generate_secs:.1f}s"
     )
+    if generate_error is not None:
+        status = "load_ok_generate_failed"
+    elif not cache_miss:
+        status = "cache_hit"
+    else:
+        status = "ok"
     return {
-        "status": "ok" if generate_error is None else "load_ok_generate_failed",
+        "status": status,
         "model_label": model_label,
         "backend": handle.get("backend", spec.get("backend")),
         "engine": engine,
@@ -171,6 +202,7 @@ def _compile_one(
         "sampling": sampling,
         "cache": stats,
         "cache_root": stats["path"],
+        "cache_miss": cache_miss,
         "load_secs": round(load_secs, 1),
         "generate_secs": round(generate_secs, 1),
         "question_id": None if item is None else item.get("id"),
@@ -199,12 +231,11 @@ def _compile_function(label: str, image: modal.Image, gpu: str):
 _COMPILE_FNS: dict[str, Any] = {}
 _missing_compile: list[str] = []
 for _label in ALL_MODEL_LABELS:
-    _image = EVAL_IMAGES.get(_label)
     _gpu = MODEL_SPECS[_label].get("gpu")
-    if _image is None or not _gpu:
+    if not _gpu:
         _missing_compile.append(_label)
         continue
-    _COMPILE_FNS[_label] = _compile_function(_label, _image, str(_gpu))
+    _COMPILE_FNS[_label] = _compile_function(_label, eval_image, str(_gpu))
 if _missing_compile:
     raise RuntimeError(f"No compile-cache worker for models: {_missing_compile}")
 
@@ -224,6 +255,9 @@ def main(
     question_id: str = DEFAULT_QUESTION_ID,
 ):
     """Warm torch.compile / Triton caches for one or more eval models.
+
+    Each worker attaches the existing ``/cache/vllm/<label>/`` tree, loads
+    the model, and runs a warmup generate only on a cache miss.
 
     Args:
         models: Comma-separated labels or ``all``.

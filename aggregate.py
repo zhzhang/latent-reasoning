@@ -9,20 +9,20 @@ from typing import Any
 # Default experiment model set (used by run_experiment aggregation).
 MODEL_LABELS = (
     "af-next-think",
-    "mimo-audio-7b",
-    "interactive-omni-8b",
+    "music-flamingo",
     "qwen3-omni",
     "voxtral-small-24b",
-)
-# Preferred display / discovery order; extras append after known labels.
-MODEL_LABEL_ORDER = MODEL_LABELS + (
-    "music-flamingo",
     "qwen2.5-omni-7b",
     "phi-4-multimodal",
     "gemma-4-e4b",
     "gemma-4-12b",
-    "qwen3-omni-instruct",
     "nemotron-3-nano-omni",
+)
+# Preferred display / discovery order; extras append after known labels.
+MODEL_LABEL_ORDER = MODEL_LABELS + (
+    "qwen3-omni-instruct",
+    "mimo-audio-7b",
+    "interactive-omni-8b",
 )
 
 

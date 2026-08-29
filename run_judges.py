@@ -9,7 +9,7 @@ verdict for the same judge key are skipped. Regenerates
 ``difficulty.jsonl`` / ``scores.json`` after grading, then writes
 ``judge_accuracy.json`` (Alt-Test Average Advantage Probability).
 
-vLLM suite / dedicated judges start Modal from this script. API judges
+vLLM MODEL_SPECS / dedicated judges start Modal from this script. API judges
 (gemini-3.7-flash) run locally and never open an App. Batch API judges
 (gpt-5.6-luna, claude-sonnet-5) also run locally: they grade text-only
 recipes (default ``with_gt``; ``--grade-prompt`` selects any text format)
@@ -18,23 +18,23 @@ on shots in ``exports/labels.csv`` that have all three reviewer ratings.
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
 
-    # All suite judges; both gold modes; labeled questions only
+    # Every uncommented mmar_models.MODEL_SPECS label; both gold modes
     uv run run_judges.py
 
     # Only these judges
     uv run run_judges.py \\
-      --judge-model-id qwen3-omni-instruct,phi-4-multimodal
+      --judge-model-id qwen3-omni,phi-4-multimodal
 
-    # Dedicated text judge (not in the suite; with-GT only)
+    # Dedicated text judge (JUDGE_SPECS, not MODEL_SPECS)
     uv run run_judges.py \\
       --judge-model-id qwen3.6-35b-a3b-fp8
 
     # Audio judge, no gold (hears the clip)
     uv run run_judges.py \\
-      --judge-model-id qwen3-omni-instruct \\
+      --judge-model-id qwen3-omni \\
       --no-include-gold
 
-    # Neutral with-GT: audio + gold, Correct/Incorrect (suite judges)
+    # Neutral with-GT: audio + gold, Correct/Incorrect (MODEL_SPECS judges)
     uv run run_judges.py --grade-prompt neutral_with_gt
 
     # Any JUDGE_FORMATS key (text-only variant; dedicated judges OK)
@@ -45,6 +45,9 @@ on shots in ``exports/labels.csv`` that have all three reviewer ratings.
 
     # Recompute Alt-Test scores from existing local verdicts
     uv run run_judges.py --accuracy-only
+
+    # Fold judge_partials into predictions.jsonl on the volume (no grading)
+    uv run run_judges.py --merge-only
 
 Local API judges::
 
@@ -67,7 +70,7 @@ OpenAI / Anthropic Batch API (text-only, triple-labeled shots)::
 Mixed (API locally while Modal vLLM runs detached)::
 
     uv run run_judges.py \\
-      --judge-model-id gemini-3.7-flash,qwen3-omni-instruct
+      --judge-model-id gemini-3.7-flash,qwen3-omni
 
     # Download remote verdicts and inspect vs exports/ labels
     uv run modal run download_judges.py
@@ -91,6 +94,7 @@ import modal
 from aggregate import aggregate_difficulty, discover_model_labels, order_model_labels
 from alt_test import DEFAULT_EPSILON, MIN_HUMANS_PER_INSTANCE, score_binary_judge
 from mmar_common import judge_label, load_jsonl, resolve_path, write_json, write_jsonl
+from mmar_models import ALL_MODEL_LABELS, MODEL_SPECS
 from modal_cache import (
     DEFAULT_MMAR_DATA_ROOT,
     DEFAULT_MMAR_META,
@@ -101,6 +105,7 @@ from modal_cache import (
     judging_volume,
     volume,
 )
+from modal_images import eval_image
 
 REPO_ROOT = Path(__file__).resolve().parent
 PACK_NAME = "mmar-judging"
@@ -112,6 +117,8 @@ INGEST_DIR_NAME = "_local_ingest"
 LABELS_CSV_NAME = "labels.csv"
 GENERATIONS_CSV_NAME = "generations.csv"
 ACCURACY_JSON_NAME = "judge_accuracy.json"
+# Temporary: drop these generation models from Alt-Test scoring.
+ACCURACY_SKIP_MODELS = frozenset({"af-next-think"})
 LOCAL_MMAR_DATA_ROOT = REPO_ROOT / "data" / "mmar"
 LOCAL_MMAR_META = LOCAL_MMAR_DATA_ROOT / "MMAR-meta.jsonl"
 
@@ -489,12 +496,7 @@ def _entry_correct(entry: object) -> bool | None:
 
 
 def _sort_judge_keys(by_judge: dict) -> list[str]:
-    def _key(name: str) -> tuple[float, str]:
-        rho = (by_judge.get(name) or {}).get("advantage_prob")
-        rank = -float(rho) if isinstance(rho, (int, float)) else 1.0
-        return (rank, name)
-
-    return sorted(by_judge, key=_key)
+    return sorted(by_judge)
 
 
 def _score_judge_tables(
@@ -528,6 +530,13 @@ def report_judge_accuracy(
     if not labels_path.is_file():
         raise SystemExit(f"labels.csv not found at {labels_path}")
     rows = load_pack_label_rows(labels_path)
+    skipped = [row for row in rows if row["model_label"] in ACCURACY_SKIP_MODELS]
+    if ACCURACY_SKIP_MODELS:
+        rows = [row for row in rows if row["model_label"] not in ACCURACY_SKIP_MODELS]
+        print(
+            f"[run-judges] accuracy skip models={sorted(ACCURACY_SKIP_MODELS)} "
+            f"dropped_rows={len(skipped)}"
+        )
     if not rows:
         raise SystemExit(f"No labeled rows in {labels_path}")
 
@@ -580,6 +589,7 @@ def report_judge_accuracy(
         "labels_path": str(labels_path),
         "n_label_rows": len(rows),
         "n_questions": len(labeled_question_ids(rows)),
+        "skipped_models": sorted(ACCURACY_SKIP_MODELS),
         "epsilon": float(epsilon),
         "modes": accuracy_mode_names(stats),
     }
@@ -674,6 +684,7 @@ def _cuda_base_image(python_version: str = "3.12") -> modal.Image:
 def _mount_sources(image: modal.Image) -> modal.Image:
     return image.add_local_python_source(
         "modal_cache",
+        "modal_images",
         "mmar_common",
         "mmar_api",
         "audio_flamingo_runtime",
@@ -683,25 +694,6 @@ def _mount_sources(image: modal.Image) -> modal.Image:
         "mmar_models",
     )
 
-
-_INPROC_VLLM_ENV = {
-    "HF_XET_HIGH_PERFORMANCE": "1",
-    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-    "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-}
-
-# Same fused-MoE stand-in as run_experiment.py (Qwen3-Omni / Nemotron on A100).
-_FUSED_MOE_CONFIG_CMD = (
-    "D=/usr/local/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/configs && "
-    "SRC=\"$D/E=128,N=768,device_name=NVIDIA_H200.json\" && "
-    "if [ ! -f \"$SRC\" ]; then echo \"fused_moe: no H200 config, skipping\"; "
-    "else "
-    "for name in NVIDIA_A100_80GB_PCIe NVIDIA_A100-SXM4-80GB; do "
-    "DST=\"$D/E=128,N=768,device_name=$name.json\"; "
-    "cp -n \"$SRC\" \"$DST\" 2>/dev/null || cp \"$SRC\" \"$DST\"; "
-    "echo \"fused_moe: installed $name from H200\"; "
-    "done; fi"
-)
 
 # 0.28+ recommended for Qwen3.6 gated-delta hybrid / FP8 checkpoints.
 grader_image = _mount_sources(
@@ -723,29 +715,6 @@ grader_image = _mount_sources(
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         }
     )
-)
-
-# Suite judges load via mmar_models (same image/GPU as inference).
-large_mm_image = _mount_sources(
-    _cuda_base_image()
-    .uv_pip_install(
-        "vllm[audio]==0.28.0",
-        "transformers>=5.5.3",
-        "mistral-common[audio]",
-        "huggingface-hub>=0.30.0",
-        "librosa>=0.11.0",
-        "soundfile",
-        "soxr",
-        "av",
-        "numpy",
-        "tqdm>=4.67.0",
-        "accelerate>=1.14.0",
-        "torch",
-        "torchaudio",
-        extra_index_url=VLLM_WHEEL_INDEX,
-    )
-    .run_commands(_FUSED_MOE_CONFIG_CMD)
-    .env(_INPROC_VLLM_ENV)
 )
 
 cpu_image = _mount_sources(
@@ -1029,15 +998,13 @@ def _csv_parts(raw: str) -> list[str]:
 
 
 def _as_suite_judge(raw: str) -> str | None:
-    from grader import ROUND_ROBIN_SUITE, resolve_judge_model_id, _suite_label_for
+    from grader import resolve_judge_model_id, _suite_label_for
 
     for candidate in (raw.strip(), resolve_judge_model_id(raw)):
         if not candidate:
             continue
-        if candidate in ROUND_ROBIN_SUITE:
-            return candidate
         label = _suite_label_for(candidate)
-        if label in ROUND_ROBIN_SUITE:
+        if label:
             return label
     return None
 
@@ -1045,16 +1012,17 @@ def _as_suite_judge(raw: str) -> str | None:
 def _select_judges(
     judge_model_id: str,
 ) -> tuple[list[str], list[dict], list[str], str | None]:
-    """Suite labels, dedicated text judges, API labels, and the first requested.
+    """MODEL_SPECS labels, dedicated text judges, API labels, and the first requested.
 
-    Empty ``judge_model_id`` means the full vLLM suite (no API judges).
+    Empty ``judge_model_id`` means every uncommented ``mmar_models.MODEL_SPECS``
+    label (no API or JUDGE_SPECS text judges).
     """
-    from grader import ROUND_ROBIN_SUITE, resolve_judge_model_id
+    from grader import resolve_judge_model_id
     from mmar_api import expand_api_judge_token
 
     requested = _csv_parts(judge_model_id)
     if not requested:
-        suite = list(ROUND_ROBIN_SUITE)
+        suite = list(ALL_MODEL_LABELS)
         return suite, [], [], suite[0] if suite else None
 
     suite: list[str] = []
@@ -1195,7 +1163,7 @@ def grade_with_judge(
     from grader import (
         DEFAULT_GRADE_PROMPT,
         get_judge_format,
-        grade_predictions_file,
+        grade_predictions_pack,
         iter_grade_modes,
         judge_is_audio_model,
         load_grader,
@@ -1222,59 +1190,82 @@ def grade_with_judge(
     last_key = None
     last_prompt = DEFAULT_GRADE_PROMPT
     last_gold: bool | None = include_gold
+    progress_label = str(
+        handle.get("judge_label") or judge_label(judge_model_id)
+    )
+    mode_pairs: list[tuple[str, bool]] = []
     for prompt_name, gold_flag in iter_grade_modes(
         prompt=prompt, include_gold=include_gold
     ):
         fmt = get_judge_format(prompt_name, include_gold=gold_flag)
         if fmt.audio_included and not audio_ok:
             print(
-                f"[run-judges] skipping audio format {prompt_name} "
-                f"for text judge {judge_model_id}"
+                f"[{progress_label}] skipping audio format {prompt_name} "
+                f"for text judge {judge_model_id}",
+                flush=True,
             )
             continue
-        key = resolve_grade_judge_key(
-            handle, prompt=prompt_name, include_gold=gold_flag
-        )
-        last_key = key
-        last_prompt = prompt_name
-        last_gold = gold_flag
-        modes.append(
-            {"prompt": prompt_name, "include_gold": gold_flag, "judge_key": key}
-        )
+        mode_pairs.append((prompt_name, gold_flag))
+    n_gradees = len(model_labels)
+    print(
+        f"[{progress_label}] workload gradees={n_gradees} "
+        f"modes={len(mode_pairs)} "
+        f"n_labeled={len(question_ids) if question_ids is not None else 'all'}",
+        flush=True,
+    )
+    if mode_pairs:
         effective_batch_size = resolve_judge_batch_size(judge_model_id, batch_size)
-        for label in model_labels:
-            predictions_path = pack_dir / "models" / label / "predictions.jsonl"
-            print(
-                f"[run-judges] {label} with {key} "
-                f"(primary={primary_judge}, batch_size={effective_batch_size}"
-                f"{f', n_questions={n_questions}' if n_questions is not None else ''}"
-                f", n_labeled={len(question_ids) if question_ids is not None else 'all'}) "
-                f"-> {predictions_path}"
+        print(
+            f"[{progress_label}] flattening modes={len(mode_pairs)} "
+            f"gradees={n_gradees} into one generate "
+            f"batch_size={effective_batch_size}",
+            flush=True,
+        )
+        pack_result = grade_predictions_pack(
+            pack_dir,
+            handle,
+            model_labels,
+            batch_size=effective_batch_size,
+            force=force,
+            modes=mode_pairs,
+            sidecar=False,
+            make_primary=make_primary,
+            primary_judge=primary_judge,
+            n_questions=n_questions,
+            question_ids=question_ids,
+        )
+        per_model = pack_result.get("by_model") or {}
+        for prompt_name, gold_flag in mode_pairs:
+            key = resolve_grade_judge_key(
+                handle, prompt=prompt_name, include_gold=gold_flag
             )
-            per_model[f"{label}/{key}"] = grade_predictions_file(
-                predictions_path,
-                handle,
+            last_key = key
+            last_prompt = prompt_name
+            last_gold = gold_flag
+            modes.append(
+                {
+                    "prompt": prompt_name,
+                    "include_gold": gold_flag,
+                    "judge_key": key,
+                }
+            )
+            for label in model_labels:
+                stats = per_model.get(f"{label}/{key}")
+                if stats is not None:
+                    print(
+                        f"[{progress_label}] finished {label}/{key}:",
+                        stats,
+                        flush=True,
+                    )
+            manifest = _merge_judge_manifest(
+                manifest,
+                model_id=judge_model_id,
                 judge_key=key,
-                primary_judge=primary_judge,
-                batch_size=effective_batch_size,
-                force=force,
+                primary=primary_judge,
+                make_primary=make_primary,
                 prompt=prompt_name,
                 include_gold=gold_flag,
-                make_primary=make_primary,
-                n_questions=n_questions,
-                question_ids=question_ids,
             )
-            judging_volume.commit()
-            print(f"[run-judges] {label}:", per_model[f"{label}/{key}"])
-        manifest = _merge_judge_manifest(
-            manifest,
-            model_id=judge_model_id,
-            judge_key=key,
-            primary=primary_judge,
-            make_primary=make_primary,
-            prompt=prompt_name,
-            include_gold=gold_flag,
-        )
     write_json(pack_dir / "manifest.json", manifest)
     judging_volume.commit()
     return {
@@ -1306,7 +1297,7 @@ def _grade_suite_judge(
 ) -> dict:
     from grader import (
         compose_judge_key,
-        grade_predictions_file,
+        grade_predictions_pack,
         iter_grade_modes,
         load_grader,
     )
@@ -1323,45 +1314,55 @@ def _grade_suite_judge(
     per_model: dict[str, dict] = {}
     keys: list[str] = []
     modes: list[dict] = []
-    gradees = [label for label in model_labels if label != judge_label]
-    for prompt_name, gold_flag in iter_grade_modes(
-        prompt=prompt, include_gold=include_gold
-    ):
-        key = compose_judge_key(
-            judge_label, prompt=prompt_name, include_gold=gold_flag
+    gradees = list(model_labels)
+    mode_pairs = list(iter_grade_modes(prompt=prompt, include_gold=include_gold))
+    print(
+        f"[{judge_label}] workload gradees={len(gradees)} "
+        f"modes={len(mode_pairs)} "
+        f"n_labeled={len(question_ids) if question_ids is not None else 'all'}",
+        flush=True,
+    )
+    if mode_pairs:
+        print(
+            f"[{judge_label}] flattening modes={len(mode_pairs)} "
+            f"gradees={len(gradees)} into one generate",
+            flush=True,
         )
-        if key not in keys:
-            keys.append(key)
-            modes.append(
-                {
-                    "prompt": prompt_name,
-                    "include_gold": gold_flag,
-                    "judge_key": key,
-                }
+        pack_result = grade_predictions_pack(
+            pack_dir,
+            handle,
+            gradees,
+            modes=mode_pairs,
+            force=force,
+            batch_size=batch_size,
+            sidecar=True,
+            n_questions=n_questions,
+            question_ids=question_ids,
+            on_batch=lambda: judging_volume.commit(),
+        )
+        per_model = pack_result.get("by_model") or {}
+        for prompt_name, gold_flag in mode_pairs:
+            key = compose_judge_key(
+                judge_label, prompt=prompt_name, include_gold=gold_flag
             )
-        for gradee in gradees:
-            predictions_path = pack_dir / "models" / gradee / "predictions.jsonl"
-            sidecar = (
-                pack_dir / "models" / gradee / "judge_partials" / f"{key}.jsonl"
-            )
-            print(
-                f"[run-judges-rr] {judge_label} -> {gradee} key={key} "
-                f"sidecar={sidecar}"
-            )
-            per_model[f"{gradee}/{key}"] = grade_predictions_file(
-                predictions_path,
-                handle,
-                judge_key=key,
-                batch_size=batch_size,
-                force=force,
-                prompt=prompt_name,
-                include_gold=gold_flag,
-                sidecar_path=sidecar,
-                n_questions=n_questions,
-                question_ids=question_ids,
-            )
-            judging_volume.commit()
-            print(f"[run-judges-rr] {gradee}/{key}:", per_model[f"{gradee}/{key}"])
+            if key not in keys:
+                keys.append(key)
+                modes.append(
+                    {
+                        "prompt": prompt_name,
+                        "include_gold": gold_flag,
+                        "judge_key": key,
+                    }
+                )
+            for gradee in gradees:
+                stats = per_model.get(f"{gradee}/{key}")
+                if stats is not None:
+                    print(
+                        f"[{judge_label}] finished {gradee}/{key}:",
+                        stats,
+                        flush=True,
+                    )
+    judging_volume.commit()
     return {
         "status": "ok",
         "judge_label": judge_label,
@@ -1377,68 +1378,120 @@ def _grade_suite_judge(
     }
 
 
+# ---------------------------------------------------------------------------
+# Modal suite-judge workers (one GPU function per MODEL_SPECS label)
+# ---------------------------------------------------------------------------
+# single_use_containers keeps a GPU from being reused after that model returns.
+
+_PACK_VOLUMES = {
+    VOLUME_MOUNT: volume,
+    JUDGING_MOUNT: judging_volume,
+}
+
 _SUITE_GRADE_KW = dict(
-    image=large_mm_image,
     timeout=12 * 60 * 60,
-    volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
+    volumes=_PACK_VOLUMES,
     secrets=[hf_secret],
     memory=65536,
+    single_use_containers=True,
 )
 
 
-@app.function(gpu="L40S", **_SUITE_GRADE_KW)
-def grade_suite_l40s(
-    judge_label: str,
-    model_labels: list[str],
-    include_gold: bool | None = None,
-    prompt: str | None = None,
-    force: bool = False,
-    batch_size: int | None = None,
-    n_questions: int | None = None,
-    question_ids: list[str] | None = None,
-) -> dict:
-    return _grade_suite_judge(
-        judge_label,
-        model_labels=model_labels,
-        include_gold=include_gold,
-        prompt=prompt,
-        force=force,
-        batch_size=batch_size,
-        n_questions=n_questions,
-        question_ids=question_ids,
+def _suite_grade_function(label: str, image: modal.Image, gpu: str):
+    def run(**kwargs) -> dict:
+        return _grade_suite_judge(label, **kwargs)
+
+    # Modal rejects nested @app.function unless serialized=True (cloudpickle
+    # from this process into the CUDA image). Give the worker a global
+    # __qualname__ and bind it on the module so FILE load works. Dots must
+    # go too: a dotted __qualname__ looks like a class method.
+    name = f"grade_{label.replace('-', '_').replace('.', '_')}"
+    run.__name__ = name
+    run.__qualname__ = name
+    fn = app.function(
+        image=image, gpu=gpu, name=f"grade-{label}", **_SUITE_GRADE_KW
+    )(run)
+    globals()[name] = fn
+    return fn
+
+
+_GRADE_FNS = {}
+_missing_grade = []
+for _label in ALL_MODEL_LABELS:
+    _gpu = MODEL_SPECS[_label].get("gpu")
+    if not _gpu:
+        _missing_grade.append(_label)
+        continue
+    _GRADE_FNS[_label] = _suite_grade_function(
+        _label,
+        eval_image.add_local_python_source("alt_test"),
+        str(_gpu),
     )
+if _missing_grade:
+    raise RuntimeError(f"No GPU grade worker for models: {_missing_grade}")
 
 
-@app.function(gpu="H100", **_SUITE_GRADE_KW)
-def grade_suite_h100(
-    judge_label: str,
-    model_labels: list[str],
-    include_gold: bool | None = None,
-    prompt: str | None = None,
-    force: bool = False,
-    batch_size: int | None = None,
-    n_questions: int | None = None,
-    question_ids: list[str] | None = None,
-) -> dict:
-    return _grade_suite_judge(
-        judge_label,
-        model_labels=model_labels,
-        include_gold=include_gold,
-        prompt=prompt,
-        force=force,
-        batch_size=batch_size,
-        n_questions=n_questions,
-        question_ids=question_ids,
-    )
+def _suite_grade_fn(label: str):
+    fn = _GRADE_FNS.get(label)
+    if fn is None:
+        raise SystemExit(f"No GPU worker for judge {label!r}")
+    return fn
 
 
-_SUITE_GRADE_FNS = {
-    "qwen2.5-omni-7b": grade_suite_l40s,
-    "phi-4-multimodal": grade_suite_l40s,
-    "gemma-4-e4b": grade_suite_l40s,
-    "qwen3-omni-instruct": grade_suite_h100,
-    "nemotron-3-nano-omni": grade_suite_h100,
-}
+def _peek_sidecar_meta(path: Path) -> dict:
+    """First-row judge_key / model_id from a sidecar, else filename stem."""
+    from grader import parse_judge_key
+
+    key = path.stem
+    model_id = ""
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                row = json.loads(stripped)
+                key = str(row.get("judge_key") or key)
+                entry = row.get("entry") or {}
+                if isinstance(entry, dict):
+                    model_id = str(entry.get("model_id") or "")
+                break
+    parsed = parse_judge_key(key)
+    gold_tag = str(parsed.get("gold_tag") or "").lower()
+    include_gold = None
+    if gold_tag == "gold":
+        include_gold = True
+    elif gold_tag == "nongold":
+        include_gold = False
+    if not model_id:
+        from grader import JUDGE_SPECS
+        from mmar_models import MODEL_SPECS
+
+        spec = MODEL_SPECS.get(parsed["model"]) or JUDGE_SPECS.get(parsed["model"]) or {}
+        model_id = str(spec.get("model_id") or parsed["model"] or "")
+    return {
+        "judge_key": key,
+        "model_id": model_id,
+        "prompt": parsed.get("prompt") or None,
+        "include_gold": include_gold,
+    }
+
+
+def _judge_entries_from_partials(
+    pack_dir: Path, model_labels: list[str]
+) -> list[dict]:
+    """One manifest entry per sidecar key found under the given gradees."""
+    by_key: dict[str, dict] = {}
+    for label in model_labels:
+        partials_dir = pack_dir / "models" / label / "judge_partials"
+        if not partials_dir.is_dir():
+            continue
+        for path in sorted(partials_dir.glob("*.jsonl")):
+            meta = _peek_sidecar_meta(path)
+            key = str(meta.get("judge_key") or "")
+            if key and key not in by_key:
+                by_key[key] = meta
+    return list(by_key.values())
 
 
 @app.function(
@@ -1447,12 +1500,15 @@ _SUITE_GRADE_FNS = {
     volumes={VOLUME_MOUNT: volume, JUDGING_MOUNT: judging_volume},
 )
 def merge_round_robin(
-    model_labels: list[str],
-    judge_entries: list[dict],
+    model_labels: list[str] | None = None,
+    judge_entries: list[dict] | None = None,
     make_primary: bool = False,
     primary_judge: str | None = None,
 ) -> dict:
-    """Fold judge sidecars into predictions.jsonl and append manifest entries."""
+    """Fold judge sidecars into predictions.jsonl and append manifest entries.
+
+    Empty ``model_labels`` / ``judge_entries`` means discover from the pack.
+    """
     from grader import apply_judge_partials
 
     judging_volume.reload()
@@ -1460,8 +1516,17 @@ def merge_round_robin(
     manifest = _load_manifest(pack_dir)
     _assert_freeform_run(manifest)
 
+    labels = list(model_labels or [])
+    if not labels:
+        labels = discover_model_labels(pack_dir, manifest=manifest)
+    if not labels:
+        raise SystemExit(f"No model predictions found under {pack_dir / 'models'}")
+    entries = list(judge_entries or [])
+    if not entries:
+        entries = _judge_entries_from_partials(pack_dir, labels)
+
     by_model: dict[str, dict] = {}
-    for label in model_labels:
+    for label in labels:
         pred = pack_dir / "models" / label / "predictions.jsonl"
         partials_dir = pack_dir / "models" / label / "judge_partials"
         paths = sorted(partials_dir.glob("*.jsonl")) if partials_dir.is_dir() else []
@@ -1473,7 +1538,9 @@ def merge_round_robin(
         )
         print(f"[run-judges-rr] merged {label}:", by_model[label])
 
-    for entry in judge_entries:
+    for entry in entries:
+        if not str(entry.get("judge_key") or ""):
+            continue
         manifest = _merge_judge_manifest(
             manifest,
             model_id=str(entry.get("model_id") or ""),
@@ -1672,25 +1739,19 @@ def _spawn_remote_judges(
 ) -> tuple[list[tuple[str, object]], list[tuple[dict, object]]]:
     suite_handles: list[tuple[str, object]] = []
     for label in suite:
-        fn = _SUITE_GRADE_FNS.get(label)
-        if fn is None:
-            raise SystemExit(f"No GPU worker for suite judge {label!r}")
-        print(f"[run-judges] spawning suite judge {label}")
-        suite_handles.append(
-            (
-                label,
-                fn.spawn(
-                    label,
-                    model_labels=gradees,
-                    include_gold=include_gold,
-                    prompt=prompt,
-                    force=force,
-                    batch_size=batch_size,
-                    n_questions=n_questions,
-                    question_ids=question_ids,
-                ),
-            )
+        fn = _suite_grade_fn(label)
+        print(f"[run-judges] spawning MODEL_SPECS judge {label}")
+        call = fn.spawn(
+            model_labels=gradees,
+            include_gold=include_gold,
+            prompt=prompt,
+            force=force,
+            batch_size=batch_size,
+            n_questions=n_questions,
+            question_ids=question_ids,
         )
+        print(f"Spawned {label} call_id={call.object_id}")
+        suite_handles.append((label, call))
 
     dedicated_handles: list[tuple[dict, object]] = []
     for i, entry in enumerate(dedicated):
@@ -2177,7 +2238,8 @@ def parse_args() -> argparse.Namespace:
         "--judge-model-id",
         default="",
         help="Comma-separated judges, 'api' for live API judges, "
-        "or 'batch' for OpenAI/Anthropic Batch API judges",
+        "or 'batch' for OpenAI/Anthropic Batch API judges. "
+        "Empty: every uncommented mmar_models.MODEL_SPECS label",
     )
     parser.add_argument("--models", default="all")
     parser.add_argument("--make-primary", action="store_true")
@@ -2214,6 +2276,12 @@ def parse_args() -> argparse.Namespace:
         "do not grade.",
     )
     parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Fold judge_partials sidecars into predictions.jsonl on the "
+        "judging volume; do not grade.",
+    )
+    parser.add_argument(
         "--epsilon",
         type=float,
         default=DEFAULT_EPSILON,
@@ -2240,10 +2308,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_merge_only(
+    *,
+    models: str = "all",
+    make_primary: bool = False,
+) -> dict:
+    labels = _csv_parts(models) if models and models.strip().lower() != "all" else []
+    merge = merge_round_robin.remote(
+        model_labels=labels,
+        judge_entries=[],
+        make_primary=make_primary,
+        primary_judge=None,
+    )
+    print("Merged:", merge)
+    return {"merge": merge}
+
+
 def _run_judges_from_args(args: argparse.Namespace) -> dict:
     if args.accuracy_only:
         pack_dir = _require_local_pack()
         return report_judge_accuracy(pack_dir, epsilon=args.epsilon)
+    if args.merge_only:
+        return _run_merge_only(
+            models=args.models,
+            make_primary=args.make_primary,
+        )
     return _run_judges(
         judge_model_id=args.judge_model_id,
         models=args.models,
@@ -2270,6 +2359,10 @@ if __name__ == "__main__":
     args = parse_args()
     if args.accuracy_only:
         _run_judges_from_args(args)
+    elif args.merge_only:
+        with modal.enable_output():
+            with app.run():
+                _run_judges_from_args(args)
     else:
         suite, dedicated, _api, _first = _select_judges(args.judge_model_id)
         if suite or dedicated:

@@ -44,7 +44,6 @@ PREFIX_ASSISTANT_THINK_LABELS = frozenset(
     {
         "af-next-think",
         "music-flamingo",
-        "mimo-audio-7b",
     }
 )
 _EMPTY_THINK_TAIL_RE = re.compile(r"<think>\s*</think>\s*$", re.IGNORECASE)

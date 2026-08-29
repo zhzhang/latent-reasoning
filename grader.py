@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,16 +123,6 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
 }
 
 ALL_JUDGE_LABELS = tuple(JUDGE_SPECS.keys())
-
-# Open vLLM models that grade each other in round-robin (not mimo / voxtral /
-# AF-Next / Thinking unless they appear in a run and are passed explicitly).
-ROUND_ROBIN_SUITE: tuple[str, ...] = (
-    "qwen2.5-omni-7b",
-    "phi-4-multimodal",
-    "gemma-4-e4b",
-    "qwen3-omni-instruct",
-    "nemotron-3-nano-omni",
-)
 
 # Named formats live in ``JUDGE_FORMATS`` below. Default runs still use
 # with_gt / free via include_gold; ``--grade-prompt`` selects any table
@@ -1014,10 +1005,37 @@ def _grade_reuse_key(
     prediction: str,
     *,
     include_gold: bool,
-) -> tuple[str, str, str]:
-    """Identity of a grade prompt: question, gold (if shown), normalized answer."""
+    prompt: str | None = None,
+) -> tuple[str, ...]:
+    """Identity of a grade prompt: optional format, question, gold, answer.
+
+    ``prompt`` is prepended when given so ``with_gt`` and ``neutral_with_gt``
+    (both show gold) do not share verdicts. Callers that grade one format at
+    a time may omit it; the 3-tuple shape stays stable for those caches.
+    """
     gold = str(answer or "") if include_gold else ""
-    return (str(question or ""), gold, _normalize_grade_answer(prediction))
+    body = (str(question or ""), gold, _normalize_grade_answer(prediction))
+    if prompt is None:
+        return body
+    name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    return (name, *body)
+
+
+def _job_grade_spec(
+    job: dict,
+    *,
+    prompt: str,
+    include_gold: bool,
+) -> tuple[str, bool, JudgeFormat]:
+    """Per-job format: ``job['prompt']`` / ``job['include_gold']`` override the batch."""
+    job_prompt = job.get("prompt", prompt)
+    if job.get("include_gold") is not None:
+        job_gold = bool(job["include_gold"])
+    else:
+        job_gold = include_gold
+    name = normalize_grade_prompt(job_prompt, include_gold=job_gold)
+    fmt = get_judge_format(name, include_gold=job_gold)
+    return name, fmt.include_gold, fmt
 
 
 def _shots_in_index_order(
@@ -1229,7 +1247,7 @@ def remaining_grade_work(
 
 
 def _suite_label_for(model_id: str) -> str | None:
-    """Return a MODEL_SPECS label when ``model_id`` is a suite alias or HF id."""
+    """Return a MODEL_SPECS label when ``model_id`` is a spec key or HF id."""
     from mmar_models import MODEL_SPECS
 
     key = str(model_id or "").strip()
@@ -1247,7 +1265,7 @@ def judge_is_audio_model(
     model_id: str | None = None,
     handle: dict[str, Any] | None = None,
 ) -> bool:
-    """True when this judge can hear MMAR audio (suite or API audio models)."""
+    """True when this judge can hear MMAR audio (MODEL_SPECS or API)."""
     if handle and handle.get("suite_label"):
         return True
     if handle and handle.get("backend") in {"openai", "gemini"}:
@@ -1288,7 +1306,7 @@ def require_audio_nongold_judge(
     raise SystemExit(
         "Audio grading requires an audio-capable judge that receives the "
         f"clip (got {shown!r}). Text-only judges cannot grade this format; "
-        "use a suite or API audio model, or a text-only with-GT recipe."
+        "use a MODEL_SPECS or API audio model, or a text-only with-GT recipe."
     )
 
 
@@ -1349,15 +1367,18 @@ def load_grader(
         sampling = _grade_sampling_for_engine(
             spec.get("engine") or {}, spec.get("sampling") or {}
         )
+        backend = loaded.get("backend") or spec.get("backend")
         print(
             f"Freeform grader ready (suite): {suite_label} ({spec['model_id']}) "
-            f"sampling={sampling}"
+            f"backend={backend} sampling={sampling}"
         )
         chat_kwargs = loaded.get("chat_kwargs") or {}
         try:
             from vllm import SamplingParams
         except ImportError:
             SamplingParams = None  # type: ignore[misc, assignment]
+        # HF .chat() is sequential; small chunks keep progress logs moving.
+        hf_chat = llm is None and loaded.get("model") is not None
         return {
             "llm": llm,
             "model": loaded.get("model"),
@@ -1365,7 +1386,7 @@ def load_grader(
             "model_id": spec["model_id"],
             "judge_label": suite_label,
             "suite_label": suite_label,
-            "backend": loaded.get("backend") or spec.get("backend"),
+            "backend": backend,
             "sampling_rate": int(
                 loaded.get("sampling_rate") or spec.get("sampling_rate") or 16000
             ),
@@ -1375,7 +1396,11 @@ def load_grader(
             "lora_request": loaded.get("lora_request"),
             "chat_kwargs": chat_kwargs,
             "chat_template_kwargs": chat_kwargs.get("chat_template_kwargs") or {},
-            "batch_size": int((spec.get("engine") or {}).get("max_num_seqs") or 32),
+            "batch_size": (
+                8
+                if hf_chat
+                else int((spec.get("engine") or {}).get("max_num_seqs") or 32)
+            ),
         }
 
     from modal_cache import configure_compile_cache
@@ -1631,12 +1656,6 @@ NONGOLD_AUDIO_PROMPT_TEMPLATES: dict[str, str] = {
         "<sound>{fields}<|im_end|>\n"
         "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
     ),
-    "mimo-audio-7b": (
-        "<|im_start|>user\n"
-        "{instructions}\n\n"
-        "<|sosp|><|empty|><|eosp|>{fields}<|im_end|>\n"
-        "<|im_start|>assistant\n" + ASSISTANT_THINK_OPEN
-    ),
 }
 
 # Chat-message backends (not a string template). Slots match the format fields.
@@ -1797,7 +1816,7 @@ _DEFAULT_RENDER_AUDIO = "/cache/data/mmar/audio/example.wav"
 
 
 def judge_render_labels() -> tuple[str, ...]:
-    """Labels ``render_judge_prompt`` can dump (suite, dedicated, API)."""
+    """Labels ``render_judge_prompt`` can dump (MODEL_SPECS, dedicated, API)."""
     from mmar_api import API_SPECS
     from mmar_models import ALL_MODEL_LABELS
 
@@ -1811,10 +1830,9 @@ def judge_render_labels() -> tuple[str, ...]:
                 labels.append(key)
                 seen.add(key)
 
-    _add(ROUND_ROBIN_SUITE)
+    _add(ALL_MODEL_LABELS)
     _add(JUDGE_SPECS)
     _add(NONGOLD_AUDIO_PROMPT_TEMPLATES)
-    _add(ALL_MODEL_LABELS)
     _add(API_SPECS)
     return tuple(labels)
 
@@ -1888,7 +1906,7 @@ def judge_can_hear_audio(label: str) -> bool:
         return False
     if is_api_judge(label):
         return True
-    if label in ROUND_ROBIN_SUITE or label in NONGOLD_AUDIO_PROMPT_TEMPLATES:
+    if label in NONGOLD_AUDIO_PROMPT_TEMPLATES:
         return True
     return label in MODEL_SPECS
 
@@ -2060,8 +2078,10 @@ def _grade_results_from_texts(
     include_gold: bool,
 ) -> list[dict]:
     results: list[dict] = []
-    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     for job, text in zip(jobs, texts):
+        prompt_name, gold, _ = _job_grade_spec(
+            job, prompt=prompt, include_gold=include_gold
+        )
         fields = _verdict_fields(text)
         results.append(
             {
@@ -2071,7 +2091,7 @@ def _grade_results_from_texts(
                 "answer": job.get("answer"),
                 "prediction": job.get("prediction"),
                 "prompt": prompt_name,
-                "include_gold": bool(include_gold),
+                "include_gold": gold,
             }
         )
     return results
@@ -2087,8 +2107,11 @@ def _grade_results_from_sample_groups(
 ) -> list[dict]:
     """One result per job: majority vote over ``n`` sampled judge replies."""
     results: list[dict] = []
-    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    fallback_gold = include_gold
     for job, texts in zip(jobs, sample_groups):
+        prompt_name, gold, _ = _job_grade_spec(
+            job, prompt=prompt, include_gold=fallback_gold
+        )
         sample_fields = [_verdict_fields(text) for text in texts]
         raw = [item["grader_verdict_raw"] for item in sample_fields]
         majority = majority_grade_verdict(raw)
@@ -2132,7 +2155,7 @@ def _grade_results_from_sample_groups(
                 "answer": job.get("answer"),
                 "prediction": job.get("prediction"),
                 "prompt": prompt_name,
-                "include_gold": bool(include_gold),
+                "include_gold": gold,
             }
         )
     return results
@@ -2141,6 +2164,120 @@ def _grade_results_from_sample_groups(
 # ---------------------------------------------------------------------------
 # Batch grading
 # ---------------------------------------------------------------------------
+
+
+def _is_hf_chat_handle(handle: dict[str, Any]) -> bool:
+    """True when the suite loader fell back to Transformers ``model.chat()``."""
+    model = handle.get("model")
+    return handle.get("llm") is None and model is not None and callable(
+        getattr(model, "chat", None)
+    )
+
+
+def _hf_generation_config(
+    handle: dict[str, Any],
+    *,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    seed: int | None = None,
+    n: int = 1,
+) -> dict[str, Any]:
+    """Map judge sampling onto an HF ``generation_config``."""
+    sampling = dict(handle.get("sampling") or {})
+    if max_tokens is not None:
+        sampling["max_tokens"] = int(max_tokens)
+    t = 0.0 if temperature is None else float(temperature)
+    if max(1, int(n)) > 1 and t <= 0:
+        t = 1.0
+    cfg: dict[str, Any] = {
+        "max_new_tokens": int(sampling.get("max_tokens") or DEFAULT_JUDGE_MAX_TOKENS),
+        "do_sample": t > 0,
+        "top_p": float(sampling.get("top_p") or 1.0),
+        "repetition_penalty": float(sampling.get("repetition_penalty") or 1.0),
+    }
+    if t > 0:
+        cfg["temperature"] = t
+    if seed is not None:
+        cfg["seed"] = int(seed)
+    elif sampling.get("seed") is not None:
+        cfg["seed"] = int(sampling["seed"])
+    return cfg
+
+
+def _run_hf_chat(
+    handle: dict[str, Any],
+    messages_list: list[list[dict[str, Any]]],
+    *,
+    generation_config: dict[str, Any],
+) -> list[str]:
+    """Call ``model.chat(tokenizer, generation_config, messages)`` one job at a time."""
+    import torch
+
+    from audio_flamingo_runtime import seed_everything
+
+    seed = generation_config.get("seed")
+    if seed is not None:
+        seed_everything(int(seed))
+    cfg = {key: value for key, value in generation_config.items() if key != "seed"}
+    model = handle["model"]
+    tokenizer = handle["tokenizer"]
+    texts: list[str] = []
+    with torch.inference_mode():
+        for messages in messages_list:
+            response = model.chat(tokenizer, cfg, messages)
+            if isinstance(response, tuple):
+                response = response[0]
+            texts.append(str(response or ""))
+    return texts
+
+
+def _grade_hf_chat_messages(
+    handle: dict[str, Any],
+    jobs: list[dict],
+    messages_list: list[list[dict[str, Any]]],
+    *,
+    max_tokens: int | None,
+    prompt_name: str,
+    include_gold: bool,
+    n_samples: int,
+    temperature: float | None,
+) -> list[dict]:
+    model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
+    n_samples = max(1, int(n_samples))
+    if n_samples <= 1:
+        cfg = _hf_generation_config(
+            handle, max_tokens=max_tokens, temperature=temperature
+        )
+        texts = _run_hf_chat(handle, messages_list, generation_config=cfg)
+        return _grade_results_from_texts(
+            jobs,
+            texts,
+            model_id=model_id,
+            prompt=prompt_name,
+            include_gold=include_gold,
+        )
+    sample_groups: list[list[str]] = []
+    for messages in messages_list:
+        group: list[str] = []
+        for shot_i in range(n_samples):
+            cfg = _hf_generation_config(
+                handle,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=shot_i,
+                n=n_samples,
+            )
+            group.extend(
+                _run_hf_chat(handle, [messages], generation_config=cfg)
+            )
+        sample_groups.append(group)
+    return _grade_results_from_sample_groups(
+        jobs,
+        sample_groups,
+        model_id=model_id,
+        prompt=prompt_name,
+        include_gold=include_gold,
+    )
 
 
 def _grade_results_from_audio_outputs(
@@ -2179,6 +2316,167 @@ def _grade_results_from_audio_outputs(
     )
 
 
+def _text_grade_user_messages(
+    job: dict, prompt_name: str, include_gold: bool
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": build_grade_prompt(
+                        question=str(job.get("question") or ""),
+                        answer=str(job.get("answer") or ""),
+                        prediction=str(job.get("prediction") or ""),
+                        prompt=prompt_name,
+                        include_gold=include_gold,
+                    ),
+                }
+            ],
+        }
+    ]
+
+
+def _require_job_audio_path(job: dict) -> Path:
+    audio_path = resolve_grade_audio_path(str(job.get("audio_path") or "") or None)
+    if audio_path is None:
+        raise SystemExit(
+            "Audio grading needs a readable wav for each question; "
+            f"missing audio_path for id={job.get('id')!r} "
+            f"path={job.get('audio_path')!r}"
+        )
+    return audio_path
+
+
+def _chat_messages_for_grade_job(
+    handle: dict[str, Any],
+    job: dict,
+    spec: tuple[str, bool, JudgeFormat],
+    *,
+    audio_type: str,
+) -> list[dict[str, Any]]:
+    prompt_name, include_gold, fmt = spec
+    if not fmt.audio_included:
+        return _text_grade_user_messages(job, prompt_name, include_gold)
+    label = str(handle.get("suite_label") or handle.get("judge_label") or "")
+    instructions = _adapt_judge_instructions(label, fmt.prompt)
+    return _nongold_audio_chat_messages(
+        instructions,
+        str(job.get("question") or ""),
+        str(job.get("prediction") or ""),
+        _require_job_audio_path(job),
+        audio_type=audio_type,
+        closer=fmt.closer,
+        answer=str(job.get("answer") or ""),
+        field_templates=fmt.field_templates,
+    )
+
+
+def _vllm_text_grade_prompt(
+    handle: dict[str, Any],
+    job: dict,
+    prompt_name: str,
+    include_gold: bool,
+) -> str:
+    tokenizer = handle.get("tokenizer")
+    if tokenizer is None:
+        getter = getattr(handle.get("llm"), "get_tokenizer", None)
+        tokenizer = getter() if callable(getter) else None
+    if tokenizer is None:
+        raise SystemExit("Text grade jobs need a tokenizer on the judge handle")
+    return _format_chat(
+        tokenizer,
+        build_grade_prompt(
+            question=str(job.get("question") or ""),
+            answer=str(job.get("answer") or ""),
+            prediction=str(job.get("prediction") or ""),
+            prompt=prompt_name,
+            include_gold=include_gold,
+        ),
+        chat_template_kwargs=handle.get("chat_template_kwargs") or {},
+    )
+
+
+def _vllm_generate_item_for_grade_job(
+    handle: dict[str, Any],
+    job: dict,
+    spec: tuple[str, bool, JudgeFormat],
+    *,
+    label: str,
+    sampling_rate: int,
+) -> str | dict[str, Any]:
+    from mmar_models import _load_audio_tuple
+
+    prompt_name, include_gold, fmt = spec
+    if not fmt.audio_included:
+        return _vllm_text_grade_prompt(handle, job, prompt_name, include_gold)
+    audio_path = _require_job_audio_path(job)
+    instructions = _adapt_judge_instructions(label, fmt.prompt)
+    fields = fmt.fields(
+        question=str(job.get("question") or ""),
+        answer=str(job.get("answer") or ""),
+        prediction=str(job.get("prediction") or ""),
+    )
+    audio = _load_audio_tuple(str(audio_path), sampling_rate)
+    return {
+        "prompt": _nongold_audio_prompt_string(
+            label, instructions, fields, fmt.closer
+        ),
+        "multi_modal_data": {"audio": audio},
+    }
+
+
+def _voxtral_item_for_grade_job(
+    handle: dict[str, Any],
+    job: dict,
+    spec: tuple[str, bool, JudgeFormat],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    from mistral_common.protocol.instruct.chunk import AudioChunk, TextChunk
+    from mistral_common.protocol.instruct.messages import UserMessage
+    from mistral_common.tokens.tokenizers.audio import Audio
+
+    prompt_name, include_gold, fmt = spec
+    tokenizer = handle["tokenizer"]
+    if not fmt.audio_included:
+        text = build_grade_prompt(
+            question=str(job.get("question") or ""),
+            answer=str(job.get("answer") or ""),
+            prediction=str(job.get("prediction") or ""),
+            prompt=prompt_name,
+            include_gold=include_gold,
+        )
+        messages = [UserMessage(content=[TextChunk(text=text)]).to_openai()]
+        return {
+            "prompt_token_ids": tokenizer.apply_chat_template(messages=messages)
+        }
+    instructions = _adapt_judge_instructions(label, fmt.prompt)
+    audio_path = _require_job_audio_path(job)
+    fields = fmt.fields_with_closer(
+        question=str(job.get("question") or ""),
+        answer=str(job.get("answer") or ""),
+        prediction=str(job.get("prediction") or ""),
+    )
+    audio = Audio.from_file(str(audio_path), strict=False)
+    messages = [
+        UserMessage(
+            content=[
+                TextChunk(text=instructions),
+                AudioChunk.from_audio(audio),
+                TextChunk(text=fields),
+            ]
+        ).to_openai()
+    ]
+    return {
+        "prompt_token_ids": tokenizer.apply_chat_template(messages=messages),
+        "multi_modal_data": {
+            "audio": [(audio.audio_array, audio.sampling_rate)]
+        },
+    }
+
+
 def _grade_shot_batch_audio(
     handle: dict[str, Any],
     jobs: list[dict],
@@ -2189,22 +2487,25 @@ def _grade_shot_batch_audio(
     n_samples: int = 1,
     temperature: float | None = None,
 ) -> list[dict]:
-    """Audio path: judges hear the clip, then question / optional gold / response.
+    """One ``chat`` / ``generate`` for mixed audio and text grade jobs.
 
-    ``n_samples > 1`` majority-votes that many completions per job. Plain vLLM
-    backends use ``SamplingParams(n=...)``. Omni / HF duplicate the prompt
-    (those backends cannot fork ``n`` on one prefill).
+    Jobs that include a clip keep the audio-then-fields layout. Text-only
+    jobs (with-GT, gold-no-audio, …) use the text grade prompt so a run can
+    send every format in one vLLM call. ``n_samples > 1`` majority-votes
+    that many completions per job. Plain vLLM backends use
+    ``SamplingParams(n=...)``. HF duplicates the prompt (those backends
+    cannot fork ``n`` on one prefill).
     """
-    from mmar_models import backend_duplicates_shots, _load_audio_tuple
+    from mmar_models import backend_duplicates_shots
 
     label = str(handle.get("suite_label") or handle.get("judge_label") or "")
     backend = str(handle.get("backend") or "vllm")
     sampling_rate = int(handle.get("sampling_rate") or 16000)
-    fmt = get_judge_format(prompt, include_gold=include_gold)
-    include_gold = fmt.include_gold
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
-    instructions = _adapt_judge_instructions(label, fmt.prompt)
-    closer = fmt.closer
+    specs = [
+        _job_grade_spec(job, prompt=prompt_name, include_gold=include_gold)
+        for job in jobs
+    ]
     n_samples = max(1, int(n_samples))
     duplicate_prompts = n_samples > 1 and backend_duplicates_shots(backend)
     sampling = _grade_sampling(
@@ -2217,17 +2518,6 @@ def _grade_shot_batch_audio(
     if handle.get("lora_request") is not None:
         generate_kwargs["lora_request"] = handle["lora_request"]
 
-    resolved: list[tuple[dict, Path]] = []
-    for job in jobs:
-        audio_path = resolve_grade_audio_path(str(job.get("audio_path") or "") or None)
-        if audio_path is None:
-            raise SystemExit(
-                "Audio grading needs a readable wav for each question; "
-                f"missing audio_path for id={job.get('id')!r} "
-                f"path={job.get('audio_path')!r}"
-            )
-        resolved.append((job, audio_path))
-
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
     result_kwargs = dict(
         n_samples=n_samples,
@@ -2239,16 +2529,10 @@ def _grade_shot_batch_audio(
     if backend == "vllm_chat":
         chat_kwargs = dict(handle.get("chat_kwargs") or {})
         messages = [
-            _nongold_audio_chat_messages(
-                instructions,
-                str(job.get("question") or ""),
-                str(job.get("prediction") or ""),
-                audio_path,
-                closer=closer,
-                answer=str(job.get("answer") or ""),
-                field_templates=fmt.field_templates,
+            _chat_messages_for_grade_job(
+                handle, job, spec, audio_type="audio_url"
             )
-            for job, audio_path in resolved
+            for job, spec in zip(jobs, specs)
         ]
         outputs = handle["llm"].chat(
             messages, sampling_params=sampling, **chat_kwargs
@@ -2256,20 +2540,24 @@ def _grade_shot_batch_audio(
         return _grade_results_from_audio_outputs(
             jobs, outputs=outputs, **result_kwargs
         )
-    if backend in {"hf_chat", "vllm_transformers"}:
+    if _is_hf_chat_handle(handle) or backend in {"hf_chat", "vllm_transformers"}:
         messages = [
-            _nongold_audio_chat_messages(
-                instructions,
-                str(job.get("question") or ""),
-                str(job.get("prediction") or ""),
-                audio_path,
-                audio_type="audio",
-                closer=closer,
-                answer=str(job.get("answer") or ""),
-                field_templates=fmt.field_templates,
+            _chat_messages_for_grade_job(
+                handle, job, spec, audio_type="audio"
             )
-            for job, audio_path in resolved
+            for job, spec in zip(jobs, specs)
         ]
+        if _is_hf_chat_handle(handle):
+            return _grade_hf_chat_messages(
+                handle,
+                jobs,
+                messages,
+                max_tokens=max_tokens,
+                prompt_name=prompt_name,
+                include_gold=include_gold,
+                n_samples=n_samples,
+                temperature=temperature,
+            )
         chat_kwargs = dict(handle.get("chat_kwargs") or {})
         if duplicate_prompts:
             sample_groups: list[list[str]] = []
@@ -2300,123 +2588,23 @@ def _grade_shot_batch_audio(
             jobs, outputs=outputs, **result_kwargs
         )
     if backend == "vllm_voxtral":
-        from mistral_common.protocol.instruct.chunk import AudioChunk, TextChunk
-        from mistral_common.protocol.instruct.messages import UserMessage
-        from mistral_common.tokens.tokenizers.audio import Audio
-
-        tokenizer = handle["tokenizer"]
-        prompts = []
-        for job, audio_path in resolved:
-            fields = fmt.fields_with_closer(
-                question=str(job.get("question") or ""),
-                answer=str(job.get("answer") or ""),
-                prediction=str(job.get("prediction") or ""),
-            )
-            audio = Audio.from_file(str(audio_path), strict=False)
-            messages = [
-                UserMessage(
-                    content=[
-                        TextChunk(text=instructions),
-                        AudioChunk.from_audio(audio),
-                        TextChunk(text=fields),
-                    ]
-                ).to_openai()
-            ]
-            prompts.append(
-                {
-                    "prompt_token_ids": tokenizer.apply_chat_template(
-                        messages=messages
-                    ),
-                    "multi_modal_data": {
-                        "audio": [(audio.audio_array, audio.sampling_rate)]
-                    },
-                }
-            )
+        prompts = [
+            _voxtral_item_for_grade_job(handle, job, spec, label=label)
+            for job, spec in zip(jobs, specs)
+        ]
         outputs = handle["llm"].generate(
             prompts, sampling_params=sampling, **generate_kwargs
         )
         return _grade_results_from_audio_outputs(
             jobs, outputs=outputs, **result_kwargs
         )
-    if backend == "vllm_omni":
-        from mmar_models import _omni_generate_texts
 
-        prompts = []
-        for job, audio_path in resolved:
-            fields = fmt.fields(
-                question=str(job.get("question") or ""),
-                answer=str(job.get("answer") or ""),
-                prediction=str(job.get("prediction") or ""),
-            )
-            audio = _load_audio_tuple(str(audio_path), sampling_rate)
-            item = {
-                "prompt": _nongold_audio_prompt_string(
-                    label, instructions, fields, closer
-                ),
-                "multi_modal_data": {"audio": audio},
-                "modalities": ["text"],
-            }
-            prompts.append(item)
-        if n_samples > 1:
-            expanded = []
-            expanded_sp = []
-            for item in prompts:
-                for shot_i in range(n_samples):
-                    expanded.append(item)
-                    expanded_sp.append(
-                        _grade_sampling(
-                            handle,
-                            max_tokens=max_tokens,
-                            n=1,
-                            temperature=temperature,
-                            seed=shot_i,
-                        )
-                    )
-            flat = _omni_generate_texts(
-                handle["llm"],
-                expanded,
-                expanded_sp,
-                stages=int(handle.get("stages") or 1),
-                n_shots=n_samples,
-                debug_label=label,
-            )
-            sample_groups = [
-                flat[index * n_samples : (index + 1) * n_samples]
-                for index in range(len(jobs))
-            ]
-            return _grade_results_from_audio_outputs(
-                jobs, sample_groups=sample_groups, **result_kwargs
-            )
-        texts = _omni_generate_texts(
-            handle["llm"],
-            prompts,
-            [sampling] * len(prompts),
-            stages=int(handle.get("stages") or 1),
-            n_shots=1,
-            debug_label=label,
+    prompts = [
+        _vllm_generate_item_for_grade_job(
+            handle, job, spec, label=label, sampling_rate=sampling_rate
         )
-        return _grade_results_from_audio_outputs(
-            jobs, texts=texts, **result_kwargs
-        )
-
-    # vllm: audio placeholder in the prompt string.
-    prompts = []
-    for job, audio_path in resolved:
-        fields = fmt.fields(
-            question=str(job.get("question") or ""),
-            answer=str(job.get("answer") or ""),
-            prediction=str(job.get("prediction") or ""),
-        )
-        audio = _load_audio_tuple(str(audio_path), sampling_rate)
-        item: dict[str, Any] = {
-            "prompt": _nongold_audio_prompt_string(
-                label, instructions, fields, closer
-            ),
-            "multi_modal_data": {"audio": audio},
-        }
-        if label == "mimo-audio-7b":
-            item["modalities"] = ["text"]
-        prompts.append(item)
+        for job, spec in zip(jobs, specs)
+    ]
     outputs = handle["llm"].generate(
         prompts, sampling_params=sampling, **generate_kwargs
     )
@@ -2437,13 +2625,15 @@ def grade_shot_batch(
 ) -> list[dict]:
     """Grade a list of ``{question, answer, prediction}`` jobs.
 
-    NO_GOLD jobs must use an audio judge and include ``audio_path``. After the
-    grade prompt, inputs are audio, then question, then the response, then
-    the 0/1 closer.
+    Each job may carry its own ``prompt`` / ``include_gold``. Audio jobs
+    must use an audio judge and include ``audio_path``. After the grade
+    prompt, those inputs are audio, then question, then the response, then
+    the 0/1 closer. Mixed audio and text jobs go to one vLLM ``generate``
+    or ``chat`` call.
 
     ``n_samples > 1`` uses ``SamplingParams(n=...)`` so the copies share
-    prefill (plain vLLM), then majority-votes the parsed verdicts. Audio
-    Omni / HF backends duplicate the prompt instead.
+    prefill (plain vLLM), then majority-votes the parsed verdicts. HF
+    backends duplicate the prompt instead.
 
     Returns one result dict per job with ``correct``, ``verdict``,
     ``generation`` (full text, including any vLLM-separated reasoning),
@@ -2452,21 +2642,42 @@ def grade_shot_batch(
     """
     if not jobs:
         return []
-    fmt = get_judge_format(prompt, include_gold=include_gold)
-    include_gold = fmt.include_gold
+    fallback_fmt = get_judge_format(prompt, include_gold=include_gold)
+    include_gold = fallback_fmt.include_gold
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
+    specs = [
+        _job_grade_spec(job, prompt=prompt_name, include_gold=include_gold)
+        for job in jobs
+    ]
     n_samples = max(1, int(n_samples))
-    require_audio_nongold_judge(
-        handle=handle,
-        include_gold=include_gold,
-        audio_required=fmt.audio_included,
-    )
-    if fmt.audio_included:
+    for _, gold, fmt in specs:
+        require_audio_nongold_judge(
+            handle=handle,
+            include_gold=gold,
+            audio_required=fmt.audio_included,
+        )
+    if any(fmt.audio_included for _, _, fmt in specs):
         return _grade_shot_batch_audio(
             handle,
             jobs,
             max_tokens=max_tokens,
             prompt=prompt_name,
+            include_gold=include_gold,
+            n_samples=n_samples,
+            temperature=temperature,
+        )
+
+    if _is_hf_chat_handle(handle):
+        messages = [
+            _text_grade_user_messages(job, name, gold)
+            for job, (name, gold, _) in zip(jobs, specs)
+        ]
+        return _grade_hf_chat_messages(
+            handle,
+            jobs,
+            messages,
+            max_tokens=max_tokens,
+            prompt_name=prompt_name,
             include_gold=include_gold,
             n_samples=n_samples,
             temperature=temperature,
@@ -2481,12 +2692,12 @@ def grade_shot_batch(
                 question=str(job.get("question") or ""),
                 answer=str(job.get("answer") or ""),
                 prediction=str(job.get("prediction") or ""),
-                prompt=prompt_name,
-                include_gold=include_gold,
+                prompt=name,
+                include_gold=gold,
             ),
             chat_template_kwargs=chat_template_kwargs,
         )
-        for job in jobs
+        for job, (name, gold, _) in zip(jobs, specs)
     ]
     sampling = _grade_sampling(
         handle, max_tokens=max_tokens, n=n_samples, temperature=temperature
@@ -2512,6 +2723,34 @@ def grade_shot_batch(
         model_id=model_id,
         prompt=prompt_name,
         include_gold=include_gold,
+    )
+
+
+def _log_prompt_progress(
+    label: str,
+    done: int,
+    total: int,
+    *,
+    elapsed_s: float,
+    extra: str = "",
+) -> None:
+    """Print ``done/total prompts`` for a judge worker."""
+    if total > 0:
+        body = (
+            f"{done}/{total} prompts "
+            f"({100.0 * done / total:.0f}%, {elapsed_s:.0f}s)"
+        )
+    else:
+        body = f"{done}/{total} prompts ({elapsed_s:.0f}s)"
+    suffix = f" {extra}" if extra else ""
+    print(f"[{label}] {body}{suffix}", flush=True)
+
+
+def _progress_judge_label(handle: dict[str, Any], model_id: str) -> str:
+    return str(
+        handle.get("judge_label")
+        or handle.get("suite_label")
+        or model_id
     )
 
 
@@ -2555,8 +2794,12 @@ def grade_predictions_file(
     judge when ``force`` is False.
     ``n_samples > 1`` majority-votes that many judge completions per answer
     (shared-prefill ``SamplingParams(n=...)`` on plain vLLM; prompt copies
-    on Omni / HF audio backends).
+    on HF audio backends).
+    ``batch_size`` is ignored: remaining jobs go to one vLLM ``generate`` /
+    ``chat`` call (continuous batching). Already-graded shots are skipped
+    before that call.
     """
+    del batch_size
     if not predictions_path.exists():
         return {
             "status": "missing",
@@ -2580,12 +2823,6 @@ def grade_predictions_file(
     )
     n_samples = max(1, int(n_samples))
     allowed = {int(i) for i in shot_indices} if shot_indices is not None else None
-    if batch_size is not None:
-        effective_batch_size = int(batch_size)
-    elif handle.get("batch_size"):
-        effective_batch_size = int(handle["batch_size"])
-    else:
-        effective_batch_size = resolve_judge_batch_size(model_id, None)
 
     records: list[dict] = []
     with open(predictions_path, encoding="utf-8") as handle_in:
@@ -2618,7 +2855,7 @@ def grade_predictions_file(
             return True
         return str(record.get("id") or "").strip() in allowed_ids
 
-    reuse_cache: dict[tuple[str, str, str], dict] = {}
+    reuse_cache: dict[tuple[str, ...], dict] = {}
     if not force:
         for record in records:
             if not _in_sample(record):
@@ -2638,14 +2875,15 @@ def grade_predictions_file(
                         answer,
                         _shot_prediction_text(shot, model_label=gradee_label),
                         include_gold=include_gold,
+                        prompt=prompt_name,
                     ),
                     dict(entry),
                 )
 
     jobs: list[dict] = []
     owners: list[list[tuple[int, int]]] = []
-    job_keys: list[tuple[str, str, str]] = []
-    pending_index: dict[tuple[str, str, str], int] = {}
+    job_keys: list[tuple[str, ...]] = []
+    pending_index: dict[tuple[str, ...], int] = {}
     reuse_owners: list[tuple[int, int, dict]] = []
     for record_index, record in enumerate(records):
         if not _in_sample(record):
@@ -2664,7 +2902,11 @@ def grade_predictions_file(
                 continue
             prediction = _shot_prediction_text(shot, model_label=gradee_label)
             cache_key = _grade_reuse_key(
-                question, answer, prediction, include_gold=include_gold
+                question,
+                answer,
+                prediction,
+                include_gold=include_gold,
+                prompt=prompt_name,
             )
             cached = reuse_cache.get(cache_key)
             if cached is not None:
@@ -2680,6 +2922,8 @@ def grade_predictions_file(
                         "answer": answer,
                         "prediction": prediction,
                         "audio_path": record.get("audio_path"),
+                        "prompt": prompt_name,
+                        "include_gold": include_gold,
                     }
                 )
                 owners.append([(record_index, shot_index)])
@@ -2690,6 +2934,24 @@ def grade_predictions_file(
     graded = 0
     reused = 0
     partials: list[dict] = []
+    progress_label = _progress_judge_label(handle, model_id)
+    progress_extra = f"gradee={gradee_label} prompt={prompt_name}"
+    n_prompts = len(jobs)
+    started = time.perf_counter()
+    if n_prompts == 0:
+        print(
+            f"[{progress_label}] 0 prompts to generate "
+            f"(reused={len(reuse_owners)}) {progress_extra}",
+            flush=True,
+        )
+    else:
+        _log_prompt_progress(
+            progress_label,
+            0,
+            n_prompts,
+            elapsed_s=0.0,
+            extra=progress_extra,
+        )
 
     def _apply_entry(record_index: int, shot_index: int, entry: dict) -> None:
         nonlocal graded
@@ -2717,19 +2979,16 @@ def grade_predictions_file(
         _apply_entry(record_index, shot_index, entry)
         reused += 1
 
-    for start in range(0, len(jobs), effective_batch_size):
-        chunk = jobs[start : start + effective_batch_size]
-        chunk_owners = owners[start : start + effective_batch_size]
-        chunk_keys = job_keys[start : start + effective_batch_size]
+    if jobs:
         results = grade_shot_batch(
             handle,
-            chunk,
+            jobs,
             prompt=prompt_name,
             include_gold=include_gold,
             n_samples=n_samples,
             temperature=temperature,
         )
-        for cache_key, owner_list, result in zip(chunk_keys, chunk_owners, results):
+        for cache_key, owner_list, result in zip(job_keys, owners, results):
             entry = {
                 "correct": bool(result["correct"]),
                 "verdict": result.get("verdict"),
@@ -2748,6 +3007,13 @@ def grade_predictions_file(
                 _apply_entry(record_index, shot_index, entry)
                 if extra_index:
                     reused += 1
+        _log_prompt_progress(
+            progress_label,
+            n_prompts,
+            n_prompts,
+            elapsed_s=time.perf_counter() - started,
+            extra=progress_extra,
+        )
 
     if sidecar_path is not None:
         if force or partials:
@@ -2829,58 +3095,91 @@ def grade_predictions_pack(
     force: bool = False,
     prompt: str = DEFAULT_GRADE_PROMPT,
     include_gold: bool = DEFAULT_INCLUDE_GOLD,
+    modes: list[tuple[str, bool]] | None = None,
     shot_indices: tuple[int, ...] | list[int] | None = None,
     question_ids: list[str] | None = None,
     n_questions: int | None = None,
     n_samples: int = 1,
     temperature: float | None = None,
     sidecar: bool = True,
+    make_primary: bool = False,
+    primary_judge: str | None = None,
     on_batch: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Grade every test-taker in question → model → shot order.
+    """Grade every remaining format × test-taker × shot in one generate.
 
-    Jobs are emitted as ``for question: for test-taker: for shot`` so the
-    judge's question/audio prefix stays in cache across ``n_models ×
-    n_shots`` rows. Sidecars are written under each gradee's
-    ``judge_partials/`` unless ``sidecar`` is False (then each
-    ``predictions.jsonl`` is rewritten at the end).
-    ``on_batch`` runs after each sidecar flush (e.g. volume commit).
+    Jobs are emitted as ``for question: for mode: for test-taker: for shot``
+    so the judge's question/audio prefix stays in cache across gradees, and
+    every prompt in the run is one vLLM ``generate`` / ``chat`` call.
+    Sidecars are written under each gradee's ``judge_partials/`` unless
+    ``sidecar`` is False (then each ``predictions.jsonl`` is rewritten at
+    the end). ``on_batch`` runs after the sidecar flush (e.g. volume
+    commit). ``batch_size`` is ignored.
     """
+    del batch_size
     pack = Path(pack_dir)
     labels = [str(label) for label in model_labels if str(label).strip()]
     if not labels:
         return {
             "status": "ok",
-            "order": "question,model,shot",
+            "order": "question,mode,model,shot",
             "by_model": {},
             "n_shots_graded": 0,
             "n_shots_reused": 0,
         }
 
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
-    fmt = get_judge_format(prompt, include_gold=include_gold)
-    include_gold = fmt.include_gold
-    prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
-    require_audio_nongold_judge(
-        handle=handle,
-        include_gold=include_gold,
-        audio_required=fmt.audio_included,
-    )
-    key = resolve_grade_judge_key(
-        handle, prompt=prompt_name, include_gold=include_gold, judge_key=judge_key
-    )
-    n_samples = max(1, int(n_samples))
-    if batch_size is not None:
-        effective_batch_size = int(batch_size)
-    elif handle.get("batch_size"):
-        effective_batch_size = int(handle["batch_size"])
+    audio_ok = judge_is_audio_model(handle=handle)
+    if modes is None:
+        mode_pairs = [
+            (
+                normalize_grade_prompt(prompt, include_gold=include_gold),
+                get_judge_format(prompt, include_gold=include_gold).include_gold,
+            )
+        ]
     else:
-        effective_batch_size = resolve_judge_batch_size(model_id, None)
+        mode_pairs = list(modes)
+    mode_specs: list[tuple[str, bool, str]] = []
+    progress_label = _progress_judge_label(handle, model_id)
+    for prompt_name, gold_flag in mode_pairs:
+        fmt = get_judge_format(prompt_name, include_gold=gold_flag)
+        if fmt.audio_included and not audio_ok:
+            print(
+                f"[{progress_label}] skipping audio format {prompt_name} "
+                f"for text judge",
+                flush=True,
+            )
+            continue
+        name = normalize_grade_prompt(prompt_name, include_gold=fmt.include_gold)
+        require_audio_nongold_judge(
+            handle=handle,
+            include_gold=fmt.include_gold,
+            audio_required=fmt.audio_included,
+        )
+        key = resolve_grade_judge_key(
+            handle,
+            prompt=name,
+            include_gold=fmt.include_gold,
+            judge_key=judge_key if len(mode_pairs) == 1 else None,
+        )
+        mode_specs.append((name, fmt.include_gold, key))
+    if not mode_specs:
+        return {
+            "status": "ok",
+            "order": "question,mode,model,shot",
+            "by_model": {},
+            "n_shots_graded": 0,
+            "n_shots_reused": 0,
+            "modes": [],
+        }
+    n_samples = max(1, int(n_samples))
+    fallback_prompt, fallback_gold, fallback_key = mode_specs[0]
+    keys = [key for _, _, key in mode_specs]
 
     files: dict[str, list[dict]] = {}
     by_id: dict[str, dict[str, dict]] = {}
-    sidecar_paths: dict[str, Path] = {}
-    existing_sidecar: dict[str, dict[tuple[str, int], dict]] = {}
+    sidecar_paths: dict[tuple[str, str], Path] = {}
+    existing_sidecar: dict[tuple[str, str], dict[tuple[str, int], dict]] = {}
     all_ids: list[str] = []
     for gradee in labels:
         pred = pack / "models" / gradee / "predictions.jsonl"
@@ -2894,7 +3193,7 @@ def grade_predictions_pack(
         for record in records:
             ensure_judge_schema(
                 record,
-                fallback_label=key,
+                fallback_label=fallback_key,
                 fallback_model_id=model_id,
             )
         files[gradee] = records
@@ -2907,13 +3206,16 @@ def grade_predictions_pack(
             all_ids.append(qid)
         by_id[gradee] = index
         if sidecar:
-            path = pred.parent / "judge_partials" / f"{key}.jsonl"
-            sidecar_paths[gradee] = path
-            existing_sidecar[gradee] = _load_sidecar_rows(path)
-            if not force:
-                _overlay_sidecar_rows(
-                    records, existing_sidecar[gradee], judge_key=key
-                )
+            for _name, _gold, key in mode_specs:
+                path = pred.parent / "judge_partials" / f"{key}.jsonl"
+                sidecar_paths[(gradee, key)] = path
+                existing_sidecar[(gradee, key)] = _load_sidecar_rows(path)
+                if not force:
+                    _overlay_sidecar_rows(
+                        records,
+                        existing_sidecar[(gradee, key)],
+                        judge_key=key,
+                    )
 
     allowed_ids = resolve_grade_allowed_ids(
         all_ids, question_ids=question_ids, n_questions=n_questions
@@ -2925,9 +3227,40 @@ def grade_predictions_pack(
     if allowed_ids is not None:
         qid_order = [qid for qid in qid_order if qid in allowed_ids]
 
-    reuse_cache: dict[tuple[str, str, str], dict] = {}
+    reuse_cache: dict[tuple[str, ...], dict] = {}
     if not force:
         for qid in qid_order:
+            for name, gold, key in mode_specs:
+                for gradee in labels:
+                    record = by_id.get(gradee, {}).get(qid)
+                    if record is None:
+                        continue
+                    question = str(record.get("question") or "")
+                    answer = str(record.get("answer") or "")
+                    for shot_index, shot in _shots_in_index_order(
+                        record, shot_indices
+                    ):
+                        entry = _shot_judge_entry(shot, key)
+                        if entry is None:
+                            continue
+                        reuse_cache.setdefault(
+                            _grade_reuse_key(
+                                question,
+                                answer,
+                                _shot_prediction_text(shot, model_label=gradee),
+                                include_gold=gold,
+                                prompt=name,
+                            ),
+                            dict(entry),
+                        )
+
+    jobs: list[dict] = []
+    owners: list[list[tuple[str, str, int, str]]] = []
+    job_keys: list[tuple[str, ...]] = []
+    pending_index: dict[tuple[str, ...], int] = {}
+    reuse_owners: list[tuple[str, str, int, str, dict]] = []
+    for qid in qid_order:
+        for name, gold, key in mode_specs:
             for gradee in labels:
                 record = by_id.get(gradee, {}).get(qid)
                 if record is None:
@@ -2935,71 +3268,74 @@ def grade_predictions_pack(
                 question = str(record.get("question") or "")
                 answer = str(record.get("answer") or "")
                 for shot_index, shot in _shots_in_index_order(record, shot_indices):
-                    entry = _shot_judge_entry(shot, key)
-                    if entry is None:
+                    if not force and not _shot_needs_grade(shot, key):
                         continue
-                    reuse_cache.setdefault(
-                        _grade_reuse_key(
-                            question,
-                            answer,
-                            _shot_prediction_text(shot, model_label=gradee),
-                            include_gold=include_gold,
-                        ),
-                        dict(entry),
+                    prediction = _shot_prediction_text(shot, model_label=gradee)
+                    cache_key = _grade_reuse_key(
+                        question,
+                        answer,
+                        prediction,
+                        include_gold=gold,
+                        prompt=name,
                     )
-
-    jobs: list[dict] = []
-    owners: list[list[tuple[str, str, int]]] = []
-    job_keys: list[tuple[str, str, str]] = []
-    pending_index: dict[tuple[str, str, str], int] = {}
-    reuse_owners: list[tuple[str, str, int, dict]] = []
-    for qid in qid_order:
-        for gradee in labels:
-            record = by_id.get(gradee, {}).get(qid)
-            if record is None:
-                continue
-            question = str(record.get("question") or "")
-            answer = str(record.get("answer") or "")
-            for shot_index, shot in _shots_in_index_order(record, shot_indices):
-                if not force and not _shot_needs_grade(shot, key):
-                    continue
-                prediction = _shot_prediction_text(shot, model_label=gradee)
-                cache_key = _grade_reuse_key(
-                    question, answer, prediction, include_gold=include_gold
-                )
-                cached = reuse_cache.get(cache_key)
-                if cached is not None:
-                    reuse_owners.append((gradee, qid, shot_index, cached))
-                    continue
-                idx = pending_index.get(cache_key)
-                if idx is None:
-                    pending_index[cache_key] = len(jobs)
-                    jobs.append(
-                        {
-                            "id": qid,
-                            "question": question,
-                            "answer": answer,
-                            "prediction": prediction,
-                            "audio_path": record.get("audio_path"),
-                        }
-                    )
-                    owners.append([(gradee, qid, shot_index)])
-                    job_keys.append(cache_key)
-                else:
-                    owners[idx].append((gradee, qid, shot_index))
+                    cached = reuse_cache.get(cache_key)
+                    if cached is not None:
+                        reuse_owners.append(
+                            (gradee, qid, shot_index, key, cached)
+                        )
+                        continue
+                    idx = pending_index.get(cache_key)
+                    if idx is None:
+                        pending_index[cache_key] = len(jobs)
+                        jobs.append(
+                            {
+                                "id": qid,
+                                "question": question,
+                                "answer": answer,
+                                "prediction": prediction,
+                                "audio_path": record.get("audio_path"),
+                                "prompt": name,
+                                "include_gold": gold,
+                                "judge_key": key,
+                            }
+                        )
+                        owners.append([(gradee, qid, shot_index, key)])
+                        job_keys.append(cache_key)
+                    else:
+                        owners[idx].append((gradee, qid, shot_index, key))
 
     print(
-        f"[grade] order=question,test-taker,shot "
+        f"[grade] order=question,mode,test-taker,shot "
         f"jobs={len(jobs)} questions={len(qid_order)} "
-        f"gradees={len(labels)} n_samples={n_samples} "
-        f"prompt_batch={effective_batch_size}"
+        f"modes={len(mode_specs)} gradees={len(labels)} n_samples={n_samples}"
     )
 
     graded = 0
     reused = 0
-    graded_by = {gradee: 0 for gradee in labels}
-    reused_by = {gradee: 0 for gradee in labels}
-    partials: dict[str, list[dict]] = {gradee: [] for gradee in labels}
+    graded_by = {(gradee, key): 0 for gradee in labels for key in keys}
+    reused_by = {(gradee, key): 0 for gradee in labels for key in keys}
+    progress_extra = (
+        f"modes={len(mode_specs)} gradees={len(labels)}"
+    )
+    n_prompts = len(jobs)
+    started = time.perf_counter()
+    if n_prompts == 0:
+        print(
+            f"[{progress_label}] 0 prompts to generate "
+            f"(reused={len(reuse_owners)}) {progress_extra}",
+            flush=True,
+        )
+    else:
+        _log_prompt_progress(
+            progress_label,
+            0,
+            n_prompts,
+            elapsed_s=0.0,
+            extra=progress_extra,
+        )
+    partials: dict[tuple[str, str], list[dict]] = {
+        (gradee, key): [] for gradee in labels for key in keys
+    }
 
     def _find_shot(gradee: str, qid: str, shot_index: int) -> dict | None:
         record = by_id.get(gradee, {}).get(qid)
@@ -3010,11 +3346,13 @@ def grade_predictions_pack(
                 return shot
         return None
 
-    def _apply(gradee: str, qid: str, shot_index: int, entry: dict) -> None:
+    def _apply(
+        gradee: str, qid: str, shot_index: int, key: str, entry: dict
+    ) -> None:
         nonlocal graded
         copied = dict(entry)
         if sidecar:
-            partials[gradee].append(
+            partials[(gradee, key)].append(
                 {
                     "id": qid,
                     "shot_index": shot_index,
@@ -3034,43 +3372,46 @@ def grade_predictions_pack(
         if not sidecar:
             return
         wrote = False
-        for gradee, rows in partials.items():
+        for (gradee, key), rows in partials.items():
             if not rows:
                 continue
-            path = sidecar_paths[gradee]
+            path = sidecar_paths[(gradee, key)]
             path.parent.mkdir(parents=True, exist_ok=True)
-            combined = dict(existing_sidecar[gradee])
+            combined = dict(existing_sidecar[(gradee, key)])
             for row in rows:
                 row_key = _sidecar_row_key(row)
                 if row_key[0]:
                     combined[row_key] = row
-            existing_sidecar[gradee] = combined
+            existing_sidecar[(gradee, key)] = combined
             write_jsonl(path, list(combined.values()), mode="w")
             rows.clear()
             wrote = True
         if wrote and on_batch is not None:
             on_batch()
 
-    for gradee, qid, shot_index, entry in reuse_owners:
-        _apply(gradee, qid, shot_index, entry)
+    for gradee, qid, shot_index, key, entry in reuse_owners:
+        _apply(gradee, qid, shot_index, key, entry)
         reused += 1
-        reused_by[gradee] += 1
-        graded_by[gradee] += 1
+        reused_by[(gradee, key)] += 1
+        graded_by[(gradee, key)] += 1
     _flush_sidecars()
 
-    for start in range(0, len(jobs), effective_batch_size):
-        chunk = jobs[start : start + effective_batch_size]
-        chunk_owners = owners[start : start + effective_batch_size]
-        chunk_keys = job_keys[start : start + effective_batch_size]
+    if jobs:
         results = grade_shot_batch(
             handle,
-            chunk,
-            prompt=prompt_name,
-            include_gold=include_gold,
+            jobs,
+            prompt=fallback_prompt,
+            include_gold=fallback_gold,
             n_samples=n_samples,
             temperature=temperature,
         )
-        for cache_key, owner_list, result in zip(chunk_keys, chunk_owners, results):
+        for cache_key, owner_list, result in zip(job_keys, owners, results):
+            result_prompt = str(result.get("prompt") or fallback_prompt)
+            result_gold = (
+                bool(result["include_gold"])
+                if result.get("include_gold") is not None
+                else fallback_gold
+            )
             entry = {
                 "correct": bool(result["correct"]),
                 "verdict": result.get("verdict"),
@@ -3078,22 +3419,32 @@ def grade_predictions_pack(
                 "generation": result.get("generation") or "",
                 "reasoning": result.get("reasoning") or "",
                 "model_id": model_id,
-                "prompt": prompt_name,
-                "include_gold": include_gold,
+                "prompt": result_prompt,
+                "include_gold": result_gold,
             }
             if result.get("samples"):
                 entry["samples"] = result["samples"]
                 entry["n_samples"] = result.get("n_samples") or n_samples
             reuse_cache[cache_key] = entry
-            for extra_index, (gradee, qid, shot_index) in enumerate(owner_list):
-                _apply(gradee, qid, shot_index, entry)
-                graded_by[gradee] += 1
+            for extra_index, (gradee, qid, shot_index, key) in enumerate(
+                owner_list
+            ):
+                _apply(gradee, qid, shot_index, key, entry)
+                graded_by[(gradee, key)] += 1
                 if extra_index:
                     reused += 1
-                    reused_by[gradee] += 1
+                    reused_by[(gradee, key)] += 1
+        _log_prompt_progress(
+            progress_label,
+            n_prompts,
+            n_prompts,
+            elapsed_s=time.perf_counter() - started,
+            extra=progress_extra,
+        )
         _flush_sidecars()
 
     if not sidecar:
+        last_key = keys[-1] if keys else None
         for gradee in labels:
             records = files[gradee]
             pred = pack / "models" / gradee / "predictions.jsonl"
@@ -3101,57 +3452,69 @@ def grade_predictions_pack(
                 qid = str(record.get("id") or "").strip()
                 if allowed_ids is not None and qid not in allowed_ids:
                     continue
+                existing_primary = record.get("primary_judge")
+                if make_primary and last_key:
+                    use_primary = last_key
+                else:
+                    use_primary = existing_primary or primary_judge
                 existing = [str(x) for x in (record.get("judges") or []) if x]
                 ordered: list[str] = []
-                for label in existing:
-                    if label not in ordered:
-                        ordered.append(label)
-                if key not in ordered:
-                    ordered.append(key)
+                if use_primary:
+                    ordered.append(str(use_primary))
+                for item in existing:
+                    if item not in ordered:
+                        ordered.append(item)
+                for key in keys:
+                    if key not in ordered:
+                        ordered.append(key)
                 record["judges"] = ordered
                 record["scoring"] = "qwen_freeform_judge"
-                recompute_multi_judge_scores(record, record.get("primary_judge"))
+                recompute_multi_judge_scores(record, use_primary)
             if pred.parent.is_dir() or records:
                 pred.parent.mkdir(parents=True, exist_ok=True)
                 write_jsonl(pred, records, mode="w")
 
-    by_model = {
-        gradee: {
-            "status": "ok" if files[gradee] else "missing",
-            "predictions_path": str(pack / "models" / gradee / "predictions.jsonl"),
-            "sidecar_path": (
-                str(sidecar_paths[gradee]) if gradee in sidecar_paths else None
-            ),
-            "n_records": len(files[gradee]),
-            "n_sampled": (
-                sum(1 for qid in qid_order if qid in by_id.get(gradee, {}))
-            ),
-            "n_questions": n_questions,
-            "n_shots_graded": graded_by[gradee],
-            "n_shots_reused": reused_by[gradee],
-            "grader": model_id,
-            "judge_label": key,
-            "prompt": prompt_name,
-            "include_gold": include_gold,
-            "replaced": bool(force),
-            "n_samples": n_samples,
-        }
-        for gradee in labels
-    }
+    by_model: dict[str, dict[str, Any]] = {}
+    for gradee in labels:
+        for name, gold, key in mode_specs:
+            sidecar_path = sidecar_paths.get((gradee, key))
+            by_model[f"{gradee}/{key}"] = {
+                "status": "ok" if files[gradee] else "missing",
+                "predictions_path": str(
+                    pack / "models" / gradee / "predictions.jsonl"
+                ),
+                "sidecar_path": str(sidecar_path) if sidecar_path else None,
+                "n_records": len(files[gradee]),
+                "n_sampled": (
+                    sum(1 for qid in qid_order if qid in by_id.get(gradee, {}))
+                ),
+                "n_questions": n_questions,
+                "n_shots_graded": graded_by[(gradee, key)],
+                "n_shots_reused": reused_by[(gradee, key)],
+                "grader": model_id,
+                "judge_label": key,
+                "prompt": name,
+                "include_gold": gold,
+                "replaced": bool(force),
+                "n_samples": n_samples,
+            }
     return {
         "status": "ok",
-        "order": "question,model,shot",
+        "order": "question,mode,model,shot",
         "pack_dir": str(pack),
         "by_model": by_model,
         "n_shots_graded": graded,
         "n_shots_reused": reused,
         "grader": model_id,
-        "judge_label": key,
-        "prompt": prompt_name,
-        "include_gold": include_gold,
+        "judge_label": fallback_key,
+        "prompt": fallback_prompt,
+        "include_gold": fallback_gold,
+        "modes": [
+            {"prompt": name, "include_gold": gold, "judge_key": key}
+            for name, gold, key in mode_specs
+        ],
         "replaced": bool(force),
         "n_samples": n_samples,
-        "prompt_batch": effective_batch_size,
     }
 
 

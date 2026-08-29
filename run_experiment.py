@@ -1,4 +1,4 @@
-"""MMAR freeform generation on Modal (vLLM / vLLM-Omni).
+"""MMAR freeform generation on Modal (vLLM 0.28).
 
 Runs the full MMAR set (every clip with audio), ``n_shots`` temperature
 samples per model (per-model SamplingParams). Writes to the root of the
@@ -6,15 +6,14 @@ samples per model (per-model SamplingParams). Writes to the root of the
 generations and fill in missing models, questions, and shots. Grading is
 a separate pipeline (``run_judges.py``).
 
+All eval workers share ``modal_images.eval_image`` (vLLM 0.28.0 audio).
 Inference backends:
-  - af-next-think: vLLM 0.24 (native MusicFlamingo)
-  - music-flamingo: vLLM 0.24 AudioFlamingo3 (HF fallback)
-  - mimo-audio-7b: vLLM-Omni 0.24
-  - interactive-omni-8b: vLLM transformers backend (HF .chat fallback)
-  - qwen3-omni: vLLM 0.28 thinker-only (Qwen3-Omni-30B-A3B-Thinking)
+  - af-next-think: native MusicFlamingo (HF fallback)
+  - music-flamingo: native MusicFlamingo (HF fallback)
+  - qwen3-omni: thinker-only (Qwen3-Omni-30B-A3B-Thinking)
   - qwen3-omni-instruct / qwen2.5-omni-7b / phi-4-multimodal / gemma-4-e4b /
-    gemma-4-12b / nemotron-3-nano-omni: vLLM 0.28 audio
-  - voxtral-small-24b: vLLM 0.28 Mistral-format audio
+    gemma-4-12b / nemotron-3-nano-omni: vLLM audio / chat
+  - voxtral-small-24b: Mistral-format audio
 
 Results layout on ``mmar-freeform-thinking`` (volume root):
 
@@ -27,7 +26,7 @@ Results layout on ``mmar-freeform-thinking`` (volume root):
 Prereqs:
 
     uv run modal run seed_volume.py --datasets mmar \\
-      --models af-next-think,mimo-audio-7b,interactive-omni-8b,qwen3-omni,voxtral-small-24b
+      --models af-next-think,qwen3-omni,voxtral-small-24b
 
 Usage:
 
@@ -86,7 +85,7 @@ from modal_cache import (
     mmar_freeform_thinking_volume,
     volume,
 )
-from modal_images import EVAL_IMAGES, cpu_image
+from modal_images import cpu_image, eval_image
 
 DEFAULT_OUTPUT_DIR = MMAR_FREEFORM_THINKING_MOUNT
 DEFAULT_N_SHOTS = 5
@@ -436,7 +435,7 @@ def _run_model_eval(
     except Exception as exc:  # noqa: BLE001 — cache commit is best-effort
         print(f"[{model_label}] volume.commit after load failed: {exc}")
     active_backend = handle.get("backend", spec.get("backend"))
-    # Omni / HF cannot fork SamplingParams(n>1); expand question×shot rows.
+    # HF cannot fork SamplingParams(n>1); expand question×shot rows.
     # Plain vLLM uses n=n_shots on one prompt per question (shared prefill).
     # Submit all pending in one generate() so vLLM continuous-batches.
     duplicate_shots = backend_duplicates_shots(str(active_backend))
@@ -591,12 +590,11 @@ def _eval_function(label: str, image: modal.Image, gpu: str):
 _EVAL_FNS = {}
 _missing_eval = []
 for _label in ALL_MODEL_LABELS:
-    _image = EVAL_IMAGES.get(_label)
     _gpu = MODEL_SPECS[_label].get("gpu")
-    if _image is None or not _gpu:
+    if not _gpu:
         _missing_eval.append(_label)
         continue
-    _EVAL_FNS[_label] = _eval_function(_label, _image, str(_gpu))
+    _EVAL_FNS[_label] = _eval_function(_label, eval_image, str(_gpu))
 if _missing_eval:
     raise RuntimeError(f"No GPU eval worker for models: {_missing_eval}")
 
@@ -979,7 +977,7 @@ def main(
             are kept; only missing models, questions, and shots are
             generated. Plain vLLM uses SamplingParams(n=...) shared
             prefill when every pending question is starting from zero;
-            Omni/HF (and partial fills) duplicate prompts per shot. All
+            HF (and partial fills) duplicate prompts per shot. All
             pending questions go in one generate() so vLLM
             continuous-batches. Models with no remaining shots are not
             spawned on a GPU.

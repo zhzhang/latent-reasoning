@@ -103,13 +103,6 @@ MODEL_ALIASES: dict[str, str] = {
     "voxtral": "mistralai/Voxtral-Small-24B-2507",
 }
 
-# Aliases that should also seed companion repos (e.g. MiMo tokenizer).
-MODEL_SEED_EXTRAS: dict[str, tuple[str, ...]] = {
-    "mimo-audio-7b": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
-    "mimo-audio-7b-instruct": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
-    "XiaomiMiMo/MiMo-Audio-7B-Instruct": ("XiaomiMiMo/MiMo-Audio-Tokenizer",),
-}
-
 DEFAULT_DATASETS = ("mmar",)
 DEFAULT_MODELS = ("af3",)
 ALL_MODELS = (
@@ -126,8 +119,6 @@ ALL_MODELS = (
     "nemotron-3-nano-omni",
     "qwen2.5-3b",
     "qwen3.6-35b-a3b-fp8",
-    "mimo-audio-7b",
-    "interactive-omni-8b",
     "voxtral-small-24b",
 )
 
@@ -135,8 +126,6 @@ ALL_MODELS = (
 EVAL_MODELS = (
     "af-next-think",
     "music-flamingo",
-    "mimo-audio-7b",
-    "interactive-omni-8b",
     "qwen3-omni",
     "voxtral-small-24b",
     "qwen2.5-omni-7b",
@@ -171,17 +160,8 @@ def resolve_repo_id(name: str) -> str:
 
 
 def expand_seed_targets(names: list[str]) -> list[str]:
-    """Resolve aliases and append companion repos (e.g. MiMo tokenizer)."""
-    targets: list[str] = []
-    for name in names:
-        repo_id = resolve_repo_id(name)
-        targets.append(repo_id)
-        extras = MODEL_SEED_EXTRAS.get(name.strip()) or MODEL_SEED_EXTRAS.get(
-            name.strip().lower()
-        ) or MODEL_SEED_EXTRAS.get(repo_id)
-        if extras:
-            targets.extend(extras)
-    return list(dict.fromkeys(targets))
+    """Resolve aliases to Hub repo ids, preserving order and dropping dupes."""
+    return list(dict.fromkeys(resolve_repo_id(name) for name in names))
 
 
 def model_dir_for(repo_id: str) -> Path:
@@ -374,16 +354,14 @@ def seed_model(
     repo_id = resolve_repo_id(repo_id)
     token = os.environ.get("HF_TOKEN")
     # Prefer safetensors; skip redundant full pytorch dumps. Keep think/*.bin
-    # (AF3 non_lora_trainables) and other small adapter bins. InteractiveOmni
-    # needs campplus.onnx at load time, so do not ignore *.onnx for that repo.
+    # (AF3 non_lora_trainables) and other small adapter bins.
     patterns = ignore_patterns or [
+        "*.onnx",
         "*.pt",
         "*.gguf",
         "*.h5",
         "pytorch_model*.bin",
     ]
-    if "InteractiveOmni" not in repo_id and "interactive-omni" not in repo_id.lower():
-        patterns = ["*.onnx", *patterns]
 
     if hub_cache_layout:
         os.environ["HF_HUB_CACHE"] = str(MODELS_ROOT)
