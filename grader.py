@@ -32,9 +32,9 @@ from mmar_common import (
     join_vllm_reasoning,
     judge_label,
     parse_freeform_output,
-    split_answer_line,
     recompute_multi_judge_scores,
     select_grade_question_ids,
+    split_answer_line,
     write_jsonl,
 )
 
@@ -652,11 +652,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
-            "clip, and the candidate response you are judging.\n"
-            "Possible judgments:\n"
-            "\n"
-            '"Correct": The response does not match the ground-truth answer.\n'
-            '"Incorrect": The response matches the ground-truth.'
+            "clip, and the candidate response you are judging."
         ),
         closer=(
             "The response can have more information than what you believe is a sufficient answer. It can "
@@ -669,8 +665,8 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "To the best of your knowledge: Does the provided response answer the "
             "question correctly, given the audio? This is part of an automated "
             'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
-            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
-            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+            'or "Correct" on a single line final line with the format:\nAnswer: <Incorrect or Correct>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Incorrect or Correct>\n"
         ),
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
@@ -679,25 +675,19 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
-            "clip, and the candidate response you are judging.\n"
-            "Possible judgments:\n"
-            "\n"
-            '"Correct": The response does not match the ground-truth answer.\n'
-            '"Incorrect": The response matches the ground-truth.'
+            "clip, and the candidate response you are judging."
         ),
         closer=(
-            "The response can have more information than what you believe is a sufficient answer. It can "
-            'be more specific (for example, "Labrador" is more specific than "dog"), '
-            "or have additional possible correct answers. But it must cover everything "
-            "you believe is needed to satisfy what the question is asking. It is okay if it covers it in different "
+            'The response can be more specific than the ground-truth, for example "Labrador" is more specific than "dog", '
+            'or less specific, for example "citrus fruit" is less specific than "orange". '
+            "However, the response must cover everything you believe is needed to satisfy what the question is asking. It is okay if it covers it in different "
             "words, i.e. paraphrased, but it is not ok if you think the answer is too vague, incomplete, or indecisive.\n"
-            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for."
-            "\n"
+            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for.\n"
             "To the best of your knowledge: Does the provided response answer the "
             "question correctly, given the audio? This is part of an automated "
             'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
-            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
-            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+            'or "Correct" on a single line final line with the format:\nAnswer: <Incorrect or Correct>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Incorrect or Correct>\n"
         ),
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
@@ -706,25 +696,19 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
         prompt=(
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
-            "clip, and the candidate response you are judging.\n"
-            "Possible judgments:\n"
-            "\n"
-            '"Correct": The response does not match the ground-truth answer.\n'
-            '"Incorrect": The response matches the ground-truth.'
+            "clip, and the candidate response you are judging."
         ),
         closer=(
-            "The response can have more information than what you believe is a sufficient answer. It can "
-            'be more specific (for example, "Labrador" is more specific than "dog"), '
-            "or have additional possible correct answers. But it must cover everything "
-            "you believe is needed to satisfy what the question is asking. It is okay if it covers it in different "
+            'The response can be more specific than the ground-truth, for example "Labrador" is more specific than "dog", '
+            'or less specific, for example "citrus fruit" is less specific than "orange". '
+            "However, the response must contain all the information you believe is needed to satisfy what the question is asking. It is okay if it contains it in different "
             "words, i.e. paraphrased, but it is not ok if you think the answer is too vague, incomplete, or indecisive.\n"
-            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for."
-            "\n"
+            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for.\n"
             "To the best of your knowledge: Does the provided response answer the "
             "question correctly, given the audio? This is part of an automated "
             'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
-            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
-            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+            'or "Correct" on a single line final line with the format:\nAnswer: <Incorrect or Correct>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Incorrect or Correct>\n"
         ),
         audio_included=False,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
@@ -806,9 +790,6 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "Your task is to judge whether the given response to an audio question "
             "is correct or not. You are given an audio clip, a question about that "
             "clip, and the response you are judging.\n"
-            "Possible judgments:\n"
-            '"0": The response is incorrect. \n'
-            '"1": The response is correct.'
         ),
         closer=(
             "The response should fully answer the question and must not be vague.\n"
@@ -820,10 +801,9 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "\n"
             "To the best of your knowledge: Does the provided response answer the "
             "question correctly, given the audio? This is part of an automated "
-            'evaluation process, therefore you MUST OUTPUT your final answer as "0" '
-            'or "1" in <answer> </answer> tags.\n'
-            "Think step by step and end your response with <answer>0</answer> OR "
-            "<answer>1</answer> TAGS."
+            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
+            'or "Correct" on a single line final line with the format:\nAnswer: <Incorrect or Correct>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Incorrect or Correct>\n"
         ),
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
@@ -856,7 +836,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "clip, and the response you are judging.\n"
             "Reason briefly, then give a concise, answer in a single final line in "
             "exactly this format:\n"
-            "Answer: <Correct or Incorrect>"
+            "Answer: <Incorrect or Correct>"
         ),
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
