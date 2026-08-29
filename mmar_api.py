@@ -144,140 +144,140 @@ message, the user message wins.
 Example A
 Question: "What animal is heard?"
 Ground truth: "dog"
-Response: "a barking dog"
+Candidate Response: "a barking dog"
 The response names the same animal.
 Correct
 
 Example B
 Question: "What animal is heard?"
 Ground truth: "dog"
-Response: "cat"
+Candidate Response: "cat"
 The response names a different animal.
 Incorrect
 
 Example C
 Question: "What instrument is playing?"
 Ground truth: "piano"
-Response: "keyboard / piano"
+Candidate Response: "keyboard / piano"
 The response includes the ground truth and an equivalent term.
 Correct
 
 Example D
 Question: "How many speakers are there?"
 Ground truth: "2"
-Response: "two people talking"
+Candidate Response: "two people talking"
 The response matches the count.
 Correct
 
 Example E
 Question: "How many speakers are there?"
 Ground truth: "2"
-Response: "several speakers, maybe 2 to 4"
+Candidate Response: "several speakers, maybe 2 to 4"
 A range is not the specific count.
 Incorrect
 
 Example F
 Question: "What language is spoken?"
 Ground truth: "Spanish"
-Response: "the speakers are talking in Spanish"
+Candidate Response: "the speakers are talking in Spanish"
 Paraphrase that names Spanish.
 Correct
 
 Example G
 Question: "What language is spoken?"
 Ground truth: "Spanish"
-Response: "a Romance language"
+Candidate Response: "a Romance language"
 Too general; it does not name Spanish.
 Incorrect
 
 Example H
 Question: "Is there music in the background?"
 Ground truth: "yes"
-Response: "Yes, faint music behind the speech."
+Candidate Response: "Yes, faint music behind the speech."
 Affirmative with extra true detail.
 Correct
 
 Example I
 Question: "What is the mood of the speaker?"
 Ground truth: "angry"
-Response: "frustrated and angry"
+Candidate Response: "frustrated and angry"
 The ground-truth mood is covered.
 Correct
 
 Example J
 Question: "What is the mood of the speaker?"
 Ground truth: "angry"
-Response: "calm"
+Candidate Response: "calm"
 Opposite mood.
 Incorrect
 
 Example K
 Question: "Where was this recorded?"
 Ground truth: "train station"
-Response: "inside a busy railway station"
+Candidate Response: "inside a busy railway station"
 Paraphrase of the same place.
 Correct
 
 Example L
 Question: "Where was this recorded?"
 Ground truth: "train station"
-Response: "outdoors"
+Candidate Response: "outdoors"
 Different place.
 Incorrect
 
 Example M
 Question: "What happens after the beep?"
 Ground truth: "a door closes"
-Response: "someone shuts a door"
+Candidate Response: "someone shuts a door"
 Same event in other words.
 Correct
 
 Example N
 Question: "What happens after the beep?"
 Ground truth: "a door closes"
-Response: "a window opens"
+Candidate Response: "a window opens"
 Different event.
 Incorrect
 
 Example O
 Question: "Name the sport being played."
 Ground truth: "tennis"
-Response: "they are playing tennis on a court"
+Candidate Response: "they are playing tennis on a court"
 Covers tennis.
 Correct
 
 Example P
 Question: "Name the sport being played."
 Ground truth: "tennis"
-Response: "a ball sport"
+Candidate Response: "a ball sport"
 Does not name tennis.
 Incorrect
 
 Example Q
 Question: "What time of day is it?"
 Ground truth: "morning"
-Response: "early morning"
+Candidate Response: "early morning"
 More specific, still morning.
 Correct
 
 Example R
 Question: "What time of day is it?"
 Ground truth: "morning"
-Response: "evening"
+Candidate Response: "evening"
 Wrong time of day.
 Incorrect
 
 Example S
 Question: "How long is the silence?"
 Ground truth: "3 seconds"
-Response: "about 3 seconds"
+Candidate Response: "about 3 seconds"
 Matches the quantity.
 Correct
 
 Example T
 Question: "How long is the silence?"
 Ground truth: "3 seconds"
-Response: "2-5 seconds"
+Candidate Response: "2-5 seconds"
 A range around a specific duration is not a match.
 Incorrect
 
@@ -289,97 +289,97 @@ Additional output-shape examples. Same rules: user message wins.
 Example U
 Question: "Who is speaking?"
 Ground truth: "a child"
-Response: "a young kid"
+Candidate Response: "a young kid"
 Correct
 
 Example V
 Question: "Who is speaking?"
 Ground truth: "a child"
-Response: "an adult man"
+Candidate Response: "an adult man"
 Incorrect
 
 Example W
 Question: "What vehicle passes by?"
 Ground truth: "motorcycle"
-Response: "a motorbike"
+Candidate Response: "a motorbike"
 Correct
 
 Example X
 Question: "What vehicle passes by?"
 Ground truth: "motorcycle"
-Response: "a car"
+Candidate Response: "a car"
 Incorrect
 
 Example Y
 Question: "Is rain audible?"
 Ground truth: "no"
-Response: "No rain; dry indoor acoustics."
+Candidate Response: "No rain; dry indoor acoustics."
 Correct
 
 Example Z
 Question: "Is rain audible?"
 Ground truth: "no"
-Response: "yes it is raining"
+Candidate Response: "yes it is raining"
 Incorrect
 
 Example AA
 Question: "What is being cooked?"
 Ground truth: "bacon"
-Response: "frying bacon"
+Candidate Response: "frying bacon"
 Correct
 
 Example AB
 Question: "What is being cooked?"
 Ground truth: "bacon"
-Response: "eggs"
+Candidate Response: "eggs"
 Incorrect
 
 Example AC
 Question: "How many times does the phone ring?"
 Ground truth: "4"
-Response: "four rings"
+Candidate Response: "four rings"
 Correct
 
 Example AD
 Question: "How many times does the phone ring?"
 Ground truth: "4"
-Response: "a few times"
+Candidate Response: "a few times"
 Incorrect
 
 Example AE
 Question: "What genre is the music?"
 Ground truth: "jazz"
-Response: "a jazz quartet"
+Candidate Response: "a jazz quartet"
 Correct
 
 Example AF
 Question: "What genre is the music?"
 Ground truth: "jazz"
-Response: "classical piano"
+Candidate Response: "classical piano"
 Incorrect
 
 Example AG
 Question: "Does anyone laugh?"
 Ground truth: "yes"
-Response: "someone laughs at the end"
+Candidate Response: "someone laughs at the end"
 Correct
 
 Example AH
 Question: "Does anyone laugh?"
 Ground truth: "yes"
-Response: "no one laughs"
+Candidate Response: "no one laughs"
 Incorrect
 
 Example AI
 Question: "What room is this?"
 Ground truth: "kitchen"
-Response: "in the kitchen near the sink"
+Candidate Response: "in the kitchen near the sink"
 Correct
 
 Example AJ
 Question: "What room is this?"
 Ground truth: "kitchen"
-Response: "bathroom"
+Candidate Response: "bathroom"
 Incorrect
 
 Stay on the user-message task. Last line: Correct or Incorrect.

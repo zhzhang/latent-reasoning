@@ -23,6 +23,7 @@ from typing import Any
 from grader import (
     JUDGE_FORMATS,
     JUDGE_SPECS,
+    _apply_grade_sampling_knobs,
     get_judge_format,
     parse_grade_prompt_list,
     parse_judge_list,
@@ -107,8 +108,7 @@ def _judge_meta(label: str) -> dict[str, Any]:
 
     if label in MODEL_SPECS:
         spec = MODEL_SPECS[label]
-        sampling = dict(spec.get("sampling") or {})
-        sampling["temperature"] = 0.0
+        sampling = _apply_grade_sampling_knobs(spec.get("sampling") or {})
         return {
             "model_id": spec["model_id"],
             "backend": spec.get("backend"),
@@ -120,7 +120,7 @@ def _judge_meta(label: str) -> dict[str, Any]:
         return {
             "model_id": spec["model_id"],
             "backend": "vllm",
-            "sampling": spec.get("sampling"),
+            "sampling": _apply_grade_sampling_knobs(spec.get("sampling") or {}),
             "chat_kwargs": {},
         }
     api = resolve_api_judge_label(label)

@@ -47,10 +47,13 @@ DEFAULT_JUDGE_SAMPLING: dict[str, Any] = {
     "temperature": 0.0,
     "top_p": 1.0,
     "max_tokens": 4096,
-    "seed": 0,
 }
 DEFAULT_JUDGE_MAX_TOKENS = int(DEFAULT_JUDGE_SAMPLING["max_tokens"])
 DEFAULT_JUDGE_BATCH_SIZE = 64
+# Judge vs card: keep spec temperature (do not force T=0), nucleus no
+# wider than 0.95, repetition_penalty no lower than 1.05.
+GRADE_TOP_P_CAP = 0.95
+GRADE_REPETITION_PENALTY_FLOOR = 1.05
 
 # Short names accepted by judge CLIs (mirrors seed_volume.MODEL_ALIASES).
 JUDGE_MODEL_ALIASES: dict[str, str] = {
@@ -83,7 +86,6 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
             "top_k": 20,
             "repetition_penalty": 1.05,
             "max_tokens": 4096,
-            "seed": 0,
         },
         "batch_size": 128,
     },
@@ -106,7 +108,7 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
         # Chat template skips CoT only when enable_thinking is false.
         "enable_thinking": True,
         # Thinking-mode defaults: T=1.0, top_p=0.95, top_k=20
-        # (judging forces temperature=0 for determinism).
+        # (judging keeps card T, caps top_p, floors repetition_penalty).
         # Grade replies average ~600 tokens; 4096 leaves headroom for the rare
         # runaway (~0.2% of shots) whose truncation would score as a Fail.
         "sampling": {
@@ -114,7 +116,6 @@ JUDGE_SPECS: dict[str, dict[str, Any]] = {
             "top_p": 0.95,
             "top_k": 20,
             "max_tokens": 4096,
-            "seed": 0,
         },
         # Throughput keeps scaling with concurrency (128→3.5k, 256→4.8k,
         # 512→7.0k output tok/s); KV holds ~1M tokens so 512 seqs fit easily.
@@ -267,12 +268,10 @@ def judge_sampling_params(
     """
     from vllm import SamplingParams
 
-    kwargs = resolve_judge_sampling(model_id, args)
+    kwargs = _apply_grade_sampling_knobs(resolve_judge_sampling(model_id, args))
     if temperature is not None:
         t = float(temperature)
-    else:
-        t = float(kwargs.get("temperature", 0.0))
-    kwargs["temperature"] = t if t > 0 else 0.0
+        kwargs["temperature"] = t if t > 0 else 0.0
     if max_tokens is not None:
         kwargs["max_tokens"] = int(max_tokens)
     n = max(1, int(n))
@@ -325,9 +324,7 @@ def grade_prompt_name(include_gold: bool = DEFAULT_INCLUDE_GOLD) -> str:
     ]
     if matches:
         return matches[0]
-    raise ValueError(
-        f"No JUDGE_FORMATS entry with include_gold={bool(include_gold)}"
-    )
+    raise ValueError(f"No JUDGE_FORMATS entry with include_gold={bool(include_gold)}")
 
 
 def normalize_grade_prompt(
@@ -446,7 +443,9 @@ def resolve_grade_judge_key(
     """
     if judge_key:
         return str(judge_key)
-    label = str(handle.get("judge_label") or judge_label(handle.get("model_id")) or GRADER_LABEL)
+    label = str(
+        handle.get("judge_label") or judge_label(handle.get("model_id")) or GRADER_LABEL
+    )
     return compose_judge_key(label, prompt=prompt, include_gold=include_gold)
 
 
@@ -463,7 +462,12 @@ def parse_judge_key(key: str) -> dict[str, str]:
             "prompt": prompt,
             "gold_tag": gold_tag,
         }
-    return {"label": str(key or ""), "model": str(key or ""), "prompt": "", "gold_tag": ""}
+    return {
+        "label": str(key or ""),
+        "model": str(key or ""),
+        "prompt": "",
+        "gold_tag": "",
+    }
 
 
 def judge_mode_bucket(judge_key: str, entry: dict | None = None) -> str | None:
@@ -539,13 +543,13 @@ def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
 #
 # Gold / with_gt:
 #   prompt
-#   Question / Ground truth / Response
+#   Question / Ground truth / Candidate Response
 #   closer
 #
 # Nongold / free:
 #   prompt
 #   [AUDIO]
-#   Question / Response
+#   Question / Candidate Response
 #   closer
 #
 # ``build_grade_prompt`` is the full text (API judges and gold vLLM).
@@ -557,7 +561,7 @@ def parse_shot_indices(first_shot_only: bool) -> tuple[int, ...] | None:
 # Placeholders filled by ``JudgeFormat.fields``.
 FIELD_QUESTION = 'Question: "{question}"'
 FIELD_GOLD = 'Ground truth: "{answer}"'
-FIELD_PREDICTION = 'Response: "{prediction}"'
+FIELD_PREDICTION = 'Candidate Response: "{prediction}"'
 
 # Dummy values used by ``python grader.py`` so variable slots stay visible.
 PROMPT_PLACEHOLDERS: dict[str, str] = {
@@ -639,6 +643,130 @@ class JudgeFormat:
 
 # Named formats. Edit this table — not the builders.
 JUDGE_FORMATS: dict[str, JudgeFormat] = {
+    "answer_match_no_audio": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "matches a given ground truth answer or not. You are provided with a "
+            "question about an audio clip, a ground truth response, and the candidate response "
+            "you need to judge.\n"
+            'For a response to "match", it must have at least as much information '
+            "as the ground-truth. \n"
+            "The response can have more information than the ground-truth. It can "
+            'be more specific (for example, "Labrador" is more specific than "dog"), '
+            "or have additional possible correct answers. But it must cover everything "
+            "mentioned in the ground-truth. It is okay if it covers it in different "
+            "words, i.e. paraphrased. \n"
+            "For numeric answers, the relative error, defined as |response - ground "
+            "truth| / mean(response, ground truth), must be less than 1% for the "
+            "response to be judged as a correct match. Here, if the ground truth is "
+            "a specific numeric quantity but the response is a range, then they don't "
+            "match (even if the range contains the ground truth).\n"
+            "\n"
+            "Possible judgments:\n"
+            "\n"
+            '"Correct": The response does not match the ground-truth answer.\n'
+            '"Incorrect": The response matches the ground-truth.'
+        ),
+        closer=(
+            "Your job is to ONLY check whether the given response matches the ground "
+            "truth answer or not in the context of the question. You DO NOT NEED to "
+            "assess the correctness of the response. This is part of an automated "
+            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
+            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+        ),
+        audio_included=False,
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
+    ),
+    "answer_match_with_audio": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "matches a given ground truth answer or not. You are provided with an audio clip, a "
+            "question about an audio clip, a ground truth response, and the candidate response "
+            "you need to judge.\n"
+            'For a response to "match", it must have at least as much information '
+            "as the ground-truth. \n"
+            "The response can have more information than the ground-truth. It can "
+            'be more specific (for example, "Labrador" is more specific than "dog"), '
+            "or have additional possible correct answers. But it must cover everything "
+            "mentioned in the ground-truth. It is okay if it covers it in different "
+            "words, i.e. paraphrased. \n"
+            "For numeric answers, the relative error, defined as |response - ground "
+            "truth| / mean(response, ground truth), must be less than 1% for the "
+            "response to be judged as a correct match. Here, if the ground truth is "
+            "a specific numeric quantity but the response is a range, then they don't "
+            "match (even if the range contains the ground truth).\n"
+            "\n"
+            "Possible judgments:\n"
+            "\n"
+            '"Correct": The response does not match the ground-truth answer.\n'
+            '"Incorrect": The response matches the ground-truth.'
+        ),
+        closer=(
+            "Your job is to ONLY check whether the given response matches the ground "
+            "truth answer or not in the context of the question. You DO NOT NEED to "
+            "assess the correctness of the response. This is part of an automated "
+            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
+            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+        ),
+        audio_included=True,
+        field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
+    ),
+    "pure_judge": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "is correct or not. You are given an audio clip, a question about that "
+            "clip, and the candidate response you are judging.\n"
+            "Possible judgments:\n"
+            "\n"
+            '"Correct": The response does not match the ground-truth answer.\n'
+            '"Incorrect": The response matches the ground-truth.'
+        ),
+        closer=(
+            "The response can have more information than what you believe is a sufficient answer. It can "
+            'be more specific (for example, "Labrador" is more specific than "dog"), '
+            "or have additional possible correct answers. But it must cover everything "
+            "you believe is needed to satisfy what the question is asking. It is okay if it covers it in different "
+            "words, i.e. paraphrased, but it is not ok if you think the answer is too vague, incomplete, or indecisive.\n"
+            "For numeric answers, use your understanding of the intent and scope of the question to determine whether the answer satisfies what the question is asking for."
+            "\n"
+            "To the best of your knowledge: Does the provided response answer the "
+            "question correctly, given the audio? This is part of an automated "
+            'evaluation process, therefore you MUST OUTPUT your final answer as "Incorrect" '
+            'or "Correct" on a single line final line with the format:\nAnswer: <Correct or Incorrect>\n'
+            "Think step by step and end your response with the format:\nAnswer: <Correct or Incorrect>\n"
+        ),
+        audio_included=True,
+        field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
+    ),
+    "free": JudgeFormat(
+        prompt=(
+            "Your task is to judge whether the given response to an audio question "
+            "is correct or not. You are given an audio clip, a question about that "
+            "clip, and the response you are judging.\n"
+            "Possible judgments:\n"
+            '"0": The response is incorrect. \n'
+            '"1": The response is correct.'
+        ),
+        closer=(
+            "The response should fully answer the question and must not be vague.\n"
+            "For numeric answers, the relative error, defined as |response - ground "
+            "truth| / mean(response, ground truth), must be less than 1% for the "
+            "response to be judged as a correct match. Here, if the ground truth is "
+            "a specific numeric quantity but the response is a range, then they don't "
+            "match (even if the range contains the ground truth).\n"
+            "\n"
+            "To the best of your knowledge: Does the provided response answer the "
+            "question correctly, given the audio? This is part of an automated "
+            'evaluation process, therefore you MUST OUTPUT your final answer as "0" '
+            'or "1" in <answer> </answer> tags.\n'
+            "Think step by step and end your response with <answer>0</answer> OR "
+            "<answer>1</answer> TAGS."
+        ),
+        audio_included=True,
+        field_templates=(FIELD_QUESTION, FIELD_PREDICTION),
+    ),
     "with_gt": JudgeFormat(
         prompt=(
             "Your task is to judge whether the given response to an audio question "
@@ -708,7 +836,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "is correct or not. You are given an audio clip, a question about that "
             "clip, the ground truth answer, and the response you are judging.\n"
             "Reason briefly, then give your judgement of the response in a single "
-            "final line with one word: \"Correct\" or \"Incorrect\""
+            'final line with one word: "Correct" or "Incorrect"'
         ),
         audio_included=True,
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
@@ -719,7 +847,7 @@ JUDGE_FORMATS: dict[str, JudgeFormat] = {
             "is correct or not. You are given an audio clip, a question about that "
             "clip, the ground truth answer, and the response you are judging.\n"
             "Reason briefly, then give your judgement of the response in a single "
-            "final line with one word: \"Correct\" or \"Incorrect\""
+            'final line with one word: "Correct" or "Incorrect"'
         ),
         field_templates=(FIELD_QUESTION, FIELD_GOLD, FIELD_PREDICTION),
     ),
@@ -832,7 +960,8 @@ def build_grade_gold_prefix(
 # Extraction order matches test-taker parsers (``extract_freeform_answer``):
 # last ``Answer:`` line, then ``<answer>`` tags, then last-line / boxed /
 # keyword fallbacks. Soft whole-region fallback stays narrow so prose like
-# "correct in meaning" does not count as a verdict.
+# "correct in meaning" does not count as a verdict. After that, the last
+# non-empty line is scanned for exclusive ``correct`` / ``incorrect``.
 ANSWER_TAG_RE = re.compile(
     r"<answer>\s*(0|1|correct|incorrect|pass|fail|yes|no|true|false|wrong)\s*</answer>",
     re.IGNORECASE,
@@ -854,6 +983,13 @@ VERDICT_LINE_RE = re.compile(
 )
 LAST_WORD_VERDICT_RE = re.compile(
     r"\b(?P<label>incorrect|correct|pass|fail|wrong)\b\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+# Final fallback: last non-empty line, exclusive correct/incorrect.
+# ``incorrect`` first so the longer token wins; word boundaries keep
+# ``incorrect`` from also counting as ``correct``.
+LAST_LINE_CORRECT_INCORRECT_RE = re.compile(
+    r"\b(incorrect|correct)\b",
     re.IGNORECASE,
 )
 PASS_LABELS = frozenset({"PASS", "P", "YES", "Y", "TRUE", "CORRECT", "1"})
@@ -928,6 +1064,17 @@ def _verdict_from_text(snippet: str) -> bool | None:
         return True
     if has_fail and not has_pass:
         return False
+
+    # Final fallback: last non-empty line only. Both tokens → unparsed.
+    labels = {
+        _label_verdict(match.group(1))
+        for match in LAST_LINE_CORRECT_INCORRECT_RE.finditer(lines[-1])
+    }
+    labels.discard(None)
+    if labels == {True}:
+        return True
+    if labels == {False}:
+        return False
     return None
 
 
@@ -952,7 +1099,9 @@ def parse_grade_verdict(text: str) -> bool | None:
     Uses the same answer extractor as test-takers (``Answer:`` line, then
     ``<answer>`` tags, then freeform fallbacks). Returns None if unparseable.
     ``incorrect`` is matched before ``correct`` so a last-line ``Incorrect``
-    is never read as ``Correct``.
+    is never read as ``Correct``. If every earlier parser fails, the last
+    non-empty line is scanned for ``correct`` / ``incorrect`` (case
+    insensitive); both tokens on that line is a parse failure.
     """
     text = (text or "").strip()
     if not text:
@@ -1073,7 +1222,11 @@ def _shot_needs_grade(shot: dict, judge_key: str) -> bool:
         return False
     # Legacy flat fields only count for the same judge label/id.
     legacy_id = shot.get("grader")
-    if legacy_id and judge_label(legacy_id) == judge_key and shot.get("correct") is not None:
+    if (
+        legacy_id
+        and judge_label(legacy_id) == judge_key
+        and shot.get("correct") is not None
+    ):
         return False
     return True
 
@@ -1087,9 +1240,7 @@ def _record_needs_grade(
     shots = record.get("shots") or []
     if shot_indices is not None:
         allowed = {int(i) for i in shot_indices}
-        shots = [
-            shot for shot in shots if int(shot.get("shot_index", 0)) in allowed
-        ]
+        shots = [shot for shot in shots if int(shot.get("shot_index", 0)) in allowed]
     if not shots:
         return False
     return any(_shot_needs_grade(shot, judge_key) for shot in shots)
@@ -1134,9 +1285,7 @@ def _overlay_sidecar_rows(
     """Copy sidecar verdicts onto matching shots that lack this judge."""
     if not rows:
         return
-    by_id = {
-        str(record.get("id") or "").strip(): record for record in records
-    }
+    by_id = {str(record.get("id") or "").strip(): record for record in records}
     by_id.pop("", None)
     for (qid, shot_index), row in rows.items():
         record = by_id.get(qid)
@@ -1310,16 +1459,32 @@ def require_audio_nongold_judge(
     )
 
 
-def _grade_sampling_for_engine(engine: dict[str, Any], sampling: dict[str, Any]) -> dict[str, Any]:
-    """Force deterministic grading; cap max_tokens to fit ``max_model_len``."""
+def _apply_grade_sampling_knobs(sampling: dict[str, Any]) -> dict[str, Any]:
+    """Card temperature, tighter nucleus / rep floor (used by ``run_judges``).
+
+    Drops a fixed ``seed`` so temperature sampling is actually stochastic.
+    """
     out = dict(sampling)
-    out["temperature"] = 0.0
+    out.pop("seed", None)
+    top_p = out.get("top_p")
+    if top_p is None or float(top_p) > GRADE_TOP_P_CAP:
+        out["top_p"] = GRADE_TOP_P_CAP
+    rep = out.get("repetition_penalty")
+    if rep is None or float(rep) < GRADE_REPETITION_PENALTY_FLOOR:
+        out["repetition_penalty"] = GRADE_REPETITION_PENALTY_FLOOR
+    return out
+
+
+def _grade_sampling_for_engine(
+    engine: dict[str, Any], sampling: dict[str, Any]
+) -> dict[str, Any]:
+    """Card sampling for grading, with nucleus/rep knobs; cap max_tokens to fit ``max_model_len``."""
+    out = _apply_grade_sampling_knobs(sampling)
     max_len = int(engine.get("max_model_len") or 8192)
     requested = int(out.get("max_tokens") or DEFAULT_JUDGE_MAX_TOKENS)
     # Leave headroom for the grade prompt; CoT + <answer> tags need room.
     cap = max(256, min(requested, max_len // 2))
     out["max_tokens"] = cap
-    out["seed"] = 0
     return out
 
 
@@ -1424,10 +1589,7 @@ def load_grader(
         # Older vLLM builds may not accept language_model_only.
         if not language_model_only:
             raise
-        print(
-            f"[grader] language_model_only unsupported ({exc}); "
-            "retrying without it"
-        )
+        print(f"[grader] language_model_only unsupported ({exc}); retrying without it")
         llm_kwargs.pop("language_model_only", None)
         llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
@@ -1499,7 +1661,9 @@ def _chat_template_of(tokenizer: Any) -> str | None:
     return None
 
 
-def _read_model_chat_template(model_dir: str | Path | None) -> tuple[str | None, str | None]:
+def _read_model_chat_template(
+    model_dir: str | Path | None,
+) -> tuple[str | None, str | None]:
     if not model_dir:
         return None, None
     root = Path(model_dir)
@@ -1560,11 +1724,7 @@ def _ensure_tokenizer_chat_template(
 
 
 def _format_chatml(user_text: str) -> str:
-    return (
-        "<|im_start|>user\n"
-        f"{user_text}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
+    return f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
 
 
 def _format_chat(
@@ -1615,7 +1775,7 @@ def _format_chat(
 # Same format as JUDGE_FORMATS["free"]:
 #   {instructions}   = format.prompt   (task + 0/1 judgments)
 #   {audio}          = clip or model placeholder
-#   {fields}         = Question / Response + format.closer
+#   {fields}         = Question / Candidate Response + format.closer
 #
 # String templates below are used by vLLM / Omni generate.
 # Chat-message wrapping (_nongold_audio_chat_messages) is used by vllm_chat /
@@ -1853,8 +2013,7 @@ def parse_judge_list(value: str) -> list[str]:
             labels.append(resolved)
     if unknown:
         raise ValueError(
-            f"Unknown judge label(s): {unknown}. "
-            f"Choose from {list(known)} or 'all'."
+            f"Unknown judge label(s): {unknown}. Choose from {list(known)} or 'all'."
         )
     return labels
 
@@ -1939,9 +2098,7 @@ def render_judge_prompt(
     audio_path = Path(audio_raw)
 
     if not fmt.audio_included:
-        text = fmt.as_text(
-            question=question, answer=answer, prediction=prediction
-        )
+        text = fmt.as_text(question=question, answer=answer, prediction=prediction)
         return text if text.endswith("\n") else f"{text}\n"
 
     if is_batch_api_judge(resolved):
@@ -1954,9 +2111,7 @@ def render_judge_prompt(
         )
 
     if is_api_judge(resolved):
-        text = fmt.as_text(
-            question=question, answer=answer, prediction=prediction
-        )
+        text = fmt.as_text(question=question, answer=answer, prediction=prediction)
         body = text if text.endswith("\n") else f"{text}\n"
         return f"[audio attached]\n{body}"
 
@@ -1979,18 +2134,9 @@ def render_judge_prompt(
         fields = fmt.fields_with_closer(
             question=question, answer=answer, prediction=prediction
         )
-        return (
-            "role=user\n"
-            f"{instructions}\n"
-            f"<audio>{audio_path}</audio>\n"
-            f"{fields}\n"
-        )
-    fields = fmt.fields(
-        question=question, answer=answer, prediction=prediction
-    )
-    return _nongold_audio_prompt_string(
-        resolved, instructions, fields, fmt.closer
-    )
+        return f"role=user\n{instructions}\n<audio>{audio_path}</audio>\n{fields}\n"
+    fields = fmt.fields(question=question, answer=answer, prediction=prediction)
+    return _nongold_audio_prompt_string(resolved, instructions, fields, fmt.closer)
 
 
 def _grade_sampling(
@@ -2005,17 +2151,17 @@ def _grade_sampling(
 
     model_id = handle.get("model_id") or DEFAULT_GRADER_MODEL_ID
     n = max(1, int(n))
-    if handle.get("suite_label") and handle.get("sampling"):
+    if handle.get("sampling"):
         kwargs = dict(handle["sampling"])
         if max_tokens is not None:
             kwargs["max_tokens"] = int(max_tokens)
         if temperature is not None:
             t = float(temperature)
             kwargs["temperature"] = t if t > 0 else 0.0
-        else:
-            kwargs["temperature"] = 0.0
         if seed is not None:
             kwargs["seed"] = int(seed)
+        else:
+            kwargs.pop("seed", None)
         if n > 1:
             kwargs["n"] = n
             if float(kwargs.get("temperature") or 0) <= 0:
@@ -2169,8 +2315,10 @@ def _grade_results_from_sample_groups(
 def _is_hf_chat_handle(handle: dict[str, Any]) -> bool:
     """True when the suite loader fell back to Transformers ``model.chat()``."""
     model = handle.get("model")
-    return handle.get("llm") is None and model is not None and callable(
-        getattr(model, "chat", None)
+    return (
+        handle.get("llm") is None
+        and model is not None
+        and callable(getattr(model, "chat", None))
     )
 
 
@@ -2186,7 +2334,11 @@ def _hf_generation_config(
     sampling = dict(handle.get("sampling") or {})
     if max_tokens is not None:
         sampling["max_tokens"] = int(max_tokens)
-    t = 0.0 if temperature is None else float(temperature)
+    t = (
+        float(temperature)
+        if temperature is not None
+        else float(sampling.get("temperature") or 0.0)
+    )
     if max(1, int(n)) > 1 and t <= 0:
         t = 1.0
     cfg: dict[str, Any] = {
@@ -2264,12 +2416,9 @@ def _grade_hf_chat_messages(
                 handle,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                seed=shot_i,
                 n=n_samples,
             )
-            group.extend(
-                _run_hf_chat(handle, [messages], generation_config=cfg)
-            )
+            group.extend(_run_hf_chat(handle, [messages], generation_config=cfg))
         sample_groups.append(group)
     return _grade_results_from_sample_groups(
         jobs,
@@ -2295,9 +2444,7 @@ def _grade_results_from_audio_outputs(
     if n_samples > 1:
         groups = sample_groups
         if groups is None:
-            groups = [
-                _completion_texts(out, n=n_samples) for out in (outputs or [])
-            ]
+            groups = [_completion_texts(out, n=n_samples) for out in (outputs or [])]
         return _grade_results_from_sample_groups(
             jobs,
             groups,
@@ -2420,9 +2567,7 @@ def _vllm_generate_item_for_grade_job(
     )
     audio = _load_audio_tuple(str(audio_path), sampling_rate)
     return {
-        "prompt": _nongold_audio_prompt_string(
-            label, instructions, fields, fmt.closer
-        ),
+        "prompt": _nongold_audio_prompt_string(label, instructions, fields, fmt.closer),
         "multi_modal_data": {"audio": audio},
     }
 
@@ -2449,9 +2594,7 @@ def _voxtral_item_for_grade_job(
             include_gold=include_gold,
         )
         messages = [UserMessage(content=[TextChunk(text=text)]).to_openai()]
-        return {
-            "prompt_token_ids": tokenizer.apply_chat_template(messages=messages)
-        }
+        return {"prompt_token_ids": tokenizer.apply_chat_template(messages=messages)}
     instructions = _adapt_judge_instructions(label, fmt.prompt)
     audio_path = _require_job_audio_path(job)
     fields = fmt.fields_with_closer(
@@ -2471,9 +2614,7 @@ def _voxtral_item_for_grade_job(
     ]
     return {
         "prompt_token_ids": tokenizer.apply_chat_template(messages=messages),
-        "multi_modal_data": {
-            "audio": [(audio.audio_array, audio.sampling_rate)]
-        },
+        "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
     }
 
 
@@ -2529,22 +2670,14 @@ def _grade_shot_batch_audio(
     if backend == "vllm_chat":
         chat_kwargs = dict(handle.get("chat_kwargs") or {})
         messages = [
-            _chat_messages_for_grade_job(
-                handle, job, spec, audio_type="audio_url"
-            )
+            _chat_messages_for_grade_job(handle, job, spec, audio_type="audio_url")
             for job, spec in zip(jobs, specs)
         ]
-        outputs = handle["llm"].chat(
-            messages, sampling_params=sampling, **chat_kwargs
-        )
-        return _grade_results_from_audio_outputs(
-            jobs, outputs=outputs, **result_kwargs
-        )
+        outputs = handle["llm"].chat(messages, sampling_params=sampling, **chat_kwargs)
+        return _grade_results_from_audio_outputs(jobs, outputs=outputs, **result_kwargs)
     if _is_hf_chat_handle(handle) or backend in {"hf_chat", "vllm_transformers"}:
         messages = [
-            _chat_messages_for_grade_job(
-                handle, job, spec, audio_type="audio"
-            )
+            _chat_messages_for_grade_job(handle, job, spec, audio_type="audio")
             for job, spec in zip(jobs, specs)
         ]
         if _is_hf_chat_handle(handle):
@@ -2569,24 +2702,15 @@ def _grade_shot_batch_audio(
                         max_tokens=max_tokens,
                         n=1,
                         temperature=temperature,
-                        seed=shot_i,
                     )
-                    outs = handle["llm"].chat(
-                        [msgs], sampling_params=sp, **chat_kwargs
-                    )
-                    group.append(
-                        _completion_text(outs[0]) if outs else ""
-                    )
+                    outs = handle["llm"].chat([msgs], sampling_params=sp, **chat_kwargs)
+                    group.append(_completion_text(outs[0]) if outs else "")
                 sample_groups.append(group)
             return _grade_results_from_audio_outputs(
                 jobs, sample_groups=sample_groups, **result_kwargs
             )
-        outputs = handle["llm"].chat(
-            messages, sampling_params=sampling, **chat_kwargs
-        )
-        return _grade_results_from_audio_outputs(
-            jobs, outputs=outputs, **result_kwargs
-        )
+        outputs = handle["llm"].chat(messages, sampling_params=sampling, **chat_kwargs)
+        return _grade_results_from_audio_outputs(jobs, outputs=outputs, **result_kwargs)
     if backend == "vllm_voxtral":
         prompts = [
             _voxtral_item_for_grade_job(handle, job, spec, label=label)
@@ -2595,9 +2719,7 @@ def _grade_shot_batch_audio(
         outputs = handle["llm"].generate(
             prompts, sampling_params=sampling, **generate_kwargs
         )
-        return _grade_results_from_audio_outputs(
-            jobs, outputs=outputs, **result_kwargs
-        )
+        return _grade_results_from_audio_outputs(jobs, outputs=outputs, **result_kwargs)
 
     prompts = [
         _vllm_generate_item_for_grade_job(
@@ -2608,9 +2730,7 @@ def _grade_shot_batch_audio(
     outputs = handle["llm"].generate(
         prompts, sampling_params=sampling, **generate_kwargs
     )
-    return _grade_results_from_audio_outputs(
-        jobs, outputs=outputs, **result_kwargs
-    )
+    return _grade_results_from_audio_outputs(jobs, outputs=outputs, **result_kwargs)
 
 
 def grade_shot_batch(
@@ -2736,10 +2856,7 @@ def _log_prompt_progress(
 ) -> None:
     """Print ``done/total prompts`` for a judge worker."""
     if total > 0:
-        body = (
-            f"{done}/{total} prompts "
-            f"({100.0 * done / total:.0f}%, {elapsed_s:.0f}s)"
-        )
+        body = f"{done}/{total} prompts ({100.0 * done / total:.0f}%, {elapsed_s:.0f}s)"
     else:
         body = f"{done}/{total} prompts ({elapsed_s:.0f}s)"
     suffix = f" {extra}" if extra else ""
@@ -2747,11 +2864,7 @@ def _log_prompt_progress(
 
 
 def _progress_judge_label(handle: dict[str, Any], model_id: str) -> str:
-    return str(
-        handle.get("judge_label")
-        or handle.get("suite_label")
-        or model_id
-    )
+    return str(handle.get("judge_label") or handle.get("suite_label") or model_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3044,7 +3157,10 @@ def grade_predictions_file(
         }
 
     for record in records:
-        if allowed_ids is not None and str(record.get("id") or "").strip() not in allowed_ids:
+        if (
+            allowed_ids is not None
+            and str(record.get("id") or "").strip() not in allowed_ids
+        ):
             continue
         existing_primary = record.get("primary_judge")
         if make_primary:
@@ -3069,9 +3185,7 @@ def grade_predictions_file(
         "status": "ok",
         "predictions_path": str(predictions_path),
         "n_records": len(records),
-        "n_sampled": (
-            len(allowed_ids) if allowed_ids is not None else len(records)
-        ),
+        "n_sampled": (len(allowed_ids) if allowed_ids is not None else len(records)),
         "n_questions": n_questions,
         "n_shots_graded": graded,
         "n_shots_reused": reused,
@@ -3237,9 +3351,7 @@ def grade_predictions_pack(
                         continue
                     question = str(record.get("question") or "")
                     answer = str(record.get("answer") or "")
-                    for shot_index, shot in _shots_in_index_order(
-                        record, shot_indices
-                    ):
+                    for shot_index, shot in _shots_in_index_order(record, shot_indices):
                         entry = _shot_judge_entry(shot, key)
                         if entry is None:
                             continue
@@ -3280,9 +3392,7 @@ def grade_predictions_pack(
                     )
                     cached = reuse_cache.get(cache_key)
                     if cached is not None:
-                        reuse_owners.append(
-                            (gradee, qid, shot_index, key, cached)
-                        )
+                        reuse_owners.append((gradee, qid, shot_index, key, cached))
                         continue
                     idx = pending_index.get(cache_key)
                     if idx is None:
@@ -3314,9 +3424,7 @@ def grade_predictions_pack(
     reused = 0
     graded_by = {(gradee, key): 0 for gradee in labels for key in keys}
     reused_by = {(gradee, key): 0 for gradee in labels for key in keys}
-    progress_extra = (
-        f"modes={len(mode_specs)} gradees={len(labels)}"
-    )
+    progress_extra = f"modes={len(mode_specs)} gradees={len(labels)}"
     n_prompts = len(jobs)
     started = time.perf_counter()
     if n_prompts == 0:
@@ -3346,9 +3454,7 @@ def grade_predictions_pack(
                 return shot
         return None
 
-    def _apply(
-        gradee: str, qid: str, shot_index: int, key: str, entry: dict
-    ) -> None:
+    def _apply(gradee: str, qid: str, shot_index: int, key: str, entry: dict) -> None:
         nonlocal graded
         copied = dict(entry)
         if sidecar:
@@ -3426,9 +3532,7 @@ def grade_predictions_pack(
                 entry["samples"] = result["samples"]
                 entry["n_samples"] = result.get("n_samples") or n_samples
             reuse_cache[cache_key] = entry
-            for extra_index, (gradee, qid, shot_index, key) in enumerate(
-                owner_list
-            ):
+            for extra_index, (gradee, qid, shot_index, key) in enumerate(owner_list):
                 _apply(gradee, qid, shot_index, key, entry)
                 graded_by[(gradee, key)] += 1
                 if extra_index:
@@ -3480,9 +3584,7 @@ def grade_predictions_pack(
             sidecar_path = sidecar_paths.get((gradee, key))
             by_model[f"{gradee}/{key}"] = {
                 "status": "ok" if files[gradee] else "missing",
-                "predictions_path": str(
-                    pack / "models" / gradee / "predictions.jsonl"
-                ),
+                "predictions_path": str(pack / "models" / gradee / "predictions.jsonl"),
                 "sidecar_path": str(sidecar_path) if sidecar_path else None,
                 "n_records": len(files[gradee]),
                 "n_sampled": (
@@ -3694,14 +3796,18 @@ def format_grade_prompt_inspection(
         chunks.append("assembly (top → bottom):")
         chunks.append("  prompt       : preamble")
         if fmt.audio_included:
-            chunks.append("  [AUDIO]      : clip inserted here for suite / API audio judges")
+            chunks.append(
+                "  [AUDIO]      : clip inserted here for suite / API audio judges"
+            )
             if fmt.include_gold:
                 chunks.append("  fields       : Question + Ground truth + Response")
             else:
                 chunks.append("  fields       : Question + Response")
         else:
             chunks.append("  fields       : Question + Ground truth + Response")
-        chunks.append("  closer       : closer" if fmt.closer else "  closer       : (none)")
+        chunks.append(
+            "  closer       : closer" if fmt.closer else "  closer       : (none)"
+        )
         chunks.append("")
         chunks.append("rendered text prompt (API judges and gold vLLM):")
         chunks.append(_RULE)
