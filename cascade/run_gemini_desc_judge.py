@@ -40,7 +40,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from aggregate import is_dropped_model  # noqa: E402
-from alt_test import MIN_HUMANS_PER_INSTANCE, majority_label  # noqa: E402
+from alt_test import (  # noqa: E402
+    DEFAULT_EPSILON,
+    MIN_HUMANS_PER_INSTANCE,
+    UNPARSED,
+    llm_annotation_from_entry,
+    majority_label,
+    score_binary_judge,
+)
 from grader import JUDGE_FORMATS, parse_grade_verdict  # noqa: E402
 from mmar_api import gemini_response_text  # noqa: E402
 from mmar_common import (  # noqa: E402
@@ -57,6 +64,13 @@ DEFAULT_META = REPO_ROOT / "data" / "mmar" / "MMAR-meta.jsonl"
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "mmar"
 DEFAULT_OUT_DIR = REPO_ROOT / "outputs" / "gemini-desc-judge"
 JUDGE_PROMPT_NAME = "judge_no_gt"
+DESC_JUDGE_MODEL = DEFAULT_MODEL
+DESC_MODE_FIRST = "judge_no_gt_desc"
+DESC_MODE_BEST = "judge_no_gt_desc_best"
+DESC_MODE_TITLES = {
+    DESC_MODE_FIRST: "judge_no_gt_desc (caption, no gold)",
+    DESC_MODE_BEST: "judge_no_gt_desc_best (best caption, no gold)",
+}
 MAX_ATTEMPTS = 5
 DESCRIPTIONS_NAME = "descriptions.jsonl"
 GRADES_NAME = "grades.jsonl"
@@ -824,6 +838,208 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def desc_grade_annotation(grade: dict | None) -> Any:
+    """Map a grades.jsonl row to the Alt-Test label used for pack judges."""
+    if not isinstance(grade, dict):
+        return None
+    return llm_annotation_from_entry(
+        {
+            "verdict": grade.get("verdict"),
+            "correct": grade.get("judge_correct"),
+        }
+    )
+
+
+def load_grades_index(out_dir: Path) -> dict[tuple[str, int, str], dict]:
+    grades: dict[tuple[str, int, str], dict] = {}
+    for row in load_jsonl_dicts(out_dir / GRADES_NAME):
+        qid = str(row.get("question_id") or "")
+        key = normalize_prediction(row.get("prediction_key") or row.get("prediction") or "")
+        try:
+            attempt = int(row.get("attempt", 0))
+        except (TypeError, ValueError):
+            continue
+        if qid and attempt >= 1 and key:
+            grades[(qid, attempt, key)] = row
+    return grades
+
+
+def load_best_attempts(out_dir: Path) -> dict[str, int]:
+    best: dict[str, int] = {}
+    for row in load_jsonl_dicts(out_dir / QUESTIONS_NAME):
+        qid = str(row.get("question_id") or "")
+        try:
+            attempt = int(row.get("best_attempt", 0))
+        except (TypeError, ValueError):
+            continue
+        if qid and attempt >= 1:
+            best[qid] = attempt
+    return best
+
+
+def _labeled_desc_rows(labels_path: Path, generations_path: Path) -> list[dict[str, Any]]:
+    by_id, by_key = load_generation_index(generations_path)
+    rows: list[dict[str, Any]] = []
+    with labels_path.open(encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            qid = str(raw.get("question_id") or "").strip()
+            model = str(raw.get("model_label") or "").strip()
+            if not qid or not model or is_dropped_model(model):
+                continue
+            ratings = _parse_ratings_cell(raw.get("ratings"))
+            if not ratings:
+                continue
+            try:
+                shot_index = int(raw.get("shot_index", 0))
+            except (TypeError, ValueError):
+                continue
+            gid = str(raw.get("generation_id") or "").strip()
+            gen = by_key.get((qid, model, shot_index))
+            if gen is None and gid:
+                gen = by_id.get(gid)
+            pred_text = str((gen or {}).get("answer_prediction") or "")
+            rows.append(
+                {
+                    "instance_id": f"{qid}\t{model}\t{shot_index}",
+                    "question_id": qid,
+                    "model_label": model,
+                    "shot_index": shot_index,
+                    "ratings": ratings,
+                    "prediction_key": normalize_prediction(pred_text),
+                }
+            )
+    return rows
+
+
+def desc_judge_instances(
+    out_dir: Path,
+    *,
+    labels_path: Path,
+    generations_path: Path,
+    attempt: str | int = "best",
+) -> list[tuple[str, list[bool], Any]]:
+    """Join caption-judge grades onto labeled generations.
+
+    ``attempt`` is ``"best"`` (the per-question winner in questions.jsonl) or a
+    1-based attempt index. Missing grades are ``None`` (slot absent).
+    """
+    grades = load_grades_index(out_dir)
+    best = load_best_attempts(out_dir) if attempt == "best" else {}
+    instances: list[tuple[str, list[bool], Any]] = []
+    for row in _labeled_desc_rows(labels_path, generations_path):
+        qid = row["question_id"]
+        if attempt == "best":
+            att = best.get(qid)
+        else:
+            att = int(attempt)
+        key = row["prediction_key"]
+        if att is None or not key:
+            instances.append((row["instance_id"], row["ratings"], None))
+            continue
+        instances.append(
+            (
+                row["instance_id"],
+                row["ratings"],
+                desc_grade_annotation(grades.get((qid, att, key))),
+            )
+        )
+    return instances
+
+
+def _desc_parse_stats(instances: list[tuple[str, list[bool], Any]]) -> dict[str, int | float | None]:
+    n_present = 0
+    n_parsed = 0
+    for _iid, _ratings, pred in instances:
+        if pred is None:
+            continue
+        n_present += 1
+        if pred is not UNPARSED:
+            n_parsed += 1
+    n_unparsed = n_present - n_parsed
+    return {
+        "n_judge_answers": n_present,
+        "n_parsed": n_parsed,
+        "n_unparsed": n_unparsed,
+        "parse_rate": (n_parsed / n_present) if n_present else None,
+    }
+
+
+def score_desc_judge(
+    out_dir: Path | None = None,
+    *,
+    labels_path: Path | None = None,
+    generations_path: Path | None = None,
+    epsilon: float = DEFAULT_EPSILON,
+    attempt: str | int = "best",
+) -> dict[str, Any]:
+    """Alt-Test for one caption-judge attempt selection."""
+    dest = Path(out_dir or DEFAULT_OUT_DIR)
+    labels = Path(labels_path or DEFAULT_LABELS)
+    generations = Path(generations_path or DEFAULT_GENERATIONS)
+    mode = DESC_MODE_BEST if attempt == "best" else DESC_MODE_FIRST
+    key = f"{DESC_JUDGE_MODEL}__{mode}__nongold"
+    instances = desc_judge_instances(
+        dest,
+        labels_path=labels,
+        generations_path=generations,
+        attempt=attempt,
+    )
+    stats = score_binary_judge(instances, epsilon=epsilon)
+    stats.update(_desc_parse_stats(instances))
+    stats["key"] = key
+    stats["model"] = DESC_JUDGE_MODEL
+    stats["mode"] = mode
+    stats["mode_title"] = DESC_MODE_TITLES[mode]
+    stats["sees_gold"] = False
+    stats["hears_audio"] = False
+    stats["attempt"] = attempt
+    stats["out_dir"] = str(dest)
+    return stats
+
+
+def desc_judge_accuracy_rows(
+    out_dir: Path | None = None,
+    *,
+    labels_path: Path | None = None,
+    generations_path: Path | None = None,
+    epsilon: float = DEFAULT_EPSILON,
+) -> list[dict[str, Any]]:
+    """Flattened rows matching analysis.ipynb ``flatten_accuracy`` (first + best)."""
+    rows = []
+    for attempt in (1, "best"):
+        stats = score_desc_judge(
+            out_dir,
+            labels_path=labels_path,
+            generations_path=generations_path,
+            epsilon=epsilon,
+            attempt=attempt,
+        )
+        rows.append(
+            {
+                "key": stats["key"],
+                "model": stats["model"],
+                "prompt": stats["mode"],
+                "mode": stats["mode"],
+                "mode_title": stats["mode_title"],
+                "sees_gold": False,
+                "hears_audio": False,
+                "n": stats.get("n"),
+                "n_missing": stats.get("n_missing"),
+                "n_unparsed": stats.get("n_unparsed"),
+                "parse_rate": stats.get("parse_rate"),
+                "n_skipped_lt3": stats.get("n_skipped_lt3"),
+                "rho": stats.get("advantage_prob"),
+                "rho_lo": stats.get("advantage_prob_ci_low"),
+                "rho_hi": stats.get("advantage_prob_ci_high"),
+                "llm": stats.get("loo_agree_judge"),
+                "hum": stats.get("loo_agree_human"),
+                "omega": stats.get("winning_rate"),
+                "passed": stats.get("passed"),
+            }
+        )
+    return rows
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -880,7 +1096,36 @@ def main() -> None:
         default="medium",
         help="Gemini thinking_level for grades: low, medium, or high.",
     )
+    parser.add_argument(
+        "--score",
+        action="store_true",
+        help="Score existing grades with the Alt-Test (first caption and best-of-5) and exit.",
+    )
     args = parser.parse_args()
+    if args.score:
+        rows = desc_judge_accuracy_rows(
+            Path(args.out_dir),
+            labels_path=Path(args.labels),
+            generations_path=Path(args.generations),
+        )
+        print(
+            f"{'judge':<52} {'n':>6} {'miss':>6} {'unp':>6} {'parse':>8} "
+            f"{'ρ':>8} {'llm':>8} {'hum':>8} {'ω':>8} {'pass':>5}"
+        )
+
+        def _fmt(value: object) -> str:
+            return f"{value:.3f}" if isinstance(value, (int, float)) else "—"
+
+        for row in rows:
+            passed = row.get("passed")
+            pass_s = "yes" if passed is True else "no" if passed is False else "—"
+            print(
+                f"{row['key']:<52} {row.get('n', 0):>6} {row.get('n_missing', 0):>6} "
+                f"{row.get('n_unparsed', 0):>6} {_fmt(row.get('parse_rate')):>8} "
+                f"{_fmt(row.get('rho')):>8} {_fmt(row.get('llm')):>8} "
+                f"{_fmt(row.get('hum')):>8} {_fmt(row.get('omega')):>8} {pass_s:>5}"
+            )
+        return
     asyncio.run(async_main(args))
 
 
