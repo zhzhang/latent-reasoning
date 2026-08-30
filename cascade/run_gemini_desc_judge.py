@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in sys.path:
 from aggregate import is_dropped_model  # noqa: E402
 from alt_test import (  # noqa: E402
     DEFAULT_EPSILON,
+    HumanRatings,
     MIN_HUMANS_PER_INSTANCE,
     UNPARSED,
     llm_annotation_from_entry,
@@ -81,25 +82,29 @@ SUMMARY_NAME = "summary.json"
 logger = logging.getLogger(__name__)
 
 
-def _parse_ratings_cell(raw: object) -> list[bool]:
-    if isinstance(raw, list):
+def _parse_ratings_cell(raw: object) -> dict[str, bool]:
+    if isinstance(raw, (list, dict)):
         values = raw
     else:
         text = str(raw or "").strip()
         if not text:
-            return []
+            return {}
         try:
             values = json.loads(text)
         except json.JSONDecodeError:
-            return []
-    if not isinstance(values, list) or not values:
-        return []
-    out: list[bool] = []
-    for item in values:
+            return {}
+    if isinstance(values, list):
+        items = ((str(index), item) for index, item in enumerate(values))
+    elif isinstance(values, dict):
+        items = ((str(annotator_id), item) for annotator_id, item in values.items())
+    else:
+        return {}
+    out: dict[str, bool] = {}
+    for annotator_id, item in items:
         if isinstance(item, bool):
-            out.append(item)
+            out[annotator_id] = item
         else:
-            return []
+            return {}
     return out
 
 
@@ -251,7 +256,8 @@ def load_work(
             model = str(raw.get("model_label") or "").strip()
             if is_dropped_model(model):
                 continue
-            ratings = _parse_ratings_cell(raw.get("ratings"))
+            ratings_by_annotator = _parse_ratings_cell(raw.get("ratings"))
+            ratings = list(ratings_by_annotator.values())
             if not qid or not model or len(ratings) < min_raters:
                 continue
             majority = majority_label(ratings)
@@ -886,8 +892,8 @@ def _labeled_desc_rows(labels_path: Path, generations_path: Path) -> list[dict[s
             model = str(raw.get("model_label") or "").strip()
             if not qid or not model or is_dropped_model(model):
                 continue
-            ratings = _parse_ratings_cell(raw.get("ratings"))
-            if not ratings:
+            ratings_by_annotator = _parse_ratings_cell(raw.get("ratings"))
+            if not ratings_by_annotator:
                 continue
             try:
                 shot_index = int(raw.get("shot_index", 0))
@@ -904,7 +910,7 @@ def _labeled_desc_rows(labels_path: Path, generations_path: Path) -> list[dict[s
                     "question_id": qid,
                     "model_label": model,
                     "shot_index": shot_index,
-                    "ratings": ratings,
+                    "ratings": ratings_by_annotator,
                     "prediction_key": normalize_prediction(pred_text),
                 }
             )
@@ -917,7 +923,7 @@ def desc_judge_instances(
     labels_path: Path,
     generations_path: Path,
     attempt: str | int = "best",
-) -> list[tuple[str, list[bool], Any]]:
+) -> list[tuple[str, HumanRatings, Any]]:
     """Join caption-judge grades onto labeled generations.
 
     ``attempt`` is ``"best"`` (the per-question winner in questions.jsonl) or a
@@ -925,7 +931,7 @@ def desc_judge_instances(
     """
     grades = load_grades_index(out_dir)
     best = load_best_attempts(out_dir) if attempt == "best" else {}
-    instances: list[tuple[str, list[bool], Any]] = []
+    instances: list[tuple[str, HumanRatings, Any]] = []
     for row in _labeled_desc_rows(labels_path, generations_path):
         qid = row["question_id"]
         if attempt == "best":
@@ -946,7 +952,9 @@ def desc_judge_instances(
     return instances
 
 
-def _desc_parse_stats(instances: list[tuple[str, list[bool], Any]]) -> dict[str, int | float | None]:
+def _desc_parse_stats(
+    instances: list[tuple[str, HumanRatings, Any]],
+) -> dict[str, int | float | None]:
     n_present = 0
     n_parsed = 0
     for _iid, _ratings, pred in instances:

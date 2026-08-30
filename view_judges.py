@@ -3,8 +3,8 @@
 Joins:
 
 * ``exports/labels.csv`` — ``question_id``, ``generation_id``, ``model_label``,
-  ``shot_index``, ``ratings`` (JSON list of bools; gold is majority when
-  there are at least three ratings)
+  ``shot_index``, ``ratings`` (JSON annotator-to-bool mapping; legacy boolean
+  lists are supported; gold is majority when there are at least three ratings)
 * ``exports/generations.csv`` — same keys plus ``answer_prediction``
 * ``outputs/mmar-judging`` — ``shots[].judges[<key>]`` entries
   (``correct``, ``verdict``, ``output``, ``generation``, ``model_id``,
@@ -45,6 +45,7 @@ from grader import (
 )
 from alt_test import (
     DEFAULT_EPSILON,
+    HumanRatings,
     llm_annotation_from_entry,
     score_binary_judge,
     scoring_gold,
@@ -70,30 +71,34 @@ LOCAL_MMAR_META = DEFAULT_DATA_DIR / "MMAR-meta.jsonl"
 CONFIG: dict[str, Any] = {}
 
 
-def _parse_ratings_cell(raw: object) -> list[bool]:
-    if isinstance(raw, list):
+def _parse_ratings_cell(raw: object) -> dict[str, bool]:
+    if isinstance(raw, (list, dict)):
         values = raw
     else:
         text = str(raw or "").strip()
         if not text:
-            return []
+            return {}
         try:
             values = json.loads(text)
         except json.JSONDecodeError:
-            return []
-    if not isinstance(values, list) or not values:
-        return []
-    out: list[bool] = []
-    for item in values:
+            return {}
+    if isinstance(values, list):
+        items = ((str(index), item) for index, item in enumerate(values))
+    elif isinstance(values, dict):
+        items = ((str(annotator_id), item) for annotator_id, item in values.items())
+    else:
+        return {}
+    out: dict[str, bool] = {}
+    for annotator_id, item in items:
         if isinstance(item, bool):
-            out.append(item)
+            out[annotator_id] = item
         else:
-            return []
+            return {}
     return out
 
 
 def load_label_rows(path: Path) -> list[dict[str, Any]]:
-    """Rows with a non-empty boolean ``ratings`` list (exports/labels.csv)."""
+    """Rows with boolean ratings and stable annotator identities."""
     rows: list[dict[str, Any]] = []
     if not path.is_file():
         return rows
@@ -102,9 +107,10 @@ def load_label_rows(path: Path) -> list[dict[str, Any]]:
         for raw in reader:
             qid = str(raw.get("question_id") or "").strip()
             model = str(raw.get("model_label") or "").strip()
-            ratings = _parse_ratings_cell(raw.get("ratings"))
-            if not qid or not model or not ratings:
+            ratings_by_annotator = _parse_ratings_cell(raw.get("ratings"))
+            if not qid or not model or not ratings_by_annotator:
                 continue
+            ratings = list(ratings_by_annotator.values())
             try:
                 shot_index = int(raw.get("shot_index", 0))
             except (TypeError, ValueError):
@@ -128,6 +134,7 @@ def load_label_rows(path: Path) -> list[dict[str, Any]]:
                     "model_label": model,
                     "shot_index": shot_index,
                     "ratings": ratings,
+                    "ratings_by_annotator": ratings_by_annotator,
                     "gold": scoring_gold(ratings),
                     "extra": extra,
                 }
@@ -305,7 +312,7 @@ def _collect_judge_keys(
 
 
 def compute_accuracy(
-    samples: list[tuple[str, list[bool], dict[str, dict[str, Any]] | None]],
+    samples: list[tuple[str, HumanRatings, dict[str, dict[str, Any]] | None]],
     judge_keys: list[str],
     *,
     epsilon: float = DEFAULT_EPSILON,
@@ -478,7 +485,9 @@ def load_bundle(
             seen_q.add(qid)
             question_ids.append(qid)
 
-    samples: list[tuple[str, list[bool], dict[str, dict[str, Any]] | None]] = []
+    samples: list[
+        tuple[str, HumanRatings, dict[str, dict[str, Any]] | None]
+    ] = []
     by_id: dict[str, dict[str, Any]] = {}
     for qid in question_ids:
         sample_record = None
@@ -543,7 +552,7 @@ def load_bundle(
         samples.append(
             (
                 f"{qid}\t{model}\t{shot_index}",
-                list(row["ratings"]),
+                dict(row["ratings_by_annotator"]),
                 judges,
             )
         )

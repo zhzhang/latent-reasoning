@@ -883,6 +883,7 @@ def _anthropic_judge_content(
     prediction: str,
     prompt_name: str,
     include_gold: bool,
+    description: str = "",
 ) -> list[dict[str, Any]]:
     """User message: the original gold judge prompt, marked for caching.
 
@@ -900,6 +901,7 @@ def _anthropic_judge_content(
         prediction=prediction,
         prompt=prompt_name,
         include_gold=include_gold,
+        description=description,
     )
     return [
         {
@@ -1149,6 +1151,7 @@ class _PendingJob:
     audio_path: str | None
     reuse_key: tuple[str, str, str]
     owners: list[tuple[str, int, int]] = field(default_factory=list)
+    description: str = ""
 
 
 def _gold_prefix(question: str, answer: str, prompt_name: str | None = None) -> str:
@@ -1271,8 +1274,11 @@ async def grade_pack_with_api_judge(
 ) -> dict[str, Any]:
     """Grade pack predictions with one API judge; writes ``predictions.jsonl``."""
     from grader import (
+        CASCADE_PROMPT_NAME,
+        cascade_description_for,
         compose_judge_key,
         get_judge_format,
+        load_cascade_descriptions,
         normalize_grade_prompt,
         require_audio_nongold_judge,
         resolve_grade_allowed_ids,
@@ -1297,6 +1303,11 @@ async def grade_pack_with_api_judge(
     )
     use_gold_prefix = include_gold and not fmt.audio_included
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
+    cascade_descs = (
+        load_cascade_descriptions(pack_dir)
+        if prompt_name == CASCADE_PROMPT_NAME
+        else {}
+    )
     gradees = list(model_labels)
     files: dict[str, list[dict]] = {}
     all_ids: list[str] = []
@@ -1340,6 +1351,7 @@ async def grade_pack_with_api_judge(
                             answer,
                             _shot_prediction_text(shot, model_label=gradee),
                             include_gold=include_gold,
+                            prompt=prompt_name,
                         ),
                         dict(entry),
                     )
@@ -1364,7 +1376,11 @@ async def grade_pack_with_api_judge(
                     continue
                 prediction = _shot_prediction_text(shot, model_label=gradee)
                 cache_key = _grade_reuse_key(
-                    question, answer, prediction, include_gold=include_gold
+                    question,
+                    answer,
+                    prediction,
+                    include_gold=include_gold,
+                    prompt=prompt_name,
                 )
                 cached = reuse_cache.get(cache_key)
                 if cached is not None:
@@ -1379,6 +1395,11 @@ async def grade_pack_with_api_judge(
                         prediction=prediction,
                         audio_path=audio_raw,
                         reuse_key=cache_key,
+                        description=cascade_description_for(
+                            str(record.get("id") or ""),
+                            cascade_descs,
+                            prompt_name=prompt_name,
+                        ),
                     )
                     pending_by_key[cache_key] = job
                 job.owners.append((gradee, record_index, shot_index))
@@ -1440,6 +1461,7 @@ async def grade_pack_with_api_judge(
                 prediction=job.prediction,
                 prompt=prompt_name,
                 include_gold=include_gold,
+                description=job.description,
             )
             send = full
             if cached_content and prefix and use_gold_prefix and full.startswith(prefix):
@@ -1713,8 +1735,11 @@ async def _grade_pack_with_anthropic_async(
     print_every: int = 5,
 ) -> dict[str, Any]:
     from grader import (
+        CASCADE_PROMPT_NAME,
+        cascade_description_for,
         compose_judge_key,
         get_judge_format,
+        load_cascade_descriptions,
         normalize_grade_prompt,
         _grade_reuse_key,
         _shot_needs_grade,
@@ -1748,6 +1773,11 @@ async def _grade_pack_with_anthropic_async(
     include_gold = fmt.include_gold
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
+    cascade_descs = (
+        load_cascade_descriptions(pack_dir)
+        if prompt_name == CASCADE_PROMPT_NAME
+        else {}
+    )
 
     gradees = list(model_labels)
     files: dict[str, list[dict]] = {}
@@ -1823,6 +1853,11 @@ async def _grade_pack_with_anthropic_async(
                         prediction=prediction,
                         audio_path=None,
                         reuse_key=cache_key,
+                        description=cascade_description_for(
+                            qid,
+                            cascade_descs,
+                            prompt_name=prompt_name,
+                        ),
                     )
                     pending_by_key[cache_key] = job
                 job.owners.append((gradee, qid, shot_index))  # type: ignore[arg-type]
@@ -2000,6 +2035,7 @@ async def _grade_pack_with_anthropic_async(
             prediction=job.prediction,
             prompt_name=prompt_name,
             include_gold=include_gold,
+            description=job.description,
         )
         try:
             results = await taker.complete_n(content, n_samples)
@@ -2708,8 +2744,11 @@ def grade_pack_with_batch_api(
     requests per unique prompt and majority-votes the parsed verdicts.
     """
     from grader import (
+        CASCADE_PROMPT_NAME,
+        cascade_description_for,
         compose_judge_key,
         get_judge_format,
+        load_cascade_descriptions,
         normalize_grade_prompt,
         _grade_reuse_key,
         _shot_needs_grade,
@@ -2734,6 +2773,11 @@ def grade_pack_with_batch_api(
     include_gold = fmt.include_gold
     prompt_name = normalize_grade_prompt(prompt, include_gold=include_gold)
     key = compose_judge_key(resolved, prompt=prompt_name, include_gold=include_gold)
+    cascade_descs = (
+        load_cascade_descriptions(pack_dir)
+        if prompt_name == CASCADE_PROMPT_NAME
+        else {}
+    )
 
     gradees = list(model_labels)
     files: dict[str, list[dict]] = {}
@@ -2814,6 +2858,11 @@ def grade_pack_with_batch_api(
                         prediction=prediction,
                         audio_path=None,
                         reuse_key=cache_key,
+                        description=cascade_description_for(
+                            qid,
+                            cascade_descs,
+                            prompt_name=prompt_name,
+                        ),
                     )
                     pending_by_key[cache_key] = job
                 job.owners.append((gradee, qid, shot_index))
@@ -2894,6 +2943,7 @@ def grade_pack_with_batch_api(
                 prediction=job.prediction,
                 prompt=prompt_name,
                 include_gold=include_gold,
+                description=job.description,
             )
             sample_ids = (
                 [custom_id]

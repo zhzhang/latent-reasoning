@@ -2,11 +2,11 @@
 
 Reads ``exports/labels.csv`` and ``exports/generations.csv``, joins
 question / gold / audio from MMAR-meta, and writes the judged pack to
-``outputs/mmar-judging`` (Modal volume ``mmar-judging``). Grades
-only questions present in ``labels.csv``. Default is both with-GT and
-no-GT recipes (one GPU load per judge). Shots that already have a
-verdict for the same judge key are skipped. GPU grading is
-fire-and-forget: the CPU orchestrator prepares the pack, spawns one
+``outputs/mmar-judging`` (Modal volume ``mmar-judging``). Grades only
+shots with at least three human ratings in ``labels.csv``. Default is
+both with-GT and no-GT recipes (one GPU load per judge). Shots that
+already have a verdict for the same judge key are skipped. GPU grading
+is fire-and-forget: the CPU orchestrator prepares the pack, spawns one
 GPU worker per judge, and returns. After those jobs finish, fold
 sidecars with ``--merge-only`` and score with ``--accuracy-only``.
 
@@ -14,7 +14,7 @@ vLLM MODEL_SPECS / dedicated judges start Modal from this script. API judges
 (gemini-3.7-flash) run locally and never open an App. Batch API judges
 (gpt-5.6-luna, claude-sonnet-5) also run locally: they grade text-only
 recipes (default ``with_gt``; ``--grade-prompt`` selects any text format)
-on shots in ``exports/labels.csv`` that have all three reviewer ratings.
+on the same triple-labeled shots.
 
     uv run modal run seed_volume.py --datasets none --models qwen2.5-3b
     uv run modal run --detach seed_volume.py --datasets none --models qwen3.6-35b-a3b-fp8
@@ -40,6 +40,18 @@ on shots in ``exports/labels.csv`` that have all three reviewer ratings.
 
     # Any JUDGE_FORMATS key (text-only variant; dedicated judges OK)
     uv run run_judges.py --grade-prompt neutral_with_gt_no_audio
+
+    # Cascade: Gemini audio captions stand in for the clip (text-only, no gold).
+    # Same labeled pack + prompt as Modal suite judges; Gemini runs locally.
+    export GEMINI_API_KEY=...
+    uv run run_judges.py --judge-model-id gemini-3.7-flash --grade-prompt cascade
+
+    # Modal suite judges on cascade (GPU), same captions / question filter
+    uv run run_judges.py --grade-prompt cascade
+
+    # Mixed: Gemini API locally while Modal vLLM runs detached
+    uv run run_judges.py \\
+      --judge-model-id gemini-3.7-flash,qwen3-omni --grade-prompt cascade
 
     # Every format in JUDGE_FORMATS
     uv run run_judges.py --grade-prompt all
@@ -99,6 +111,7 @@ from aggregate import (
 )
 from alt_test import (
     DEFAULT_EPSILON,
+    HumanRatings,
     MIN_HUMANS_PER_INSTANCE,
     llm_annotation_from_entry,
     score_binary_judge,
@@ -133,38 +146,42 @@ LOCAL_MMAR_META = LOCAL_MMAR_DATA_ROOT / "MMAR-meta.jsonl"
 app = modal.App("run-judges")
 
 
-def _parse_ratings_cell(raw: object) -> list[bool]:
-    if isinstance(raw, list):
+def _parse_ratings_cell(raw: object) -> dict[str, bool]:
+    if isinstance(raw, (list, dict)):
         values = raw
     else:
         text = str(raw or "").strip()
         if not text:
-            return []
+            return {}
         try:
             values = json.loads(text)
         except json.JSONDecodeError:
-            return []
-    if not isinstance(values, list) or not values:
-        return []
-    out: list[bool] = []
-    for item in values:
+            return {}
+    if isinstance(values, list):
+        items = ((str(index), item) for index, item in enumerate(values))
+    elif isinstance(values, dict):
+        items = ((str(annotator_id), item) for annotator_id, item in values.items())
+    else:
+        return {}
+    out: dict[str, bool] = {}
+    for annotator_id, item in items:
         if isinstance(item, bool):
-            out.append(item)
+            out[annotator_id] = item
         else:
-            return []
+            return {}
     return out
 
 
 def load_pack_label_rows(labels_path: Path) -> list[dict]:
-    """Rows with a non-empty boolean ``ratings`` list."""
+    """Rows with boolean ratings and stable annotator identities."""
     rows: list[dict] = []
     with labels_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for raw in reader:
             qid = str(raw.get("question_id") or "").strip()
             model = str(raw.get("model_label") or "").strip()
-            ratings = _parse_ratings_cell(raw.get("ratings"))
-            if not qid or not model or not ratings:
+            ratings_by_annotator = _parse_ratings_cell(raw.get("ratings"))
+            if not qid or not model or not ratings_by_annotator:
                 continue
             try:
                 shot_index = int(raw.get("shot_index", 0))
@@ -175,7 +192,8 @@ def load_pack_label_rows(labels_path: Path) -> list[dict]:
                     "question_id": qid,
                     "model_label": model,
                     "shot_index": shot_index,
-                    "ratings": ratings,
+                    "ratings": list(ratings_by_annotator.values()),
+                    "ratings_by_annotator": ratings_by_annotator,
                 }
             )
     return rows
@@ -197,14 +215,17 @@ def _labels_path(pack_dir: Path) -> Path:
 
 
 def _require_labeled_question_ids(pack_dir: Path) -> list[str]:
+    """Question ids with ≥3 human ratings (grading / Alt-Test sample)."""
     path = _labels_path(pack_dir)
     if not path.is_file():
         raise SystemExit(
             f"labels.csv not found at {path}. Expected {EXPORTS_DIR / LABELS_CSV_NAME}."
         )
-    ids = labeled_question_ids(load_pack_label_rows(path))
+    ids = labeled_question_ids(triple_labeled_rows(load_pack_label_rows(path)))
     if not ids:
-        raise SystemExit(f"No labeled questions in {path}")
+        raise SystemExit(
+            f"No questions with ≥{MIN_HUMANS_PER_INSTANCE} human ratings in {path}"
+        )
     return ids
 
 
@@ -314,32 +335,45 @@ def _records_from_exports(
     meta_path: Path,
     data_root: Path,
 ) -> dict[str, list[dict]]:
-    label_rows = load_pack_label_rows(exports_dir / LABELS_CSV_NAME)
+    label_rows = triple_labeled_rows(
+        load_pack_label_rows(exports_dir / LABELS_CSV_NAME)
+    )
     labeled_ids = set(labeled_question_ids(label_rows))
     if not labeled_ids:
-        raise SystemExit(f"No labeled questions in {exports_dir / LABELS_CSV_NAME}")
+        raise SystemExit(
+            f"No questions with ≥{MIN_HUMANS_PER_INSTANCE} human ratings in "
+            f"{exports_dir / LABELS_CSV_NAME}"
+        )
     gen_rows = _load_generation_rows(exports_dir / GENERATIONS_CSV_NAME, labeled_ids)
     missing_gen = labeled_ids - {row["question_id"] for row in gen_rows}
     if missing_gen:
         sample = ", ".join(sorted(missing_gen)[:5])
         raise SystemExit(
-            f"{len(missing_gen)} labeled question(s) missing from generations.csv "
-            f"(e.g. {sample})"
+            f"{len(missing_gen)} triple-labeled question(s) missing from "
+            f"generations.csv (e.g. {sample})"
         )
     meta_by_id = _load_mmar_meta(meta_path)
     missing_meta = sorted(qid for qid in labeled_ids if qid not in meta_by_id)
     if missing_meta:
         sample = ", ".join(missing_meta[:5])
         raise SystemExit(
-            f"{len(missing_meta)} labeled question(s) missing from MMAR-meta "
+            f"{len(missing_meta)} triple-labeled question(s) missing from MMAR-meta "
             f"at {meta_path} (e.g. {sample})"
         )
 
+    # Only materialize (model, question, shot) triples that have ≥3 ratings.
+    labeled_shots = {
+        (row["model_label"], row["question_id"], int(row["shot_index"]))
+        for row in label_rows
+    }
     grouped: dict[str, dict[str, dict[int, dict]]] = {}
     for row in gen_rows:
         model = row["model_label"]
         qid = row["question_id"]
-        grouped.setdefault(model, {}).setdefault(qid, {})[row["shot_index"]] = row
+        shot_index = int(row["shot_index"])
+        if (model, qid, shot_index) not in labeled_shots:
+            continue
+        grouped.setdefault(model, {}).setdefault(qid, {})[shot_index] = row
 
     by_model: dict[str, list[dict]] = {}
     for model, by_qid in grouped.items():
@@ -403,7 +437,7 @@ def materialize_exports_pack(
     by_model = _records_from_exports(exports_dir, meta_path, data_root)
     labels = order_model_labels(list(by_model))
     question_ids = labeled_question_ids(
-        load_pack_label_rows(exports_dir / LABELS_CSV_NAME)
+        triple_labeled_rows(load_pack_label_rows(exports_dir / LABELS_CSV_NAME))
     )
     n_shots = max(
         (
@@ -505,7 +539,7 @@ def _entry_parsed(entry: object) -> bool:
 
 
 def _parse_stats(
-    samples: list[tuple[str, list[bool], dict[str, dict] | None]],
+    samples: list[tuple[str, HumanRatings, dict[str, dict] | None]],
     key: str,
 ) -> dict[str, int | float | None]:
     n_present = 0
@@ -531,7 +565,7 @@ def _sort_judge_keys(by_judge: dict) -> list[str]:
 
 
 def _score_judge_tables(
-    samples: list[tuple[str, list[bool], dict[str, dict] | None]],
+    samples: list[tuple[str, HumanRatings, dict[str, dict] | None]],
     key_mode: dict[str, str],
     *,
     epsilon: float,
@@ -560,14 +594,16 @@ def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -
         raise SystemExit(f"labels.csv not found at {labels_path}")
     rows = [
         row
-        for row in load_pack_label_rows(labels_path)
+        for row in triple_labeled_rows(load_pack_label_rows(labels_path))
         if not is_dropped_model(str(row.get("model_label") or ""))
     ]
     if not rows:
-        raise SystemExit(f"No labeled rows in {labels_path}")
+        raise SystemExit(
+            f"No rows with ≥{MIN_HUMANS_PER_INSTANCE} human ratings in {labels_path}"
+        )
 
     pred_cache: dict[str, dict[str, dict]] = {}
-    samples: list[tuple[str, list[bool], dict[str, dict] | None]] = []
+    samples: list[tuple[str, HumanRatings, dict[str, dict] | None]] = []
     judge_keys: set[str] = set()
 
     for row in rows:
@@ -587,7 +623,13 @@ def report_judge_accuracy(pack_dir: Path, *, epsilon: float = DEFAULT_EPSILON) -
                 if key and not is_dropped_model(str(key))
             }
             judge_keys.update(judges)
-        samples.append((_instance_id(row), list(row["ratings"]), judges))
+        samples.append(
+            (
+                _instance_id(row),
+                dict(row["ratings_by_annotator"]),
+                judges,
+            )
+        )
 
     from grader import accuracy_mode_names
 
@@ -1705,6 +1747,68 @@ def _local_model_labels(models: str) -> list[str]:
     return labels
 
 
+def _ensure_cascade_descriptions(pack_dir: Path) -> dict[str, str]:
+    """Write Gemini attempt-1 captions into the pack if cascade is grading."""
+    from grader import (
+        CASCADE_DESCRIPTIONS_NAME,
+        collect_gemini_cascade_descriptions,
+        load_cascade_descriptions,
+        write_cascade_descriptions,
+    )
+
+    existing = load_cascade_descriptions(pack_dir)
+    if existing:
+        print(
+            f"[run-judges] cascade captions already on pack "
+            f"n={len(existing)} path={pack_dir / CASCADE_DESCRIPTIONS_NAME}"
+        )
+        return existing
+    descriptions = collect_gemini_cascade_descriptions()
+    if not descriptions:
+        raise SystemExit(
+            "cascade grading needs Gemini audio captions. Expected "
+            "outputs/gemini-desc-judge/descriptions.jsonl (attempt 1) "
+            "or outputs/mmar-descriptions/models/gemini-3.7-flash/predictions.jsonl"
+        )
+    path = write_cascade_descriptions(pack_dir, descriptions)
+    print(f"[run-judges] wrote {len(descriptions)} cascade captions -> {path}")
+    return descriptions
+
+
+def _filter_cascade_question_ids(
+    question_ids: list[str],
+    descriptions: dict[str, str],
+) -> list[str]:
+    """Keep labeled questions that have a Gemini caption (required for cascade)."""
+    have = set(descriptions)
+    kept = [qid for qid in question_ids if qid in have]
+    dropped = len(question_ids) - len(kept)
+    if dropped:
+        print(
+            f"[run-judges] cascade: dropped {dropped} labeled question(s) "
+            f"without Gemini captions; grading {len(kept)}"
+        )
+    if not kept:
+        raise SystemExit(
+            "cascade grading: no overlap between labeled questions and "
+            "Gemini captions in cascade_descriptions.json"
+        )
+    return kept
+
+
+def _upload_cascade_descriptions(pack_dir: Path) -> None:
+    """Push ``cascade_descriptions.json`` onto the judging volume pack root."""
+    from grader import CASCADE_DESCRIPTIONS_NAME
+
+    local = pack_dir / CASCADE_DESCRIPTIONS_NAME
+    if not local.is_file():
+        return
+    remote = f"/{CASCADE_DESCRIPTIONS_NAME}"
+    with judging_volume.batch_upload(force=True) as batch:
+        batch.put_file(str(local), remote)
+    print(f"[run-judges] uploaded cascade captions -> {remote}")
+
+
 def _upload_local_ingest(pack_dir: Path) -> None:
     """Upload current local predictions/manifest for ingest after GPU workers finish.
 
@@ -1713,6 +1817,11 @@ def _upload_local_ingest(pack_dir: Path) -> None:
     """
     prefix = f"/{INGEST_DIR_NAME}"
     uploads: list[tuple[str, str]] = []
+    from grader import CASCADE_DESCRIPTIONS_NAME
+
+    cascade = pack_dir / CASCADE_DESCRIPTIONS_NAME
+    if cascade.is_file():
+        uploads.append((str(cascade), f"{prefix}/{CASCADE_DESCRIPTIONS_NAME}"))
     manifest = pack_dir / "manifest.json"
     if manifest.is_file():
         uploads.append((str(manifest), f"{prefix}/manifest.json"))
@@ -1822,6 +1931,7 @@ def run_judges_pipeline(
     include_gold: bool | None = None,
     prompt: str | None = None,
     n_questions: int | None = None,
+    question_ids: list[str] | None = None,
 ) -> dict:
     """Remote orchestrator: prepare the pack, spawn GPU judges, return.
 
@@ -1843,13 +1953,16 @@ def run_judges_pipeline(
     suite = list(prep.get("suite_judges") or [])
     dedicated = list(prep.get("dedicated_judges") or [])
     gradees = list(prep["model_labels"])
-    question_ids = list(prep.get("question_ids") or [])
+    if question_ids is not None:
+        qids = [str(qid).strip() for qid in question_ids if str(qid).strip()]
+    else:
+        qids = list(prep.get("question_ids") or [])
     first_new = prep.get("first_new")
     print(
         f"[run-judges] pipeline prep primary={prep['primary_judge']} "
         f"(existing_primary={prep['existing_primary']}) "
         f"existing_judges={prep['existing_judges']} "
-        f"n_labeled={len(question_ids)} "
+        f"n_labeled={len(qids)} "
         f"gold={_run_mode_note(prompt, include_gold)}"
     )
     suite_handles, dedicated_handles = _spawn_remote_judges(
@@ -1861,7 +1974,7 @@ def run_judges_pipeline(
         force=force,
         batch_size=batch_size,
         n_questions=n_questions,
-        question_ids=question_ids,
+        question_ids=qids,
         primary_judge=prep["primary_judge"],
         dedicated_make_primary=bool(make_primary)
         and any(first_new == entry["label"] for entry in dedicated),
@@ -1915,6 +2028,7 @@ def _run_judges(
     batch_poll_interval: float = 30.0,
 ) -> dict:
     from grader import (
+        CASCADE_PROMPT_NAME,
         JUDGE_FORMATS,
         compose_judge_key,
         iter_grade_modes,
@@ -1934,6 +2048,7 @@ def _run_judges(
     suite, dedicated, api, first_new = _select_judges(judge_model_id)
     live_api, batch_api = split_api_judges(api)
     modes = iter_grade_modes(prompt=prompt, include_gold=include_gold)
+    needs_cascade = any(name == CASCADE_PROMPT_NAME for name, _ in modes)
     needs_audio = any(JUDGE_FORMATS[name].audio_included for name, _ in modes)
     if not live_api and not suite and not dedicated:
         needs_audio = False
@@ -1962,13 +2077,21 @@ def _run_judges(
     existing_primary = None
     mode = "freeform"
     local_api = bool(live_api or batch_api)
-    if local_api or not needs_modal:
-        pack_dir = _require_local_pack(need_audio=needs_audio and bool(live_api))
+    if local_api or not needs_modal or needs_cascade:
+        pack_dir = _require_local_pack(
+            need_audio=needs_audio and bool(live_api)
+        )
         manifest = _load_manifest(pack_dir)
         mode = _assert_freeform_run(manifest)
         gradees = _local_model_labels(models)
         question_ids = _require_labeled_question_ids(pack_dir)
         existing_primary = manifest.get("primary_judge")
+    if needs_cascade:
+        assert pack_dir is not None
+        cascade_descs = _ensure_cascade_descriptions(pack_dir)
+        question_ids = _filter_cascade_question_ids(question_ids, cascade_descs)
+        if needs_modal:
+            _upload_cascade_descriptions(pack_dir)
     if make_primary:
         primary = first_new
     else:
@@ -2149,6 +2272,7 @@ def _run_judges(
         include_gold=include_gold,
         prompt=prompt,
         n_questions=n_questions,
+        question_ids=question_ids or None,
     ).get()
     dashboard = app.get_dashboard_url()
     suite_spawned = list(out.get("suite") or [])

@@ -8,7 +8,8 @@ secondary.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from scipy.stats import ttest_1samp
@@ -29,6 +30,7 @@ InstanceId = Hashable
 AnnotatorId = Hashable
 Annotation = Any
 ScoringFn = Callable[[Any, list[Any]], float]
+HumanRatings = Mapping[AnnotatorId, bool] | Sequence[bool]
 
 
 def majority_label(ratings: Sequence[bool]) -> bool | None:
@@ -42,7 +44,9 @@ def majority_label(ratings: Sequence[bool]) -> bool | None:
     return n_true > n_false
 
 
-def scoring_gold(ratings: Sequence[bool], *, min_humans: int = MIN_HUMANS_PER_INSTANCE) -> bool | None:
+def scoring_gold(
+    ratings: Sequence[bool], *, min_humans: int = MIN_HUMANS_PER_INSTANCE
+) -> bool | None:
     """Gold used for per-shot diagnostics: majority when ≥ ``min_humans`` ratings."""
     values = [bool(item) for item in ratings]
     if len(values) < min_humans:
@@ -325,7 +329,9 @@ def alt_test(
         "advantage_prob_ci_high": ci_high,
         "advantage_prob_ci_level": float(ci_level),
         "winning_rate": winning_rate,
-        "passed": (winning_rate >= PASS_THRESHOLD) if winning_rate is not None else None,
+        "passed": (winning_rate >= PASS_THRESHOLD)
+        if winning_rate is not None
+        else None,
         "loo_agree_judge": float(np.mean(agree_llm)) if agree_llm else None,
         "loo_agree_human": float(np.mean(agree_human)) if agree_human else None,
         "n_annotators": n_humans,
@@ -337,7 +343,7 @@ def alt_test(
 
 
 def score_binary_judge(
-    instances: Sequence[tuple[InstanceId, Sequence[bool], Any]],
+    instances: Sequence[tuple[InstanceId, HumanRatings, Any]],
     *,
     epsilon: float = DEFAULT_EPSILON,
     min_humans_per_instance: int = MIN_HUMANS_PER_INSTANCE,
@@ -346,30 +352,41 @@ def score_binary_judge(
 ) -> dict[str, Any]:
     """Score one judge against boolean human ratings.
 
-    Each item is ``(instance_id, ratings, llm_verdict)``. ``llm_verdict`` is
-    ``None`` when the judge slot is missing, a bool for a parsed pass/fail, or
-    ``UNPARSED`` when the stored text has no verdict. Unparsed replies enter the
-    test and never match a human bool (disagreement). Only instances with at
-    least ``min_humans_per_instance`` ratings and a non-``None`` label enter.
-    Rating index is the annotator id.
+    Each item is ``(instance_id, ratings, llm_verdict)``. ``ratings`` should be
+    an annotator-id-to-label mapping so the same human is excluded across all
+    of their instances. Legacy boolean sequences remain supported and use the
+    rating index as the annotator id.
+
+    ``llm_verdict`` is ``None`` when the judge slot is missing, a bool for a
+    parsed pass/fail, or ``UNPARSED`` when the stored text has no verdict.
+    Unparsed replies enter the test and never match a human bool (disagreement).
+    Only instances with at least ``min_humans_per_instance`` ratings and a
+    non-``None`` label enter.
     """
     n_total = len(instances)
     n_missing = 0
     n_skipped_lt3 = 0
-    humans: dict[str, dict[InstanceId, bool]] = {}
+    humans: dict[AnnotatorId, dict[InstanceId, bool]] = {}
     llm: dict[InstanceId, Any] = {}
 
     for instance_id, ratings, pred in instances:
-        values = [bool(item) for item in ratings]
-        if len(values) < min_humans_per_instance:
+        if isinstance(ratings, Mapping):
+            annotated_values = [
+                (annotator_id, bool(rating)) for annotator_id, rating in ratings.items()
+            ]
+        else:
+            annotated_values = [
+                (str(index), bool(rating)) for index, rating in enumerate(ratings)
+            ]
+        if len(annotated_values) < min_humans_per_instance:
             n_skipped_lt3 += 1
             continue
         if pred is None:
             n_missing += 1
             continue
         llm[instance_id] = pred
-        for index, rating in enumerate(values):
-            humans.setdefault(str(index), {})[instance_id] = bool(rating)
+        for annotator_id, rating in annotated_values:
+            humans.setdefault(annotator_id, {})[instance_id] = rating
 
     if not llm or not humans:
         return {
